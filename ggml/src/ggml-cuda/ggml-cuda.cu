@@ -1792,9 +1792,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
-    // fusion is not universally faster on Pascal
+    // fusion is disabled on CC < 610 (e.g. SM60 without DP4A), but enabled on SM61 (GTX 1080)
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (cc <= GGML_CUDA_CC_PASCAL) {
+    if (cc < GGML_CUDA_CC_DP4A) {
         return false;
     }
     //we only support fusion for ncols_dst = 1

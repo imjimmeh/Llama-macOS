@@ -1487,9 +1487,24 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
         const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
 
-        if (ntiles_x < ntiles_J_best) {
-            J_best = J;
-            ntiles_J_best = ntiles_x;
+        if (cc == GGML_CUDA_CC_DP4A) {
+            const int id_dev = ggml_cuda_get_device();
+            const int nsm = ggml_cuda_info().devices[id_dev].nsm;
+            const int nty = (args.nrows_x + config.I - 1) / config.I;
+            const int total_blocks = nty * ntiles_x * args.nchannels_y * args.nsamples_y;
+            const int waves = (total_blocks + nsm - 1) / nsm;
+            const int slots = waves * nsm;
+            const int wave_eff = slots > 0 ? (total_blocks * 1000) / slots : 1000;
+
+            if (ntiles_x < ntiles_J_best || (ntiles_x == ntiles_J_best && wave_eff > 800)) {
+                J_best = J;
+                ntiles_J_best = ntiles_x;
+            }
+        } else {
+            if (ntiles_x < ntiles_J_best) {
+                J_best = J;
+                ntiles_J_best = ntiles_x;
+            }
         }
     }
 
