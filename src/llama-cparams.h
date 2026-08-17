@@ -64,6 +64,7 @@ struct llama_cparams {
 
     llama_context * ctx_other;
 
-    size_t expert_cache_size  = 0;
-    bool   expert_cache_stats = false;
+    size_t  expert_cache_size   = 0;
+    int32_t expert_cache_period = 64;
+    bool    expert_cache_stats  = false;
 };

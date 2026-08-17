@@ -355,6 +355,7 @@ extern "C" {
 
     // Expert cache
     GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size);
+    GGML_API void                 ggml_backend_sched_set_expert_cache_period(ggml_backend_sched_t sched, int32_t period);
     GGML_API void                 ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched);
 
     //

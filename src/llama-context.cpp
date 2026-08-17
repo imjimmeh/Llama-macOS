@@ -139,8 +139,9 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
-    cparams.expert_cache_size  = params.expert_cache_size;
-    cparams.expert_cache_stats = params.expert_cache_stats;
+    cparams.expert_cache_size   = params.expert_cache_size;
+    cparams.expert_cache_period = params.expert_cache_period;
+    cparams.expert_cache_stats  = params.expert_cache_stats;
 
     cparams.ctx_other = nullptr;
 
@@ -610,6 +611,7 @@ void llama_context::sched_reserve() {
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     if (cparams.expert_cache_size > 0) {
         ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
+        ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
     }
 
     llama_memory_context_ptr mctx;
@@ -648,6 +650,7 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 if (cparams.expert_cache_size > 0) {
                     ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
+                    ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
                 }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -2477,9 +2480,10 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
-        /*.cb          =*/ graph_get_cb(),
-        /*.res         =*/ res,
+        /*.n_outputs      =*/ n_outputs,
+        /*.ffn_partitions =*/ model.ffn_partitions.get(),
+        /*.cb             =*/ graph_get_cb(),
+        /*.res            =*/ res,
     };
 }
 
@@ -3561,6 +3565,7 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
         /*.expert_cache_size           =*/ 0,
+        /*.expert_cache_period         =*/ 64,
         /*.expert_cache_stats          =*/ false,
     };
 

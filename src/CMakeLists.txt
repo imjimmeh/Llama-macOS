@@ -33,6 +33,8 @@ add_library(llama
             llama-memory-recurrent.cpp
             llama-mmap.cpp
             llama-model-loader.cpp
+            llama-model-partition.cpp
+            llama-model-partition.h
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp

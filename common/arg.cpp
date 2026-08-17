@@ -2766,6 +2766,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE"));
     add_opt(common_arg(
+        {"-excp", "--expert-cache-period"}, "N",
+        "token interval between expert cache rebalancing swaps (0 = on-demand LRU, default: 64)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_period = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_PERIOD"));
+    add_opt(common_arg(
         {"-excs", "--expert-cache-stats"},
         "print expert cache performance and hit-rate statistics on exit",
         [](common_params & params) {
@@ -2791,6 +2798,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
+    add_opt(common_arg(
+        {"--ffn-split"}, "P",
+        "fraction of dense FFN intermediate dimension to place on GPU (0.0-1.0, default: 0.0)",
+        [](common_params & params, const std::string & value) {
+            params.ffn_split = std::stof(value);
+            if (params.ffn_split < 0.0f || params.ffn_split > 1.0f) {
+                throw std::invalid_argument("--ffn-split must be between 0.0 and 1.0");
+            }
+        }
+    ).set_env("LLAMA_ARG_FFN_SPLIT"));
     add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"

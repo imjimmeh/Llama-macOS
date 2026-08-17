@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-model-partition.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1696,6 +1697,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if (params.ffn_split > 0.0f && !devices.empty()) {
+        ggml_backend_dev_t accel_dev = nullptr;
+        for (const auto & d : devices) {
+            if (ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                accel_dev = d.dev;
+                break;
+            }
+        }
+        if (accel_dev) {
+            ffn_partitions = llama_ffn_partition_build(*this, params.ffn_split, accel_dev);
+            if (ffn_partitions) {
+                size_t n_part = 0;
+                for (const auto & p : ffn_partitions->partitions) {
+                    if (p) {
+                        n_part++;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: FFN heterogeneous partition: %zu layers, %.1f%% on %s (%.2f MiB VRAM)\n",
+                    __func__, n_part, params.ffn_split * 100.0f,
+                    ggml_backend_dev_name(accel_dev),
+                    ggml_backend_buffer_get_size(ffn_partitions->buf_accel.get()) / (1024.0 * 1024.0));
+            }
+        }
+    }
+
     return true;
 }
 
@@ -2490,6 +2516,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.ffn_split                   =*/ 0.0f,
     };
 
     return result;

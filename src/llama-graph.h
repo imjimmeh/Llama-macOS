@@ -18,6 +18,8 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_ffn_partition;
+struct llama_ffn_partition_set;
 
 struct llama_memory_context_i;
 
@@ -772,6 +774,8 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    const llama_ffn_partition_set * ffn_partitions = nullptr;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -842,11 +846,12 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
-            arch  == other.arch  &&
-            gtype == other.gtype &&
-            cvec  == other.cvec  &&
-            loras == other.loras &&
-            cross == other.cross;
+            arch           == other.arch           &&
+            gtype          == other.gtype          &&
+            cvec           == other.cvec           &&
+            loras          == other.loras          &&
+            cross          == other.cross          &&
+            ffn_partitions == other.ffn_partitions;
     }
 };
 
@@ -992,6 +997,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_ffn_partition_set * ffn_partitions;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1061,6 +1067,40 @@ struct llm_graph_context {
          llm_ffn_op_type   type_op,
        llm_ffn_gate_type   type_gate,
                      int   il) const;
+
+    ggml_tensor * build_ffn_impl(
+             ggml_tensor * cur,
+             ggml_tensor * up,
+             ggml_tensor * up_b,
+             ggml_tensor * up_s,
+             ggml_tensor * gate,
+             ggml_tensor * gate_b,
+             ggml_tensor * gate_s,
+             ggml_tensor * down,
+             ggml_tensor * down_b,
+             ggml_tensor * down_s,
+             ggml_tensor * act_scales,
+         llm_ffn_op_type   type_op,
+       llm_ffn_gate_type   type_gate,
+                     int   il,
+             const char  * suffix) const;
+
+    ggml_tensor * build_ffn_partitioned(
+             ggml_tensor * cur,
+             ggml_tensor * up,
+             ggml_tensor * up_b,
+             ggml_tensor * up_s,
+             ggml_tensor * gate,
+             ggml_tensor * gate_b,
+             ggml_tensor * gate_s,
+             ggml_tensor * down,
+             ggml_tensor * down_b,
+             ggml_tensor * down_s,
+             ggml_tensor * act_scales,
+         llm_ffn_op_type   type_op,
+       llm_ffn_gate_type   type_gate,
+                     int   il,
+     const llama_ffn_partition & part) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(

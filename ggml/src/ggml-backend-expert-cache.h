@@ -21,6 +21,8 @@ struct ggml_backend_expert_cache_stats {
     uint64_t n_hits;
     uint64_t n_misses;
     uint64_t n_evictions;
+    uint64_t n_rebalances;
+    uint64_t n_jit_swaps;
     size_t   bytes_ram_to_gpu;
     size_t   bytes_avoided;
 };
@@ -33,6 +35,26 @@ GGML_API ggml_backend_expert_cache_t ggml_backend_expert_cache_new(
 
 GGML_API void ggml_backend_expert_cache_free(
     ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_set_period(
+    ggml_backend_expert_cache_t cache,
+    int32_t period);
+
+GGML_API int32_t ggml_backend_expert_cache_get_period(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_begin_step(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_record_access(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
+GGML_API void ggml_backend_expert_cache_process_jit_swaps(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * completed_tensor,
+    ggml_backend_t backend);
 
 GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_tensor(
     ggml_backend_expert_cache_t cache);

@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-model-partition.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -1462,6 +1463,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    ffn_partitions   (params.ffn_partitions),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1681,6 +1683,50 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il) const {
+    if (ffn_partitions && up) {
+        if (il >= 0 && il < (int) ffn_partitions->partitions.size()) {
+            const auto & part = ffn_partitions->partitions[il];
+            if (part && part->n_ff_accel > 0) {
+                return build_ffn_partitioned(
+                    cur, up, up_b, up_s, gate, gate_b, gate_s,
+                    down, down_b, down_s, act_scales,
+                    type_op, type_gate, il, *part);
+            }
+        }
+    }
+
+    return build_ffn_impl(
+        cur, up, up_b, up_s, gate, gate_b, gate_s,
+        down, down_b, down_s, act_scales,
+        type_op, type_gate, il, nullptr);
+}
+
+ggml_tensor * llm_graph_context::build_ffn_impl(
+         ggml_tensor * cur,
+         ggml_tensor * up,
+         ggml_tensor * up_b,
+         ggml_tensor * up_s,
+         ggml_tensor * gate,
+         ggml_tensor * gate_b,
+         ggml_tensor * gate_s,
+         ggml_tensor * down,
+         ggml_tensor * down_b,
+         ggml_tensor * down_s,
+         ggml_tensor * act_scales,
+     llm_ffn_op_type   type_op,
+   llm_ffn_gate_type   type_gate,
+                 int   il,
+         const char  * suffix) const {
+    auto cb_suff = [this, suffix, il](ggml_tensor * t, const char * name) {
+        if (!suffix) {
+            cb(t, name, il);
+        } else {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "%s%s", name, suffix);
+            cb(t, buf, il);
+        }
+    };
+
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
     // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
@@ -1705,16 +1751,16 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
-    cb(tmp, "ffn_up", il);
+    cb_suff(tmp, "ffn_up");
 
     if (up_b) {
         tmp = ggml_add(ctx0, tmp, up_b);
-        cb(tmp, "ffn_up_b", il);
+        cb_suff(tmp, "ffn_up_b");
     }
 
     if (up_s) {
         tmp = ggml_mul(ctx0, tmp, up_s);
-        cb(tmp, "ffn_up_s", il);
+        cb_suff(tmp, "ffn_up_s");
     }
 
     if (gate) {
@@ -1722,23 +1768,23 @@ ggml_tensor * llm_graph_context::build_ffn(
             case LLM_FFN_SEQ:
                 {
                     cur = build_lora_mm(gate, tmp);
-                    cb(cur, "ffn_gate", il);
+                    cb_suff(cur, "ffn_gate");
                 } break;
             case LLM_FFN_PAR:
                 {
                     cur = build_lora_mm(gate, cur);
-                    cb(cur, "ffn_gate", il);
+                    cb_suff(cur, "ffn_gate");
                 } break;
         }
 
         if (gate_b) {
             cur = ggml_add(ctx0, cur, gate_b);
-            cb(cur, "ffn_gate_b", il);
+            cb_suff(cur, "ffn_gate_b");
         }
 
         if (gate_s) {
             cur = ggml_mul(ctx0, cur, gate_s);
-            cb(cur, "ffn_gate_s", il);
+            cb_suff(cur, "ffn_gate_s");
         }
 
     } else {
@@ -1753,66 +1799,66 @@ ggml_tensor * llm_graph_context::build_ffn(
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
                         tmp = ggml_clamp(ctx0, tmp, -limit, limit);
-                        cb(tmp, "ffn_up_clamped", il);
+                        cb_suff(tmp, "ffn_up_clamped");
 
                         if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
-                            cb(cur, "ffn_gate_clamped", il);
+                            cb_suff(cur, "ffn_gate_clamped");
                             cur = ggml_swiglu_split(ctx0, cur, tmp);
                         } else {
                             ggml_tensor * gate_act = ggml_silu(ctx0, cur);
-                            cb(gate_act, "ffn_silu", il);
+                            cb_suff(gate_act, "ffn_silu");
                             gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
-                            cb(gate_act, "ffn_silu_clamped", il);
+                            cb_suff(gate_act, "ffn_silu_clamped");
                             cur = ggml_mul(ctx0, gate_act, tmp);
                         }
-                        cb(cur, "ffn_swiglu_limited", il);
+                        cb_suff(cur, "ffn_swiglu_limited");
                         type_gate = LLM_FFN_SEQ;
                         break;
                     }
                 }
 
                 cur = ggml_swiglu_split(ctx0, cur, tmp);
-                cb(cur, "ffn_swiglu", il);
+                cb_suff(cur, "ffn_swiglu");
                 type_gate = LLM_FFN_SEQ;
             } else {
                 cur = ggml_silu(ctx0, cur);
-                cb(cur, "ffn_silu", il);
+                cb_suff(cur, "ffn_silu");
             } break;
         case LLM_FFN_GELU:
             if (gate && type_gate == LLM_FFN_PAR) {
                 cur = ggml_geglu_split(ctx0, cur, tmp);
-                cb(cur, "ffn_geglu", il);
+                cb_suff(cur, "ffn_geglu");
                 type_gate = LLM_FFN_SEQ;
             } else {
                 cur = ggml_gelu(ctx0, cur);
-                cb(cur, "ffn_gelu", il);
+                cb_suff(cur, "ffn_gelu");
                 if (act_scales != NULL) {
                     cur = ggml_div(ctx0, cur, act_scales);
-                    cb(cur, "ffn_act", il);
+                    cb_suff(cur, "ffn_act");
                 }
             } break;
         case LLM_FFN_RELU:
             if (gate && type_gate == LLM_FFN_PAR) {
                 cur = ggml_reglu_split(ctx0, cur, tmp);
-                cb(cur, "ffn_reglu", il);
+                cb_suff(cur, "ffn_reglu");
                 type_gate = LLM_FFN_SEQ;
             } else {
                 cur = ggml_relu(ctx0, cur);
-                cb(cur, "ffn_relu", il);
+                cb_suff(cur, "ffn_relu");
             } break;
         case LLM_FFN_RELU_SQR:
             {
                 cur = ggml_relu(ctx0, cur);
-                cb(cur, "ffn_relu", il);
+                cb_suff(cur, "ffn_relu");
 
                 cur = ggml_sqr(ctx0, cur);
-                cb(cur, "ffn_sqr(relu)", il);
+                cb_suff(cur, "ffn_sqr(relu)");
             } break;
         case LLM_FFN_SWIGLU:
             {
                 cur = ggml_swiglu(ctx0, cur);
-                cb(cur, "ffn_swiglu", il);
+                cb_suff(cur, "ffn_swiglu");
             } break;
         case LLM_FFN_SWIGLU_OAI_MOE:
             if (gate && type_gate == LLM_FFN_PAR) {
@@ -1820,7 +1866,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                 const float alpha = 1.702f;
                 const float limit = 7.0f;
                 cur = ggml_swiglu_oai(ctx0, cur, tmp, alpha, limit);
-                cb(cur, "ffn_swiglu_oai", il);
+                cb_suff(cur, "ffn_swiglu_oai");
                 type_gate = LLM_FFN_SEQ;
             } else {
                 GGML_ABORT("LLM_FFN_SWIGLU_OAI_MOE requires a parallel gate");
@@ -1828,12 +1874,12 @@ ggml_tensor * llm_graph_context::build_ffn(
         case LLM_FFN_GEGLU:
             {
                 cur = ggml_geglu(ctx0, cur);
-                cb(cur, "ffn_geglu", il);
+                cb_suff(cur, "ffn_geglu");
             } break;
         case LLM_FFN_REGLU:
             {
                 cur = ggml_reglu(ctx0, cur);
-                cb(cur, "ffn_reglu", il);
+                cb_suff(cur, "ffn_reglu");
             } break;
         case LLM_FFN_SITU:
             GGML_ABORT("not yet supported");
@@ -1843,7 +1889,7 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     if (gate && type_gate == LLM_FFN_PAR) {
         cur = ggml_mul(ctx0, cur, tmp);
-        cb(cur, "ffn_gate_par", il);
+        cb_suff(cur, "ffn_gate_par");
     }
 
     if (down) {
@@ -1855,7 +1901,7 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (down_b) {
-        cb(cur, "ffn_down", il);
+        cb_suff(cur, "ffn_down");
     }
 
     if (down_b) {
@@ -1864,10 +1910,92 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     if (down_s) {
         cur = ggml_mul(ctx0, cur, down_s);
-        cb(cur, "ffn_down_s", il);
+        cb_suff(cur, "ffn_down_s");
     }
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_ffn_partitioned(
+        ggml_tensor * cur,
+        ggml_tensor * up,
+        ggml_tensor * up_b,
+        ggml_tensor * up_s,
+        ggml_tensor * gate,
+        ggml_tensor * gate_b,
+        ggml_tensor * gate_s,
+        ggml_tensor * down,
+        ggml_tensor * down_b,
+        ggml_tensor * down_s,
+        ggml_tensor * act_scales,
+        llm_ffn_op_type   type_op,
+        llm_ffn_gate_type type_gate,
+        int il,
+        const llama_ffn_partition & part) const {
+
+    GGML_UNUSED(up_b);
+    GGML_UNUSED(up_s);
+    GGML_UNUSED(gate_b);
+    GGML_UNUSED(gate_s);
+    GGML_UNUSED(down_b);
+    GGML_UNUSED(down_s);
+    GGML_UNUSED(act_scales);
+
+    // 1. GPU branch (submitted first to achieve overlap with CPU)
+    ggml_tensor * gpu = build_ffn_impl(
+        cur,
+        part.up_accel,   nullptr, nullptr,
+        part.gate_accel, nullptr, nullptr,
+        part.down_accel, nullptr, nullptr,
+        nullptr,
+        type_op, type_gate, il, "_gpu");
+
+    // 2. CPU branch (views of up/gate, packed down_cpu)
+    const int64_t n_ff_accel = part.n_ff_accel;
+    const int64_t n_ff       = up->ne[1];
+    const int64_t n_ff_cpu   = n_ff - n_ff_accel;
+
+    ggml_tensor * up_cpu = ggml_view_2d(
+        ctx0, up,
+        up->ne[0], n_ff_cpu,
+        up->nb[1],
+        n_ff_accel * up->nb[1]);
+    cb(up_cpu, "ffn_up_cpu_view", il);
+
+    ggml_tensor * gate_cpu = ggml_view_2d(
+        ctx0, gate,
+        gate->ne[0], n_ff_cpu,
+        gate->nb[1],
+        n_ff_accel * gate->nb[1]);
+    cb(gate_cpu, "ffn_gate_cpu_view", il);
+
+    ggml_tensor * cpu = build_ffn_impl(
+        cur,
+        up_cpu,         nullptr, nullptr,
+        gate_cpu,       nullptr, nullptr,
+        part.down_cpu,  nullptr, nullptr,
+        nullptr,
+        type_op, type_gate, il, "_cpu");
+
+    // 3. Pin backends if scheduler is available
+    if (sched) {
+        for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
+            ggml_backend_t be = ggml_backend_sched_get_backend(sched, b);
+            if (ggml_backend_get_device(be) == part.dev) {
+                ggml_backend_sched_set_tensor_backend(sched, gpu, be);
+                break;
+            }
+        }
+        if (backend_cpu) {
+            ggml_backend_sched_set_tensor_backend(sched, cpu, backend_cpu);
+        }
+    }
+
+    // 4. Sum branches
+    ggml_tensor * out = ggml_add(ctx0, gpu, cpu);
+    cb(out, "ffn_split_out", il);
+
+    return out;
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(

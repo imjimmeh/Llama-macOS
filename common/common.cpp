@@ -1668,6 +1668,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.ffn_split       = params.ffn_split;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1727,8 +1728,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
-    cparams.expert_cache_size  = params.expert_cache_size;
-    cparams.expert_cache_stats = params.expert_cache_stats;
+    cparams.expert_cache_size   = params.expert_cache_size;
+    cparams.expert_cache_period = params.expert_cache_period;
+    cparams.expert_cache_stats  = params.expert_cache_stats;
 
     return cparams;
 }

@@ -338,6 +338,7 @@ struct cmd_params {
     std::vector<bool>                cpu_strict;
     std::vector<int>                 poll;
     std::vector<int>                 n_gpu_layers;
+    std::vector<float>               ffn_split;
     std::vector<int>                 n_cpu_moe;
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
@@ -383,6 +384,7 @@ static const cmd_params cmd_params_defaults = {
     /* cpu_strict           */ { false },
     /* poll                 */ { 50 },
     /* n_gpu_layers         */ { -1 },
+    /* ffn_split            */ { 0.0f },
     /* n_cpu_moe            */ { 0 },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
@@ -456,6 +458,7 @@ static void print_usage(int /*argc*/, const char * const * argv) {
     printf("  --cpu-strict <0|1>                                (default: %s)\n", join(cmd_params_defaults.cpu_strict, ",").c_str());
     printf("  --poll <0...100>                                  (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                          (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
+    printf("  --ffn-split <p>                                   (default: %s)\n", join(cmd_params_defaults.ffn_split, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                           (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
@@ -710,6 +713,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i], /*allow_negative=*/true);
                 params.n_gpu_layers.insert(params.n_gpu_layers.end(), p.begin(), p.end());
+            } else if (arg == "--ffn-split") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<float>(argv[i], split_delim);
+                params.ffn_split.insert(params.ffn_split.end(), p.begin(), p.end());
             } else if (arg == "-ncmoe" || arg == "--n-cpu-moe") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1148,6 +1158,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.n_gpu_layers.empty()) {
         params.n_gpu_layers = cmd_params_defaults.n_gpu_layers;
     }
+    if (params.ffn_split.empty()) {
+        params.ffn_split = cmd_params_defaults.ffn_split;
+    }
     if (params.n_cpu_moe.empty()) {
         params.n_cpu_moe = cmd_params_defaults.n_cpu_moe;
     }
@@ -1214,6 +1227,7 @@ struct cmd_params_instance {
     bool               cpu_strict;
     int                poll;
     int                n_gpu_layers;
+    float              ffn_split;
     int                n_cpu_moe;
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
@@ -1234,6 +1248,7 @@ struct cmd_params_instance {
         llama_model_params mparams = llama_model_default_params();
 
         mparams.n_gpu_layers = n_gpu_layers;
+        mparams.ffn_split    = ffn_split;
         if (!devices.empty()) {
             mparams.devices = const_cast<ggml_backend_dev_t *>(devices.data());
         }
@@ -1283,7 +1298,8 @@ struct cmd_params_instance {
     }
 
     bool equal_mparams(const cmd_params_instance & other) const {
-        return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+        return model == other.model && n_gpu_layers == other.n_gpu_layers && ffn_split == other.ffn_split &&
+               n_cpu_moe == other.n_cpu_moe &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && devices == other.devices && no_host == other.no_host &&
@@ -1320,6 +1336,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & fpc : params.fit_params_min_ctx)
     for (const auto & exc : params.expert_cache_size)
     for (const auto & nl : params.n_gpu_layers)
+    for (const auto & fs : params.ffn_split)
     for (const auto & ncmoe : params.n_cpu_moe)
     for (const auto & sm : params.split_mode)
     for (const auto & lm : params.load_mode)
@@ -1359,6 +1376,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .cpu_strict            = */ cs,
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
+                /* .ffn_split             = */ fs,
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
@@ -1396,6 +1414,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .cpu_strict            = */ cs,
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
+                /* .ffn_split             = */ fs,
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
@@ -1433,6 +1452,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .cpu_strict            = */ cs,
                 /* .poll                  = */ pl,
                 /* .n_gpu_layers          = */ nl,
+                /* .ffn_split             = */ fs,
                 /* .n_cpu_moe             = */ ncmoe,
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
@@ -1475,6 +1495,7 @@ struct test {
     ggml_type                type_k;
     ggml_type                type_v;
     int                      n_gpu_layers;
+    float                    ffn_split;
     int                      n_cpu_moe;
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
@@ -1515,6 +1536,7 @@ struct test {
         type_k         = inst.type_k;
         type_v         = inst.type_v;
         n_gpu_layers   = inst.n_gpu_layers;
+        ffn_split      = inst.ffn_split;
         n_cpu_moe      = inst.n_cpu_moe;
         split_mode     = inst.split_mode;
         load_mode      = inst.load_mode;
@@ -1584,7 +1606,7 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
+            "type_k",         "type_v",         "n_gpu_layers",  "ffn_split",      "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
@@ -1609,7 +1631,7 @@ struct test {
             field == "embeddings" || field == "no_host") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" || field == "ffn_split") {
             return FLOAT;
         }
         if (field == "load_mode") {
@@ -1673,6 +1695,7 @@ struct test {
                                             ggml_type_name(type_k),
                                             ggml_type_name(type_v),
                                             std::to_string(n_gpu_layers),
+                                            std::to_string(ffn_split),
                                             std::to_string(n_cpu_moe),
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
@@ -1948,6 +1971,9 @@ struct markdown_printer : public printer {
                               test::get_backend().find("ZenDNN") != std::string::npos;
         if (!is_cpu_backend) {
             fields.emplace_back("n_gpu_layers");
+        }
+        if (params.ffn_split.size() > 1 || params.ffn_split != cmd_params_defaults.ffn_split) {
+            fields.emplace_back("ffn_split");
         }
         if (params.n_cpu_moe.size() > 1 || params.n_cpu_moe != cmd_params_defaults.n_cpu_moe) {
             fields.emplace_back("n_cpu_moe");

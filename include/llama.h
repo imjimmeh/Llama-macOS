@@ -339,6 +339,8 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        float ffn_split;      // fraction of dense FFN intermediate dimension to place on GPU (0.0 = disabled)
     };
 
     struct llama_sampler_seq_config {
@@ -409,8 +411,9 @@ extern "C" {
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
 
-        size_t expert_cache_size;  // expert cache capacity in bytes (0 = disabled)
-        bool   expert_cache_stats; // print expert cache performance stats on exit
+        size_t expert_cache_size;   // expert cache capacity in bytes (0 = disabled)
+        int32_t expert_cache_period; // token interval for expert cache rebalancing (0 = on-demand LRU, default = 64)
+        bool   expert_cache_stats;  // print expert cache performance stats on exit
     };
 
     struct llama_model_tensor_override {

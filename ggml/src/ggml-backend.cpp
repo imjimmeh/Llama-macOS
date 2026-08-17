@@ -830,6 +830,7 @@ struct ggml_backend_sched {
     int debug_prev_graph_size;
 
     size_t expert_cache_size;
+    int32_t expert_cache_period;
     ggml_backend_expert_cache_t expert_caches[GGML_SCHED_MAX_BACKENDS];
 };
 
@@ -1599,6 +1600,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b]) {
+            ggml_backend_expert_cache_begin_step(sched->expert_caches[b]);
+        }
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1702,6 +1709,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         struct ggml_tensor * cache_tensor = ggml_backend_expert_cache_get_tensor(cache);
 
                         for (int32_t exp_id : requested_experts) {
+                            ggml_backend_expert_cache_record_access(cache, input, exp_id);
                             size_t c_offset = ggml_backend_expert_cache_find_offset(cache, input, exp_id);
                             if (c_offset != SIZE_MAX) {
                                 ggml_backend_expert_cache_record_hit(cache, input, exp_id, expert_size);
@@ -1743,7 +1751,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_tensor_copy_async(split_backend, split_backend, &src_view, &dst_view);
                         }
 
-                        // 2. Process misses: 1x PCIe copy to input_cpy + fast local D2D copy into cache
+                        // 2. Process misses: copy PCIe to input_cpy (+ populate cache if on-demand LRU mode)
+                        const bool is_periodic = ggml_backend_expert_cache_get_period(cache) > 0;
+
                         auto copy_miss_range = [&](int32_t first_id, int32_t last_id) {
                             const size_t expert_offset = (size_t)first_id * expert_size;
                             const size_t expert_size_copy = (size_t)(last_id - first_id + 1) * expert_size;
@@ -1755,39 +1765,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 (const uint8_t *)input->data + expert_offset, expert_offset,
                                 expert_size_copy + padding_end);
 
-                            for (int32_t mid = first_id; mid <= last_id; mid++) {
-                                size_t slot_offset = ggml_backend_expert_cache_alloc_slot(
-                                    cache, input, mid, expert_size,
-                                    pinned_keys.data(), pinned_keys.size());
+                            if (!is_periodic) {
+                                for (int32_t mid = first_id; mid <= last_id; mid++) {
+                                    size_t slot_offset = ggml_backend_expert_cache_alloc_slot(
+                                        cache, input, mid, expert_size,
+                                        pinned_keys.data(), pinned_keys.size());
 
-                                if (slot_offset != SIZE_MAX) {
-                                    const size_t src_off = (size_t)mid * expert_size;
+                                    if (slot_offset != SIZE_MAX) {
+                                        const size_t src_off = (size_t)mid * expert_size;
 
-                                    struct ggml_tensor src_view = *input_cpy;
-                                    src_view.data = (uint8_t *)input_cpy->data + src_off;
-                                    src_view.ne[0] = expert_size;
-                                    src_view.ne[1] = 1;
-                                    src_view.ne[2] = 1;
-                                    src_view.ne[3] = 1;
-                                    src_view.nb[0] = 1;
-                                    src_view.nb[1] = expert_size;
-                                    src_view.nb[2] = expert_size;
-                                    src_view.nb[3] = expert_size;
-                                    src_view.view_src = input_cpy;
+                                        struct ggml_tensor src_view = *input_cpy;
+                                        src_view.data = (uint8_t *)input_cpy->data + src_off;
+                                        src_view.ne[0] = expert_size;
+                                        src_view.ne[1] = 1;
+                                        src_view.ne[2] = 1;
+                                        src_view.ne[3] = 1;
+                                        src_view.nb[0] = 1;
+                                        src_view.nb[1] = expert_size;
+                                        src_view.nb[2] = expert_size;
+                                        src_view.nb[3] = expert_size;
+                                        src_view.view_src = input_cpy;
 
-                                    struct ggml_tensor dst_view = *cache_tensor;
-                                    dst_view.data = (uint8_t *)cache_tensor->data + slot_offset;
-                                    dst_view.ne[0] = expert_size;
-                                    dst_view.ne[1] = 1;
-                                    dst_view.ne[2] = 1;
-                                    dst_view.ne[3] = 1;
-                                    dst_view.nb[0] = 1;
-                                    dst_view.nb[1] = expert_size;
-                                    dst_view.nb[2] = expert_size;
-                                    dst_view.nb[3] = expert_size;
-                                    dst_view.view_src = cache_tensor;
+                                        struct ggml_tensor dst_view = *cache_tensor;
+                                        dst_view.data = (uint8_t *)cache_tensor->data + slot_offset;
+                                        dst_view.ne[0] = expert_size;
+                                        dst_view.ne[1] = 1;
+                                        dst_view.ne[2] = 1;
+                                        dst_view.ne[3] = 1;
+                                        dst_view.nb[0] = 1;
+                                        dst_view.nb[1] = expert_size;
+                                        dst_view.nb[2] = expert_size;
+                                        dst_view.nb[3] = expert_size;
+                                        dst_view.view_src = cache_tensor;
 
-                                    ggml_backend_tensor_copy_async(split_backend, split_backend, &src_view, &dst_view);
+                                        ggml_backend_tensor_copy_async(split_backend, split_backend, &src_view, &dst_view);
+                                    }
                                 }
                             }
                         };
@@ -1817,6 +1829,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                             copy_miss_range(first_id, last_id);
                         }
+
+                        // JIT post-execution swap: process any forward swaps scheduled after this input tensor completes
+                        ggml_backend_expert_cache_process_jit_swaps(cache, input, split_backend);
                     } else {
                         // group consecutive experts and copy them together
                         auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -2140,6 +2155,19 @@ void ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size
         }
         if (size > 0 && ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
             sched->expert_caches[b] = ggml_backend_expert_cache_new(sched->backends[b], size);
+            if (sched->expert_caches[b] && sched->expert_cache_period > 0) {
+                ggml_backend_expert_cache_set_period(sched->expert_caches[b], sched->expert_cache_period);
+            }
+        }
+    }
+}
+
+void ggml_backend_sched_set_expert_cache_period(ggml_backend_sched_t sched, int32_t period) {
+    GGML_ASSERT(sched);
+    sched->expert_cache_period = period;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b]) {
+            ggml_backend_expert_cache_set_period(sched->expert_caches[b], period);
         }
     }
 }

@@ -46,6 +46,15 @@ struct ggml_backend_expert_cache_free_block {
     size_t size;
 };
 
+struct ggml_expert_cache_swap_op {
+    ggml_expert_cache_key evict_key;
+    ggml_expert_cache_key load_key;
+    size_t offset;
+    size_t size;
+    size_t alloc_size;
+    bool   is_forward;
+};
+
 struct ggml_backend_expert_cache {
     ggml_backend_t backend;
 
@@ -57,12 +66,28 @@ struct ggml_backend_expert_cache {
     size_t used;
 
     uint64_t clock;
+    int32_t  period_tokens;
+    uint64_t decode_step;
 
     std::vector<ggml_backend_expert_cache_free_block> free_blocks;
     std::unordered_map<ggml_expert_cache_key, ggml_backend_expert_cache_entry, ggml_expert_cache_key_hash, ggml_expert_cache_key_eq> entries;
 
+    std::unordered_map<ggml_expert_cache_key, uint32_t, ggml_expert_cache_key_hash, ggml_expert_cache_key_eq> access_freq;
+    std::vector<ggml_expert_cache_swap_op> pending_forward_swaps;
+
     struct ggml_backend_expert_cache_stats stats;
 };
+
+static int ggml_expert_cache_get_tensor_layer(const struct ggml_tensor * tensor) {
+    if (tensor == NULL || tensor->name[0] == '\0') {
+        return -1;
+    }
+    int layer = -1;
+    if (sscanf(tensor->name, "blk.%d.", &layer) == 1) {
+        return layer;
+    }
+    return -1;
+}
 
 static void ggml_backend_expert_cache_coalesce_free(ggml_backend_expert_cache_t cache) {
     if (cache->free_blocks.size() <= 1) {
@@ -132,6 +157,8 @@ ggml_backend_expert_cache_t ggml_backend_expert_cache_new(
     cache->capacity = capacity;
     cache->used = 0;
     cache->clock = 0;
+    cache->period_tokens = 64;
+    cache->decode_step = 0;
     cache->free_blocks.push_back({ 0, capacity });
     memset(&cache->stats, 0, sizeof(cache->stats));
 
@@ -149,6 +176,243 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
         ggml_backend_buffer_free(cache->buffer);
     }
     delete cache;
+}
+
+void ggml_backend_expert_cache_set_period(
+        ggml_backend_expert_cache_t cache,
+        int32_t period) {
+    if (cache == NULL) {
+        return;
+    }
+    cache->period_tokens = period;
+}
+
+int32_t ggml_backend_expert_cache_get_period(
+        ggml_backend_expert_cache_t cache) {
+    if (cache == NULL) {
+        return 0;
+    }
+    return cache->period_tokens;
+}
+
+static void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache) {
+    if (cache == NULL || cache->access_freq.empty()) {
+        return;
+    }
+
+    struct candidate {
+        ggml_expert_cache_key key;
+        uint32_t freq;
+        size_t size;
+        size_t alloc_size;
+    };
+    std::vector<candidate> candidates;
+    candidates.reserve(cache->access_freq.size());
+
+    for (const auto & kv : cache->access_freq) {
+        if (kv.second > 0 && kv.first.tensor != NULL) {
+            const size_t expert_size = kv.first.tensor->nb[2];
+            const size_t alloc_size = GGML_EXPERT_CACHE_PAD(expert_size);
+            candidates.push_back({ kv.first, kv.second, expert_size, alloc_size });
+        }
+    }
+
+    if (candidates.empty()) {
+        return;
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const candidate & a, const candidate & b) {
+        if (a.freq != b.freq) {
+            return a.freq > b.freq;
+        }
+        return a.key.expert_id < b.key.expert_id;
+    });
+
+    std::vector<candidate> desired;
+    size_t desired_total_size = 0;
+    for (const auto & cand : candidates) {
+        if (desired_total_size + cand.alloc_size <= cache->capacity) {
+            desired.push_back(cand);
+            desired_total_size += cand.alloc_size;
+        }
+    }
+
+    std::vector<ggml_expert_cache_key> to_evict;
+    for (const auto & kv : cache->entries) {
+        bool found = false;
+        for (const auto & d : desired) {
+            if (d.key.tensor == kv.first.tensor && d.key.expert_id == kv.first.expert_id) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            to_evict.push_back(kv.first);
+        }
+    }
+
+    std::vector<candidate> to_load;
+    for (const auto & d : desired) {
+        if (cache->entries.find(d.key) == cache->entries.end()) {
+            to_load.push_back(d);
+        }
+    }
+
+    if (to_evict.empty() && to_load.empty()) {
+        for (auto & kv : cache->access_freq) {
+            kv.second >>= 1;
+        }
+        return;
+    }
+
+    cache->stats.n_rebalances++;
+    cache->pending_forward_swaps.clear();
+
+    size_t n_swaps = std::min(to_evict.size(), to_load.size());
+    for (size_t i = 0; i < n_swaps; i++) {
+        const auto & evict_k = to_evict[i];
+        const auto & load_cand = to_load[i];
+
+        auto eit = cache->entries.find(evict_k);
+        GGML_ASSERT(eit != cache->entries.end());
+        size_t slot_offset = eit->second.offset;
+        size_t slot_alloc_size = eit->second.alloc_size;
+
+        int evict_layer = ggml_expert_cache_get_tensor_layer(evict_k.tensor);
+        int load_layer  = ggml_expert_cache_get_tensor_layer(load_cand.key.tensor);
+
+        bool is_forward = (evict_layer >= 0 && load_layer >= 0 && evict_layer <= load_layer);
+
+        if (is_forward) {
+            cache->pending_forward_swaps.push_back({
+                evict_k,
+                load_cand.key,
+                slot_offset,
+                load_cand.size,
+                slot_alloc_size,
+                true
+            });
+        } else {
+            cache->entries.erase(eit);
+            cache->stats.n_evictions++;
+
+            ggml_backend_expert_cache_entry new_entry = {
+                load_cand.key.tensor,
+                load_cand.key.expert_id,
+                slot_offset,
+                load_cand.size,
+                slot_alloc_size,
+                ++cache->clock,
+                0,
+            };
+            cache->entries[load_cand.key] = new_entry;
+
+            const size_t expert_size = load_cand.key.tensor->nb[2];
+            const size_t src_off = (size_t)load_cand.key.expert_id * expert_size;
+            ggml_backend_tensor_set_async(
+                cache->backend,
+                cache->tensor,
+                (const uint8_t *)load_cand.key.tensor->data + src_off,
+                slot_offset,
+                expert_size);
+        }
+    }
+
+    for (size_t i = n_swaps; i < to_evict.size(); i++) {
+        auto eit = cache->entries.find(to_evict[i]);
+        if (eit != cache->entries.end()) {
+            cache->free_blocks.push_back({ eit->second.offset, eit->second.alloc_size });
+            cache->used -= eit->second.alloc_size;
+            cache->stats.n_evictions++;
+            cache->entries.erase(eit);
+        }
+    }
+    ggml_backend_expert_cache_coalesce_free(cache);
+
+    for (size_t i = n_swaps; i < to_load.size(); i++) {
+        const auto & load_cand = to_load[i];
+        size_t slot_offset = ggml_backend_expert_cache_alloc_slot(
+            cache, load_cand.key.tensor, load_cand.key.expert_id, load_cand.size, NULL, 0);
+        if (slot_offset != SIZE_MAX) {
+            const size_t expert_size = load_cand.key.tensor->nb[2];
+            const size_t src_off = (size_t)load_cand.key.expert_id * expert_size;
+            ggml_backend_tensor_set_async(
+                cache->backend,
+                cache->tensor,
+                (const uint8_t *)load_cand.key.tensor->data + src_off,
+                slot_offset,
+                expert_size);
+        }
+    }
+
+    for (auto & kv : cache->access_freq) {
+        kv.second >>= 1;
+    }
+}
+
+void ggml_backend_expert_cache_begin_step(ggml_backend_expert_cache_t cache) {
+    if (cache == NULL) {
+        return;
+    }
+    cache->decode_step++;
+    if (cache->period_tokens > 0 && (cache->decode_step % (uint64_t)cache->period_tokens == 0)) {
+        ggml_backend_expert_cache_rebalance(cache);
+    }
+}
+
+void ggml_backend_expert_cache_record_access(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id) {
+    if (cache == NULL || tensor == NULL) {
+        return;
+    }
+    ggml_expert_cache_key key = { tensor, expert_id };
+    cache->access_freq[key]++;
+}
+
+void ggml_backend_expert_cache_process_jit_swaps(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * completed_tensor,
+        ggml_backend_t backend) {
+    if (cache == NULL || cache->pending_forward_swaps.empty() || completed_tensor == NULL) {
+        return;
+    }
+
+    for (auto it = cache->pending_forward_swaps.begin(); it != cache->pending_forward_swaps.end(); ) {
+        if (it->evict_key.tensor == completed_tensor) {
+            auto eit = cache->entries.find(it->evict_key);
+            if (eit != cache->entries.end()) {
+                cache->entries.erase(eit);
+                cache->stats.n_evictions++;
+            }
+
+            ggml_backend_expert_cache_entry new_entry = {
+                it->load_key.tensor,
+                it->load_key.expert_id,
+                it->offset,
+                it->size,
+                it->alloc_size,
+                ++cache->clock,
+                0,
+            };
+            cache->entries[it->load_key] = new_entry;
+            cache->stats.n_jit_swaps++;
+
+            const size_t expert_size = it->load_key.tensor->nb[2];
+            const size_t src_off = (size_t)it->load_key.expert_id * expert_size;
+            ggml_backend_tensor_set_async(
+                backend,
+                cache->tensor,
+                (const uint8_t *)it->load_key.tensor->data + src_off,
+                it->offset,
+                expert_size);
+
+            it = cache->pending_forward_swaps.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 struct ggml_tensor * ggml_backend_expert_cache_get_tensor(ggml_backend_expert_cache_t cache) {
@@ -236,7 +500,6 @@ size_t ggml_backend_expert_cache_alloc_slot(
         return SIZE_MAX;
     }
 
-    // Try allocating from free blocks
     auto try_alloc = [&]() -> size_t {
         for (size_t i = 0; i < cache->free_blocks.size(); i++) {
             if (cache->free_blocks[i].size >= alloc_size) {
@@ -268,7 +531,6 @@ size_t ggml_backend_expert_cache_alloc_slot(
         return offset;
     }
 
-    // Free memory is insufficient or fragmented; collect candidates for LRU eviction
     std::vector<ggml_expert_cache_key> evict_candidates;
     evict_candidates.reserve(cache->entries.size());
 
@@ -287,7 +549,6 @@ size_t ggml_backend_expert_cache_alloc_slot(
         }
     }
 
-    // Sort unpinned entries by last_used ascending (oldest first)
     std::sort(evict_candidates.begin(), evict_candidates.end(),
         [&](const ggml_expert_cache_key & a, const ggml_expert_cache_key & b) {
             return cache->entries[a].last_used < cache->entries[b].last_used;
@@ -351,6 +612,9 @@ void ggml_backend_expert_cache_print_stats(ggml_backend_expert_cache_t cache) {
     GGML_LOG_INFO("Expert Cache (%s):\n", ggml_backend_name(cache->backend));
     GGML_LOG_INFO("  capacity:             %8.2f MiB\n", cap_mib);
     GGML_LOG_INFO("  resident:             %8.2f MiB (%zu entries)\n", used_mib, cache->entries.size());
+    GGML_LOG_INFO("  period:               %d tokens\n", cache->period_tokens);
+    GGML_LOG_INFO("  rebalances:           %" PRIu64 "\n", cache->stats.n_rebalances);
+    GGML_LOG_INFO("  JIT swaps:            %" PRIu64 "\n", cache->stats.n_jit_swaps);
     GGML_LOG_INFO("  requests:             %" PRIu64 "\n", cache->stats.n_requests);
     GGML_LOG_INFO("  hits:                 %" PRIu64 "\n", cache->stats.n_hits);
     GGML_LOG_INFO("  misses:               %" PRIu64 "\n", cache->stats.n_misses);
