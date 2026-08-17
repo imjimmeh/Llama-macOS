@@ -203,11 +203,7 @@ static void common_params_fit_impl(
         margins.push_back(margins_s[0]);
     } else {
         for (size_t id = 0; id < nd; id++) {
-            int64_t m = margins_s[id];
-            if (cparams->expert_cache_size > 0 && ggml_backend_dev_type(devs[id]) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                m += cparams->expert_cache_size;
-            }
-            margins.push_back(m);
+            margins.push_back(margins_s[id]);
         }
     }
 
