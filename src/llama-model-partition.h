@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 struct llama_layer;
@@ -33,14 +34,35 @@ struct llama_ffn_partition_set {
     ggml_backend_buffer_ptr buf_accel;
     ggml_backend_buffer_ptr buf_cpu;
 
-    std::vector<std::unique_ptr<llama_ffn_partition>> partitions;
+    // Keyed by original host up-tensor (e.g. layer.ffn_up or layer.ffn_up_shexp)
+    std::unordered_map<const ggml_tensor *, std::unique_ptr<llama_ffn_partition>> partitions;
+
+    const llama_ffn_partition * find(const ggml_tensor * up) const {
+        if (!up) {
+            return nullptr;
+        }
+        auto it = partitions.find(up);
+        return it != partitions.end() ? it->second.get() : nullptr;
+    }
 };
 
 #include "llama.h"
 
 int64_t LLAMA_API llama_ffn_partition_align(
+        const ggml_tensor * up,
+        const ggml_tensor * gate,
+        const ggml_tensor * down,
+        float fraction);
+
+int64_t LLAMA_API llama_ffn_partition_align(
         const llama_layer & layer,
         float fraction);
+
+bool LLAMA_API llama_ffn_can_partition(
+        const ggml_tensor * up,
+        const ggml_tensor * gate,
+        const ggml_tensor * down,
+        llm_ffn_gate_type type_gate);
 
 bool LLAMA_API llama_ffn_can_partition(
         const llama_layer & layer,

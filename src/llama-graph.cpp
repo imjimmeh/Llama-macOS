@@ -1684,14 +1684,12 @@ ggml_tensor * llm_graph_context::build_ffn(
    llm_ffn_gate_type   type_gate,
                  int   il) const {
     if (ffn_partitions && up) {
-        if (il >= 0 && il < (int) ffn_partitions->partitions.size()) {
-            const auto & part = ffn_partitions->partitions[il];
-            if (part && part->n_ff_accel > 0) {
-                return build_ffn_partitioned(
-                    cur, up, up_b, up_s, gate, gate_b, gate_s,
-                    down, down_b, down_s, act_scales,
-                    type_op, type_gate, il, *part);
-            }
+        const auto * part = ffn_partitions->find(up);
+        if (part && part->n_ff_accel > 0) {
+            return build_ffn_partitioned(
+                cur, up, up_b, up_s, gate, gate_b, gate_s,
+                down, down_b, down_s, act_scales,
+                type_op, type_gate, il, *part);
         }
     }
 

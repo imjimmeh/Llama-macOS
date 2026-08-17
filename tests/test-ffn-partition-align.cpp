@@ -86,8 +86,32 @@ int main() {
         layer.ffn_gate   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 4096, 14336);
         layer.ffn_down   = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 14336, 4096);
         layer.ffn_down_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4096);
-
         assert(llama_ffn_can_partition(layer, LLM_FFN_PAR) == false);
+    }
+
+    // Test 6: Shared expert tensor tuple
+    {
+        ggml_tensor * up_shexp   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, 2048, 5632);
+        ggml_tensor * gate_shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, 2048, 5632);
+        ggml_tensor * down_shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, 5632, 2048);
+
+        assert(llama_ffn_can_partition(up_shexp, gate_shexp, down_shexp, LLM_FFN_PAR) == true);
+
+        int64_t n_ff_gpu = llama_ffn_partition_align(up_shexp, gate_shexp, down_shexp, 0.40f);
+        assert(n_ff_gpu > 0);
+        assert(n_ff_gpu % 256 == 0);
+        assert((5632 - n_ff_gpu) % 256 == 0);
+
+        // Registry lookup simulation
+        llama_ffn_partition_set set = {};
+        auto part = std::make_unique<llama_ffn_partition>();
+        part->n_ff_accel = n_ff_gpu;
+        set.partitions[up_shexp] = std::move(part);
+
+        assert(set.find(up_shexp) != nullptr);
+        assert(set.find(up_shexp)->n_ff_accel == n_ff_gpu);
+        assert(set.find(gate_shexp) == nullptr);
+        assert(set.find(nullptr) == nullptr);
     }
 
     ggml_free(ctx);

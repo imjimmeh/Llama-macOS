@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-model-partition.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -3292,6 +3293,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += backend_buf_exp_size[i];
+            if (cparams.expert_cache_size > 0 && !ggml_backend_buft_is_host(buft)) {
+                ret[buft].compute += cparams.expert_cache_size;
+            }
         }
     } else {
         for (const auto & backend_ptr : backends) {
@@ -4188,8 +4192,19 @@ void llama_perf_context_print(const llama_context * ctx) {
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 
-    if (ctx->get_cparams().expert_cache_stats && ctx->get_sched()) {
-        ggml_backend_sched_print_expert_cache_stats(ctx->get_sched());
+    if (ctx->get_cparams().expert_cache_stats) {
+        if (ctx->get_sched()) {
+            ggml_backend_sched_print_expert_cache_stats(ctx->get_sched());
+        }
+        if (ctx->get_model().ffn_partitions) {
+            const auto & set = *ctx->get_model().ffn_partitions;
+            const size_t n_part = set.partitions.size();
+            const double vram_mib = set.buf_accel ? (double)ggml_backend_buffer_get_size(set.buf_accel.get()) / (1024.0 * 1024.0) : 0.0;
+            LLAMA_LOG_INFO("\n");
+            LLAMA_LOG_INFO("FFN Heterogeneous Partitioning:\n");
+            LLAMA_LOG_INFO("  partitioned branches: %zu\n", n_part);
+            LLAMA_LOG_INFO("  accelerator VRAM:     %8.2f MiB\n", vram_mib);
+        }
     }
 }
 

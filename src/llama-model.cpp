@@ -1708,13 +1708,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (accel_dev) {
             ffn_partitions = llama_ffn_partition_build(*this, params.ffn_split, accel_dev);
             if (ffn_partitions) {
-                size_t n_part = 0;
-                for (const auto & p : ffn_partitions->partitions) {
-                    if (p) {
-                        n_part++;
-                    }
-                }
-                LLAMA_LOG_INFO("%s: FFN heterogeneous partition: %zu layers, %.1f%% on %s (%.2f MiB VRAM)\n",
+                const size_t n_part = ffn_partitions->partitions.size();
+                LLAMA_LOG_INFO("%s: FFN heterogeneous partition: %zu FFN branches, %.1f%% on %s (%.2f MiB VRAM)\n",
                     __func__, n_part, params.ffn_split * 100.0f,
                     ggml_backend_dev_name(accel_dev),
                     ggml_backend_buffer_get_size(ffn_partitions->buf_accel.get()) / (1024.0 * 1024.0));
@@ -1787,6 +1782,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
                 // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
                 ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
             }
+        }
+    }
+    if (ffn_partitions) {
+        if (ffn_partitions->buf_accel) {
+            ret[ggml_backend_buffer_get_type(ffn_partitions->buf_accel.get())] += ggml_backend_buffer_get_size(ffn_partitions->buf_accel.get());
+        }
+        if (ffn_partitions->buf_cpu) {
+            ret[ggml_backend_buffer_get_type(ffn_partitions->buf_cpu.get())] += ggml_backend_buffer_get_size(ffn_partitions->buf_cpu.get());
         }
     }
     return ret;

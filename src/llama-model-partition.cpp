@@ -8,18 +8,22 @@
 #include <cstring>
 #include <vector>
 
-int64_t llama_ffn_partition_align(const llama_layer & layer, float fraction) {
-    if (!layer.ffn_up) {
+int64_t llama_ffn_partition_align(
+        const ggml_tensor * up,
+        const ggml_tensor * gate,
+        const ggml_tensor * down,
+        float fraction) {
+    if (!up) {
         return 0;
     }
 
-    const int64_t n_ff = layer.ffn_up->ne[1];
+    const int64_t n_ff = up->ne[1];
     const int64_t raw  = (int64_t)(n_ff * fraction);
 
     int64_t blk = 1;
-    if (layer.ffn_up)   blk = std::max(blk, (int64_t)ggml_blck_size(layer.ffn_up->type));
-    if (layer.ffn_gate) blk = std::max(blk, (int64_t)ggml_blck_size(layer.ffn_gate->type));
-    if (layer.ffn_down) blk = std::max(blk, (int64_t)ggml_blck_size(layer.ffn_down->type));
+    if (up)   blk = std::max(blk, (int64_t)ggml_blck_size(up->type));
+    if (gate) blk = std::max(blk, (int64_t)ggml_blck_size(gate->type));
+    if (down) blk = std::max(blk, (int64_t)ggml_blck_size(down->type));
 
     const int64_t aligned = (raw / blk) * blk;
     if (aligned <= 0 || aligned >= n_ff) {
@@ -29,8 +33,16 @@ int64_t llama_ffn_partition_align(const llama_layer & layer, float fraction) {
     return aligned;
 }
 
-bool llama_ffn_can_partition(const llama_layer & layer, llm_ffn_gate_type type_gate) {
-    if (!layer.ffn_up || !layer.ffn_down || !layer.ffn_gate) {
+int64_t llama_ffn_partition_align(const llama_layer & layer, float fraction) {
+    return llama_ffn_partition_align(layer.ffn_up, layer.ffn_gate, layer.ffn_down, fraction);
+}
+
+bool llama_ffn_can_partition(
+        const ggml_tensor * up,
+        const ggml_tensor * gate,
+        const ggml_tensor * down,
+        llm_ffn_gate_type type_gate) {
+    if (!up || !gate || !down) {
         return false;
     }
 
@@ -38,25 +50,28 @@ bool llama_ffn_can_partition(const llama_layer & layer, llm_ffn_gate_type type_g
         return false;
     }
 
-    if (layer.ffn_up->ne[1] != layer.ffn_gate->ne[1]) {
+    if (up->ne[1] != gate->ne[1]) {
         return false;
     }
 
-    if (layer.ffn_down->ne[0] != layer.ffn_up->ne[1]) {
+    if (down->ne[0] != up->ne[1]) {
         return false;
     }
 
-    if (layer.ffn_up->type == GGML_TYPE_NVFP4 ||
-        layer.ffn_gate->type == GGML_TYPE_NVFP4 ||
-        layer.ffn_down->type == GGML_TYPE_NVFP4) {
-        return false;
-    }
-
-    if (layer.ffn_up_b || layer.ffn_gate_b || layer.ffn_down_b) {
+    if (up->type == GGML_TYPE_NVFP4 ||
+        gate->type == GGML_TYPE_NVFP4 ||
+        down->type == GGML_TYPE_NVFP4) {
         return false;
     }
 
     return true;
+}
+
+bool llama_ffn_can_partition(const llama_layer & layer, llm_ffn_gate_type type_gate) {
+    if (layer.ffn_up_b || layer.ffn_gate_b || layer.ffn_down_b) {
+        return false;
+    }
+    return llama_ffn_can_partition(layer.ffn_up, layer.ffn_gate, layer.ffn_down, type_gate);
 }
 
 std::unique_ptr<llama_ffn_partition_set> llama_ffn_partition_build(
@@ -68,48 +83,60 @@ std::unique_ptr<llama_ffn_partition_set> llama_ffn_partition_build(
         return nullptr;
     }
 
+    struct partition_candidate {
+        const char * suffix;
+        size_t il;
+        ggml_tensor * up;
+        ggml_tensor * gate;
+        ggml_tensor * down;
+        int64_t n_ff_accel;
+    };
+
+    std::vector<partition_candidate> candidates;
     const size_t n_layer = model.layers.size();
-    auto result = std::make_unique<llama_ffn_partition_set>();
-    result->partitions.resize(n_layer);
 
-    size_t count = 0;
-    for (size_t il = 0; il < n_layer; ++il) {
-        const auto & layer = model.layers[il];
-
-        if (!llama_ffn_can_partition(layer, LLM_FFN_PAR)) {
-            continue;
+    auto check_and_add = [&](const char * suffix, size_t il, ggml_tensor * up, ggml_tensor * gate, ggml_tensor * down) {
+        if (!llama_ffn_can_partition(up, gate, down, LLM_FFN_PAR)) {
+            return;
         }
 
         // skip layers with clamping in hparams
         if (il < model.hparams.swiglu_clamp_shexp.size() && model.hparams.swiglu_clamp_shexp[il] > 1e-6f) {
-            continue;
+            return;
         }
 
-        // only partition layers whose weights reside on CPU
-        if (layer.ffn_up->buffer && !ggml_backend_buffer_is_host(layer.ffn_up->buffer)) {
-            continue;
+        // only partition tensors whose weights reside in host memory
+        if (up->buffer && !ggml_backend_buffer_is_host(up->buffer)) {
+            return;
         }
 
-        const int64_t n_ff_accel = llama_ffn_partition_align(layer, fraction);
+        const int64_t n_ff_accel = llama_ffn_partition_align(up, gate, down, fraction);
         if (n_ff_accel <= 0) {
-            continue;
+            return;
         }
 
-        auto part = std::make_unique<llama_ffn_partition>();
-        part->n_ff_accel = n_ff_accel;
-        part->dev        = accel_dev;
+        candidates.push_back({ suffix, il, up, gate, down, n_ff_accel });
+    };
 
-        result->partitions[il] = std::move(part);
-        count++;
+    for (size_t il = 0; il < n_layer; ++il) {
+        auto & layer = model.layers[il];
+
+        // 1. Primary dense FFN branch
+        check_and_add("ffn", il, layer.ffn_up, layer.ffn_gate, layer.ffn_down);
+
+        // 2. Shared expert branch
+        check_and_add("shexp", il, layer.ffn_up_shexp, layer.ffn_gate_shexp, layer.ffn_down_shexp);
     }
 
-    if (count == 0) {
+    if (candidates.empty()) {
         return nullptr;
     }
 
+    auto result = std::make_unique<llama_ffn_partition_set>();
+
     // create metadata contexts
-    const size_t n_tensors_accel = count * 3;
-    const size_t n_tensors_cpu   = count * 1;
+    const size_t n_tensors_accel = candidates.size() * 3;
+    const size_t n_tensors_cpu   = candidates.size() * 1;
 
     struct ggml_init_params params_accel = {
         /*.mem_size   =*/ ggml_tensor_overhead() * n_tensors_accel + 1024,
@@ -125,35 +152,60 @@ std::unique_ptr<llama_ffn_partition_set> llama_ffn_partition_build(
     };
     result->ctx_cpu.reset(ggml_init(params_cpu));
 
-    // create tensor headers
-    for (size_t il = 0; il < n_layer; ++il) {
-        auto & part = result->partitions[il];
-        if (!part) {
-            continue;
-        }
+    // create tensor headers and partition objects
+    struct target_entry {
+        std::unique_ptr<llama_ffn_partition> part;
+        const partition_candidate * cand;
+    };
+    std::vector<target_entry> targets;
+    targets.reserve(candidates.size());
 
-        const auto & layer = model.layers[il];
-        const int64_t n_ff_accel = part->n_ff_accel;
-        const int64_t n_ff       = layer.ffn_up->ne[1];
+    for (const auto & cand : candidates) {
+        auto part = std::make_unique<llama_ffn_partition>();
+        part->n_ff_accel = cand.n_ff_accel;
+        part->dev        = accel_dev;
+
+        const int64_t n_ff_accel = cand.n_ff_accel;
+        const int64_t n_ff       = cand.up->ne[1];
         const int64_t n_ff_cpu   = n_ff - n_ff_accel;
 
         char name[128];
 
-        snprintf(name, sizeof(name), "blk.%zu.ffn_up.hsplit_gpu", il);
-        part->up_accel = ggml_new_tensor_2d(result->ctx_accel.get(), layer.ffn_up->type, layer.ffn_up->ne[0], n_ff_accel);
-        ggml_set_name(part->up_accel, name);
+        if (strcmp(cand.suffix, "shexp") == 0) {
+            snprintf(name, sizeof(name), "blk.%zu.ffn_up_shexp.hsplit_gpu", cand.il);
+            part->up_accel = ggml_new_tensor_2d(result->ctx_accel.get(), cand.up->type, cand.up->ne[0], n_ff_accel);
+            ggml_set_name(part->up_accel, name);
 
-        snprintf(name, sizeof(name), "blk.%zu.ffn_gate.hsplit_gpu", il);
-        part->gate_accel = ggml_new_tensor_2d(result->ctx_accel.get(), layer.ffn_gate->type, layer.ffn_gate->ne[0], n_ff_accel);
-        ggml_set_name(part->gate_accel, name);
+            snprintf(name, sizeof(name), "blk.%zu.ffn_gate_shexp.hsplit_gpu", cand.il);
+            part->gate_accel = ggml_new_tensor_2d(result->ctx_accel.get(), cand.gate->type, cand.gate->ne[0], n_ff_accel);
+            ggml_set_name(part->gate_accel, name);
 
-        snprintf(name, sizeof(name), "blk.%zu.ffn_down.hsplit_gpu", il);
-        part->down_accel = ggml_new_tensor_2d(result->ctx_accel.get(), layer.ffn_down->type, n_ff_accel, layer.ffn_down->ne[1]);
-        ggml_set_name(part->down_accel, name);
+            snprintf(name, sizeof(name), "blk.%zu.ffn_down_shexp.hsplit_gpu", cand.il);
+            part->down_accel = ggml_new_tensor_2d(result->ctx_accel.get(), cand.down->type, n_ff_accel, cand.down->ne[1]);
+            ggml_set_name(part->down_accel, name);
 
-        snprintf(name, sizeof(name), "blk.%zu.ffn_down.hsplit_cpu", il);
-        part->down_cpu = ggml_new_tensor_2d(result->ctx_cpu.get(), layer.ffn_down->type, n_ff_cpu, layer.ffn_down->ne[1]);
-        ggml_set_name(part->down_cpu, name);
+            snprintf(name, sizeof(name), "blk.%zu.ffn_down_shexp.hsplit_cpu", cand.il);
+            part->down_cpu = ggml_new_tensor_2d(result->ctx_cpu.get(), cand.down->type, n_ff_cpu, cand.down->ne[1]);
+            ggml_set_name(part->down_cpu, name);
+        } else {
+            snprintf(name, sizeof(name), "blk.%zu.ffn_up.hsplit_gpu", cand.il);
+            part->up_accel = ggml_new_tensor_2d(result->ctx_accel.get(), cand.up->type, cand.up->ne[0], n_ff_accel);
+            ggml_set_name(part->up_accel, name);
+
+            snprintf(name, sizeof(name), "blk.%zu.ffn_gate.hsplit_gpu", cand.il);
+            part->gate_accel = ggml_new_tensor_2d(result->ctx_accel.get(), cand.gate->type, cand.gate->ne[0], n_ff_accel);
+            ggml_set_name(part->gate_accel, name);
+
+            snprintf(name, sizeof(name), "blk.%zu.ffn_down.hsplit_gpu", cand.il);
+            part->down_accel = ggml_new_tensor_2d(result->ctx_accel.get(), cand.down->type, n_ff_accel, cand.down->ne[1]);
+            ggml_set_name(part->down_accel, name);
+
+            snprintf(name, sizeof(name), "blk.%zu.ffn_down.hsplit_cpu", cand.il);
+            part->down_cpu = ggml_new_tensor_2d(result->ctx_cpu.get(), cand.down->type, n_ff_cpu, cand.down->ne[1]);
+            ggml_set_name(part->down_cpu, name);
+        }
+
+        targets.push_back({ std::move(part), &cand });
     }
 
     // allocate backend buffers
@@ -172,40 +224,37 @@ std::unique_ptr<llama_ffn_partition_set> llama_ffn_partition_build(
     }
 
     // populate tensor data
-    for (size_t il = 0; il < n_layer; ++il) {
-        auto & part = result->partitions[il];
-        if (!part) {
-            continue;
-        }
+    for (auto & target : targets) {
+        const auto & cand = *target.cand;
+        auto & part       = target.part;
 
-        const auto & layer = model.layers[il];
         const int64_t n_ff_accel = part->n_ff_accel;
-        const int64_t n_ff       = layer.ffn_up->ne[1];
+        const int64_t n_ff       = cand.up->ne[1];
 
         // up_accel
         {
-            const size_t size = n_ff_accel * layer.ffn_up->nb[1];
+            const size_t size = n_ff_accel * cand.up->nb[1];
             std::vector<uint8_t> tmp(size);
-            ggml_backend_tensor_get(layer.ffn_up, tmp.data(), 0, size);
+            ggml_backend_tensor_get(cand.up, tmp.data(), 0, size);
             ggml_backend_tensor_set(part->up_accel, tmp.data(), 0, size);
         }
 
         // gate_accel
         {
-            const size_t size = n_ff_accel * layer.ffn_gate->nb[1];
+            const size_t size = n_ff_accel * cand.gate->nb[1];
             std::vector<uint8_t> tmp(size);
-            ggml_backend_tensor_get(layer.ffn_gate, tmp.data(), 0, size);
+            ggml_backend_tensor_get(cand.gate, tmp.data(), 0, size);
             ggml_backend_tensor_set(part->gate_accel, tmp.data(), 0, size);
         }
 
         // down_accel and down_cpu (row-by-row packed copy)
         {
-            const size_t down_nbytes = ggml_nbytes(layer.ffn_down);
+            const size_t down_nbytes = ggml_nbytes(cand.down);
             std::vector<uint8_t> down_src(down_nbytes);
-            ggml_backend_tensor_get(layer.ffn_down, down_src.data(), 0, down_nbytes);
+            ggml_backend_tensor_get(cand.down, down_src.data(), 0, down_nbytes);
 
-            const int64_t blk_size  = ggml_blck_size(layer.ffn_down->type);
-            const int64_t type_size = ggml_type_size(layer.ffn_down->type);
+            const int64_t blk_size  = ggml_blck_size(cand.down->type);
+            const int64_t type_size = ggml_type_size(cand.down->type);
 
             const int64_t gpu_row_bytes = (n_ff_accel / blk_size) * type_size;
             const int64_t cpu_row_bytes = ((n_ff - n_ff_accel) / blk_size) * type_size;
@@ -213,8 +262,8 @@ std::unique_ptr<llama_ffn_partition_set> llama_ffn_partition_build(
             std::vector<uint8_t> down_accel_data(ggml_nbytes(part->down_accel));
             std::vector<uint8_t> down_cpu_data(ggml_nbytes(part->down_cpu));
 
-            for (int64_t r = 0; r < layer.ffn_down->ne[1]; ++r) {
-                const uint8_t * src_row = down_src.data() + r * layer.ffn_down->nb[1];
+            for (int64_t r = 0; r < cand.down->ne[1]; ++r) {
+                const uint8_t * src_row = down_src.data() + r * cand.down->nb[1];
                 uint8_t * dst_gpu_row   = down_accel_data.data() + r * part->down_accel->nb[1];
                 uint8_t * dst_cpu_row   = down_cpu_data.data() + r * part->down_cpu->nb[1];
 
@@ -225,6 +274,8 @@ std::unique_ptr<llama_ffn_partition_set> llama_ffn_partition_build(
             ggml_backend_tensor_set(part->down_accel, down_accel_data.data(), 0, down_accel_data.size());
             ggml_backend_tensor_set(part->down_cpu, down_cpu_data.data(), 0, down_cpu_data.size());
         }
+
+        result->partitions[cand.up] = std::move(part);
     }
 
     return result;
