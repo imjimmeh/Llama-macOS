@@ -63,4 +63,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    size_t expert_cache_size  = 0;
+    bool   expert_cache_stats = false;
 };

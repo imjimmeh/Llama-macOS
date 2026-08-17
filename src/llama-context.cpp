@@ -139,6 +139,9 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    cparams.expert_cache_size  = params.expert_cache_size;
+    cparams.expert_cache_stats = params.expert_cache_stats;
+
     cparams.ctx_other = nullptr;
 
     // TODO: more generic
@@ -498,6 +501,9 @@ llama_context::~llama_context() {
             }
         }
     }
+    if (cparams.expert_cache_stats && sched) {
+        ggml_backend_sched_print_expert_cache_stats(sched.get());
+    }
     ggml_opt_free(opt_ctx);
 }
 
@@ -602,6 +608,9 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (cparams.expert_cache_size > 0) {
+        ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -637,6 +646,9 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                if (cparams.expert_cache_size > 0) {
+                    ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -3548,6 +3560,8 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.expert_cache_size           =*/ 0,
+        /*.expert_cache_stats          =*/ false,
     };
 
     return result;
@@ -4168,6 +4182,10 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+    if (ctx->get_cparams().expert_cache_stats && ctx->get_sched()) {
+        ggml_backend_sched_print_expert_cache_stats(ctx->get_sched());
+    }
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

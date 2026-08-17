@@ -408,6 +408,9 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        size_t expert_cache_size;  // expert cache capacity in bytes (0 = disabled)
+        bool   expert_cache_stats; // print expert cache performance stats on exit
     };
 
     struct llama_model_tensor_override {

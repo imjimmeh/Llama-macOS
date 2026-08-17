@@ -2739,6 +2739,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"-exc", "--expert-cache"}, "SIZE",
+        "size of VRAM cache for CPU-offloaded MoE experts (e.g. 1024M, 1.5G, 2048MB)",
+        [](common_params & params, const std::string & value) {
+            size_t idx = 0;
+            double val = std::stod(value, &idx);
+            std::string unit = value.substr(idx);
+            while (!unit.empty() && (unit.front() == ' ' || unit.front() == '\t')) unit.erase(unit.begin());
+            while (!unit.empty() && (unit.back() == ' ' || unit.back() == '\t')) unit.pop_back();
+            for (char & c : unit) c = toupper(c);
+
+            if (unit.empty() || unit == "B") {
+                params.expert_cache_size = (size_t)val;
+            } else if (unit == "K" || unit == "KB" || unit == "KIB") {
+                params.expert_cache_size = (size_t)(val * 1024.0);
+            } else if (unit == "M" || unit == "MB" || unit == "MIB") {
+                params.expert_cache_size = (size_t)(val * 1024.0 * 1024.0);
+            } else if (unit == "G" || unit == "GB" || unit == "GIB") {
+                params.expert_cache_size = (size_t)(val * 1024.0 * 1024.0 * 1024.0);
+            } else if (unit == "T" || unit == "TB" || unit == "TIB") {
+                params.expert_cache_size = (size_t)(val * 1024.0 * 1024.0 * 1024.0 * 1024.0);
+            } else {
+                throw std::invalid_argument("invalid unit in --expert-cache: " + unit);
+            }
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE"));
+    add_opt(common_arg(
+        {"-excs", "--expert-cache-stats"},
+        "print expert cache performance and hit-rate statistics on exit",
+        [](common_params & params) {
+            params.expert_cache_stats = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_STATS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

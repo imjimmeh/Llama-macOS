@@ -353,6 +353,10 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Expert cache
+    GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size);
+    GGML_API void                 ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched);
+
     //
     // Meta backend
     //
