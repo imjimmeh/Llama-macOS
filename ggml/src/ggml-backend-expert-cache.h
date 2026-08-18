@@ -11,13 +11,29 @@
 extern "C" {
 #endif
 
+// Expert cache key: identifies an expert within a weight tensor
 struct ggml_expert_cache_key {
     const struct ggml_tensor * tensor;
     int32_t expert_id;
 };
 
+// Expert bundle key: identifies an expert across an entire layer (gate, up, down)
+struct ggml_expert_bundle_key {
+    int32_t layer;
+    int32_t expert_id;
+};
+
+// SLRU cache segments
+enum ggml_expert_cache_segment {
+    GGML_EXPERT_CACHE_SEG_PROBATIONARY = 0,
+    GGML_EXPERT_CACHE_SEG_PROTECTED    = 1,
+};
+
+
+
 typedef struct ggml_backend_expert_cache * ggml_backend_expert_cache_t;
 
+// Lifecycle
 GGML_API ggml_backend_expert_cache_t ggml_backend_expert_cache_new(
     ggml_backend_t backend,
     size_t capacity);
@@ -25,6 +41,7 @@ GGML_API ggml_backend_expert_cache_t ggml_backend_expert_cache_new(
 GGML_API void ggml_backend_expert_cache_free(
     ggml_backend_expert_cache_t cache);
 
+// Period & Mode settings
 GGML_API void ggml_backend_expert_cache_set_period(
     ggml_backend_expert_cache_t cache,
     int32_t period);
@@ -35,6 +52,7 @@ GGML_API int32_t ggml_backend_expert_cache_get_period(
 GGML_API void ggml_backend_expert_cache_begin_step(
     ggml_backend_expert_cache_t cache);
 
+// Access recording & SLRU touch
 GGML_API void ggml_backend_expert_cache_record_access(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * tensor,
@@ -51,20 +69,19 @@ GGML_API void ggml_backend_expert_cache_process_jit_swaps(
     const struct ggml_tensor * completed_tensor,
     ggml_backend_t backend);
 
-GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_tensor(
-    ggml_backend_expert_cache_t cache);
-
-GGML_API size_t ggml_backend_expert_cache_find_offset(
-    ggml_backend_expert_cache_t cache,
-    const struct ggml_tensor * tensor,
-    int32_t expert_id);
-
 GGML_API void ggml_backend_expert_cache_touch(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * tensor,
     int32_t expert_id);
 
+// Telemetry
 GGML_API void ggml_backend_expert_cache_record_hit(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id,
+    size_t bytes_avoided);
+
+GGML_API void ggml_backend_expert_cache_record_zero_copy_hit(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * tensor,
     int32_t expert_id,
@@ -74,6 +91,43 @@ GGML_API void ggml_backend_expert_cache_record_miss(
     ggml_backend_expert_cache_t cache,
     size_t bytes_ram_to_gpu);
 
+// Legacy flat pool & offset lookup
+GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_tensor(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API size_t ggml_backend_expert_cache_find_offset(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
+// Phase 1: Zero-Copy Slot Pools & ID Remapping
+GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_slot_tensor(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * weight_tensor);
+
+GGML_API int32_t ggml_backend_expert_cache_find_slot(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
+GGML_API int32_t ggml_backend_expert_cache_alloc_slot_idx(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id,
+    const struct ggml_expert_cache_key * pinned_keys,
+    size_t n_pinned);
+
+// Remap array of router expert IDs to slot indices.
+// Returns number of hits.
+GGML_API int32_t ggml_backend_expert_cache_remap_ids(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    const int32_t * original_ids,
+    int32_t n_ids,
+    int32_t * out_remapped_ids,
+    bool * out_is_hit);
+
+// Legacy byte-based slot allocation
 GGML_API size_t ggml_backend_expert_cache_alloc_slot(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * tensor,
@@ -82,6 +136,46 @@ GGML_API size_t ggml_backend_expert_cache_alloc_slot(
     const struct ggml_expert_cache_key * pinned_keys,
     size_t n_pinned);
 
+// Phase 3: Expert Bundles
+GGML_API void ggml_backend_expert_cache_register_bundle(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const struct ggml_tensor * gate_tensor,
+    const struct ggml_tensor * up_tensor,
+    const struct ggml_tensor * down_tensor);
+
+GGML_API bool ggml_backend_expert_cache_is_bundle_resident(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    int32_t expert_id);
+
+// Phase 5: Pinned Host Memory & Staging
+GGML_API void * ggml_backend_expert_cache_get_pinned_buffer(
+    ggml_backend_expert_cache_t cache,
+    size_t required_size);
+
+// Phase 6: Transition Predictor & Speculative Prefetch
+GGML_API void ggml_backend_expert_cache_record_step_experts(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const int32_t * expert_ids,
+    int32_t n_experts);
+
+GGML_API int32_t ggml_backend_expert_cache_predict_next(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const int32_t * current_experts,
+    int32_t n_current,
+    int32_t * out_predicted,
+    int32_t max_predict);
+
+GGML_API void ggml_backend_expert_cache_prefetch(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    const int32_t * expert_ids,
+    int32_t n_experts);
+
+// Stats & Seeding
 GGML_API void ggml_backend_expert_cache_get_stats(
     ggml_backend_expert_cache_t cache,
     struct ggml_backend_expert_cache_stats * stats);
@@ -99,6 +193,9 @@ GGML_API bool ggml_backend_expert_cache_seed(
     const struct ggml_tensor * tensor,
     int32_t expert_id,
     uint32_t frequency);
+
+GGML_API void ggml_backend_expert_cache_sync(
+    ggml_backend_expert_cache_t cache);
 
 #ifdef __cplusplus
 }

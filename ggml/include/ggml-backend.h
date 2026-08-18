@@ -364,6 +364,9 @@ extern "C" {
     struct ggml_backend_expert_cache_stats {
         uint64_t n_requests;
         uint64_t n_hits;
+        uint64_t n_zero_copy_hits;
+        uint64_t n_d2d_fallback_hits;
+        uint64_t n_speculative_prefetches;
         uint64_t n_misses;
         uint64_t n_evictions;
         uint64_t n_rebalances;

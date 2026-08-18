@@ -2220,6 +2220,9 @@ bool ggml_backend_sched_get_expert_cache_stats(
             ggml_backend_expert_cache_get_stats(sched->expert_caches[b], &s);
             out_stats->n_requests    += s.n_requests;
             out_stats->n_hits        += s.n_hits;
+            out_stats->n_zero_copy_hits += s.n_zero_copy_hits;
+            out_stats->n_d2d_fallback_hits += s.n_d2d_fallback_hits;
+            out_stats->n_speculative_prefetches += s.n_speculative_prefetches;
             out_stats->n_misses      += s.n_misses;
             out_stats->n_evictions   += s.n_evictions;
             out_stats->n_rebalances  += s.n_rebalances;
