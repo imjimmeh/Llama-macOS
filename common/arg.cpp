@@ -2779,6 +2779,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.expert_cache_stats = true;
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_STATS"));
+    add_opt(common_arg(
+        {"-excr", "--expert-cache-profile"}, "NAME",
+        "name of expert cache profile for persistent hot-expert caching (e.g. 'coding', 'prose')",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_profile = value;
+            params.expert_cache_persist = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_PROFILE"));
+    add_opt(common_arg(
+        {"-excf", "--expert-cache-file"}, "PATH",
+        "explicit path to JSON file for persisting/loading hot-expert cache profile",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_file = value;
+            params.expert_cache_persist = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_FILE"));
+    add_opt(common_arg(
+        {"--expert-cache-persist"},
+        "enable automatic disk persistence of expert cache profiles (default: enabled)",
+        [](common_params & params) {
+            params.expert_cache_persist = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_PERSIST"));
+    add_opt(common_arg(
+        {"--no-expert-cache-persist"},
+        "disable automatic disk persistence of expert cache profiles",
+        [](common_params & params) {
+            params.expert_cache_persist = false;
+        }
+    ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

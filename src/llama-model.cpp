@@ -2090,6 +2090,13 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     return it->second;
 }
 
+const struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name) {
+    if (model == nullptr || name == nullptr) {
+        return nullptr;
+    }
+    return model->get_tensor(name);
+}
+
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }

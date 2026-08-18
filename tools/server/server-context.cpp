@@ -9,6 +9,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "expert-cache-profile.h"
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -878,6 +879,8 @@ private:
     bool sleeping = false;
 
     int64_t t_last_load_progress_ms = 0;
+    int64_t t_last_expert_cache_save_us = 0;
+    bool had_processing = false;
 
     void destroy() {
         spec.reset();
@@ -2726,9 +2729,23 @@ private:
 
                 metrics_flush_idle();
 
+                if (had_processing) {
+                    had_processing = false;
+                    if (params_base.expert_cache_size > 0 && params_base.expert_cache_persist && ctx_tgt && model_tgt) {
+                        int64_t now_us = ggml_time_us();
+                        if (now_us - t_last_expert_cache_save_us > 5LL * 1000 * 1000) {
+                            t_last_expert_cache_save_us = now_us;
+                            std::string profile_path = common_expert_cache_get_file_path(
+                                params_base.model.path, params_base.expert_cache_profile, params_base.expert_cache_file);
+                            common_expert_cache_save_profile(ctx_tgt, model_tgt, profile_path, params_base.expert_cache_profile);
+                        }
+                    }
+                }
+
                 return; // skip further processing
 
             } else {
+                had_processing = true;
                 SRV_DBG("%s", "posting NEXT_RESPONSE\n");
 
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);

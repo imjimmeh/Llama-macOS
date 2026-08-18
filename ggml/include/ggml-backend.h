@@ -354,9 +354,19 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
     // Expert cache
+    struct ggml_backend_expert_cache_export_entry {
+        const struct ggml_tensor * tensor;
+        int32_t expert_id;
+        uint32_t frequency;
+        uint64_t hit_count;
+    };
+
     GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size);
     GGML_API void                 ggml_backend_sched_set_expert_cache_period(ggml_backend_sched_t sched, int32_t period);
     GGML_API void                 ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched);
+    GGML_API size_t               ggml_backend_sched_expert_cache_export_entries(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_export_entry * out_entries, size_t max_entries);
+    GGML_API bool                 ggml_backend_sched_expert_cache_seed(ggml_backend_sched_t sched, int backend_idx, const struct ggml_tensor * tensor, int32_t expert_id, uint32_t frequency);
+    GGML_API void                 ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched);
 
     //
     // Meta backend

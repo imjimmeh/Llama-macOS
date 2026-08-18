@@ -94,6 +94,17 @@ GGML_API void ggml_backend_expert_cache_get_stats(
 GGML_API void ggml_backend_expert_cache_print_stats(
     ggml_backend_expert_cache_t cache);
 
+GGML_API size_t ggml_backend_expert_cache_export_entries(
+    ggml_backend_expert_cache_t cache,
+    struct ggml_backend_expert_cache_export_entry * out_entries,
+    size_t max_entries);
+
+GGML_API bool ggml_backend_expert_cache_seed(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id,
+    uint32_t frequency);
+
 #ifdef __cplusplus
 }
 #endif

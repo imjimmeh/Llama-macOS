@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "expert-cache-profile.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -1284,10 +1285,13 @@ struct common_init_result::impl {
 
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
+
+    common_params params;
 };
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    pimpl->params = params;
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1428,6 +1432,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         return res;
     }
 
+    if (params.expert_cache_size > 0 && params.expert_cache_persist) {
+        std::string profile_path = common_expert_cache_get_file_path(
+            params.model.path, params.expert_cache_profile, params.expert_cache_file);
+        common_expert_cache_load_profile(lctx, model, profile_path);
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
@@ -1525,7 +1535,13 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     return res;
 }
 
-common_init_result::~common_init_result() = default;
+common_init_result::~common_init_result() {
+    if (pimpl && pimpl->params.expert_cache_size > 0 && pimpl->params.expert_cache_persist && pimpl->context && pimpl->model) {
+        std::string profile_path = common_expert_cache_get_file_path(
+            pimpl->params.model.path, pimpl->params.expert_cache_profile, pimpl->params.expert_cache_file);
+        common_expert_cache_save_profile(pimpl->context.get(), pimpl->model.get(), profile_path, pimpl->params.expert_cache_profile);
+    }
+}
 
 std::string common_get_model_endpoint() {
     std::string endpoint = common_get_env("MODEL_ENDPOINT");

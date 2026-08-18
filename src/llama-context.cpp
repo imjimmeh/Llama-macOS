@@ -4272,3 +4272,7 @@ void llama_set_expert_cache_period(struct llama_context * ctx, int32_t period) {
 int32_t llama_get_expert_cache_period(const struct llama_context * ctx) {
     return ctx ? ctx->get_cparams().expert_cache_period : 0;
 }
+
+ggml_backend_sched_t llama_context_get_sched(const struct llama_context * ctx) {
+    return ctx ? ctx->get_sched() : nullptr;
+}

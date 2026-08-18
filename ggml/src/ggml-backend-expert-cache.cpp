@@ -623,3 +623,86 @@ void ggml_backend_expert_cache_print_stats(ggml_backend_expert_cache_t cache) {
     GGML_LOG_INFO("  avoided RAM -> GPU:   %8.2f GiB\n", avoided_gib);
     GGML_LOG_INFO("  evictions:            %" PRIu64 "\n", cache->stats.n_evictions);
 }
+
+size_t ggml_backend_expert_cache_export_entries(
+        ggml_backend_expert_cache_t cache,
+        struct ggml_backend_expert_cache_export_entry * out_entries,
+        size_t max_entries) {
+    if (cache == NULL || out_entries == NULL || max_entries == 0) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (const auto & kv : cache->access_freq) {
+        if (count >= max_entries) {
+            break;
+        }
+        if (kv.first.tensor == NULL) {
+            continue;
+        }
+
+        uint64_t hits = 0;
+        auto eit = cache->entries.find(kv.first);
+        if (eit != cache->entries.end()) {
+            hits = eit->second.hit_count;
+        }
+
+        out_entries[count].tensor    = kv.first.tensor;
+        out_entries[count].expert_id = kv.first.expert_id;
+        out_entries[count].frequency = kv.second;
+        out_entries[count].hit_count = hits;
+        count++;
+    }
+
+    // Also include any resident entries that might have 0 access_freq in current window
+    for (const auto & kv : cache->entries) {
+        if (count >= max_entries) {
+            break;
+        }
+        if (cache->access_freq.find(kv.first) == cache->access_freq.end()) {
+            out_entries[count].tensor    = kv.first.tensor;
+            out_entries[count].expert_id = kv.first.expert_id;
+            out_entries[count].frequency = 0;
+            out_entries[count].hit_count = kv.second.hit_count;
+            count++;
+        }
+    }
+
+    return count;
+}
+
+bool ggml_backend_expert_cache_seed(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id,
+        uint32_t frequency) {
+    if (cache == NULL || tensor == NULL || expert_id < 0 || tensor->data == NULL) {
+        return false;
+    }
+
+    ggml_expert_cache_key key = { tensor, expert_id };
+    cache->access_freq[key] = std::max(cache->access_freq[key], frequency);
+
+    if (cache->entries.find(key) != cache->entries.end()) {
+        return true;
+    }
+
+    const size_t expert_size = tensor->nb[2];
+    size_t slot_offset = ggml_backend_expert_cache_alloc_slot(
+        cache, tensor, expert_id, expert_size, NULL, 0);
+
+    if (slot_offset == SIZE_MAX) {
+        return false;
+    }
+
+    const size_t src_off = (size_t)expert_id * expert_size;
+    ggml_backend_tensor_set_async(
+        cache->backend,
+        cache->tensor,
+        (const uint8_t *)tensor->data + src_off,
+        slot_offset,
+        expert_size);
+
+    return true;
+}
+

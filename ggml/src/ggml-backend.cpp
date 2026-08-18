@@ -2183,6 +2183,70 @@ void ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched) {
     }
 }
 
+size_t ggml_backend_sched_expert_cache_export_entries(
+        ggml_backend_sched_t sched,
+        int backend_idx,
+        struct ggml_backend_expert_cache_export_entry * out_entries,
+        size_t max_entries) {
+    if (sched == NULL) {
+        return 0;
+    }
+    if (backend_idx >= 0 && backend_idx < sched->n_backends) {
+        if (sched->expert_caches[backend_idx]) {
+            return ggml_backend_expert_cache_export_entries(sched->expert_caches[backend_idx], out_entries, max_entries);
+        }
+        return 0;
+    }
+
+    size_t total = 0;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b] && total < max_entries) {
+            total += ggml_backend_expert_cache_export_entries(
+                sched->expert_caches[b], out_entries + total, max_entries - total);
+        }
+    }
+    return total;
+}
+
+bool ggml_backend_sched_expert_cache_seed(
+        ggml_backend_sched_t sched,
+        int backend_idx,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id,
+        uint32_t frequency) {
+    if (sched == NULL || tensor == NULL) {
+        return false;
+    }
+    if (backend_idx >= 0 && backend_idx < sched->n_backends) {
+        if (sched->expert_caches[backend_idx]) {
+            return ggml_backend_expert_cache_seed(sched->expert_caches[backend_idx], tensor, expert_id, frequency);
+        }
+        return false;
+    }
+
+    bool any_success = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b]) {
+            if (ggml_backend_expert_cache_seed(sched->expert_caches[b], tensor, expert_id, frequency)) {
+                any_success = true;
+            }
+        }
+    }
+    return any_success;
+}
+
+void ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched) {
+    if (sched == NULL) {
+        return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b]) {
+            ggml_backend_synchronize(sched->backends[b]);
+        }
+    }
+}
+
+
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
