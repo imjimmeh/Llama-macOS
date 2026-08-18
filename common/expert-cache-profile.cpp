@@ -151,6 +151,17 @@ bool common_expert_cache_save_profile(
     }
 
     entries.resize(n_entries);
+    entries.erase(
+        std::remove_if(entries.begin(), entries.end(),
+            [](const ggml_backend_expert_cache_export_entry & e) {
+                return e.frequency == 0 && e.hit_count == 0;
+            }),
+        entries.end());
+
+    if (entries.empty()) {
+        return true;
+    }
+
     std::sort(entries.begin(), entries.end(),
         [](const ggml_backend_expert_cache_export_entry & a, const ggml_backend_expert_cache_export_entry & b) {
             if (a.frequency != b.frequency) {
@@ -159,10 +170,15 @@ bool common_expert_cache_save_profile(
             return a.hit_count > b.hit_count;
         });
 
+    const size_t max_profile_entries = 512;
+    if (entries.size() > max_profile_entries) {
+        entries.resize(max_profile_entries);
+    }
+
     json j;
     j["version"] = 1;
     j["profile"] = profile_name.empty() ? "default" : profile_name;
-    j["n_entries"] = n_entries;
+    j["n_entries"] = entries.size();
 
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);

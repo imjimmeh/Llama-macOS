@@ -638,6 +638,20 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        if (ctx_tgt) {
+            ggml_backend_sched_t sched = llama_context_get_sched(ctx_tgt);
+            if (sched) {
+                struct ggml_backend_expert_cache_stats ec_stats;
+                if (ggml_backend_sched_get_expert_cache_stats(sched, -1, &ec_stats) && ec_stats.n_requests > 0) {
+                    const double hit_rate = 100.0 * (double)ec_stats.n_hits / (double)ec_stats.n_requests;
+                    const double avoided_gib = (double)ec_stats.bytes_avoided / (1024.0 * 1024.0 * 1024.0);
+                    SLT_INF(*this,
+                            "expert cache = %6.2f %% hit rate (%5" PRIu64 " hits / %5" PRIu64 " reqs, %6.2f GiB PCIe saved)\n",
+                            hit_rate, ec_stats.n_hits, ec_stats.n_requests, avoided_gib);
+                }
+            }
+        }
     }
 
     json to_json(bool only_metrics = false) const {
