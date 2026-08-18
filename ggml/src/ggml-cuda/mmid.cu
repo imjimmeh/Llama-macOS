@@ -1,23 +1,17 @@
 #include "common.cuh"
 #include "mmid.cuh"
 
-// To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
-struct mm_ids_helper_store {
-    uint32_t data;
-
-    __device__ mm_ids_helper_store(const uint32_t it, const uint32_t iex_used) {
-        data = (it & 0x003FFFFF) | (iex_used << 22);
+template <int warp_size>
+__device__ __forceinline__ int warp_prefix_sum(int val) {
+#pragma unroll
+    for (int offset = 1; offset < warp_size; offset *= 2) {
+        const int tmp = __shfl_up_sync(0xFFFFFFFF, val, offset, warp_size);
+        if (threadIdx.x >= static_cast<unsigned int>(offset)) {
+            val += tmp;
+        }
     }
-
-    __device__ uint32_t it() const {
-        return data & 0x003FFFFF;
-    }
-
-    __device__ uint32_t iex_used() const {
-        return data >> 22;
-    }
-};
-static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_helper_store");
+    return val;
+}
 
 // Helper function for mul_mat_id, converts ids to a more convenient format.
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
@@ -35,7 +29,7 @@ static __global__ void mm_ids_helper(
     int nex_prev = 0; // Number of columns for experts with a lower index.
 
     if constexpr (n_expert_used_template == 0) {
-        // Pass 1: compute nex_prev
+        // Pass 1: count columns for experts with a lower index
         for (int it = 0; it < n_tokens; ++it) {
             for (int iex = 0; iex < n_expert_used; ++iex) {
                 const int expert_used = ids[it*si1 + iex];
@@ -91,7 +85,7 @@ static __global__ void mm_ids_helper(
             expert_bounds[expert] = nex_prev;
         }
 
-        // Pass 2: write directly to global memory using warp prefix scan
+        // Pass 2: write directly to global memory using Kogge-Stone warp prefix scan
         int it_compact = 0;
         for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
             const int it = it0 + threadIdx.x / neu_padded;
@@ -101,15 +95,8 @@ static __global__ void mm_ids_helper(
             const int iex_used = expert_used == expert ? iex : -1;
 
             const int it_compact_add_self = (iex_used != -1) ? 1 : 0;
-
-            int it_compact_add_lower = 0;
-#pragma unroll
-            for (int offset = 1; offset < warp_size; offset *= 2) {
-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self + it_compact_add_lower, offset, warp_size);
-                if (threadIdx.x >= static_cast<unsigned int>(offset)) {
-                    it_compact_add_lower += tmp;
-                }
-            }
+            const int inclusive = warp_prefix_sum<warp_size>(it_compact_add_self);
+            const int it_compact_add_lower = inclusive - it_compact_add_self;
 
             if (iex_used != -1) {
                 const int dst_idx = nex_prev + it_compact + it_compact_add_lower;
@@ -121,7 +108,7 @@ static __global__ void mm_ids_helper(
                 }
             }
 
-            const int warp_matches = __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+            const int warp_matches = __shfl_sync(0xFFFFFFFF, inclusive, warp_size - 1, warp_size);
             it_compact += warp_matches;
         }
 

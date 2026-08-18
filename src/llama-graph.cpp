@@ -1522,16 +1522,24 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+          ggml_tensor * w_s,
+          ggml_backend_t branch_be) const {
+    auto pin = [&](ggml_tensor * t) -> ggml_tensor * {
+        if (sched && branch_be && t) {
+            ggml_backend_sched_set_tensor_backend(sched, t, branch_be);
+        }
+        return t;
+    };
+
+    ggml_tensor * res = pin(ggml_mul_mat_id(ctx0, w, cur, ids));
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
-        ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, ids);
-        res = ggml_mul(ctx0, res, s);
+        ggml_tensor * s = pin(ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1));
+        s = pin(ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1));
+        s = pin(ggml_get_rows(ctx0, s, ids));
+        res = pin(ggml_mul(ctx0, res, s));
     }
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -1543,14 +1551,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const float rank  = (float) lw->b->ne[0];
         const float scale = alpha ? lora.second * alpha / rank : lora.second;
 
-        ggml_tensor * ab_cur = ggml_mul_mat_id(
+        ggml_tensor * ab_cur = pin(ggml_mul_mat_id(
                 ctx0, lw->b,
-                ggml_mul_mat_id(ctx0, lw->a, cur, ids),
+                pin(ggml_mul_mat_id(ctx0, lw->a, cur, ids)),
                 ids
-                );
+                ));
 
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
+        ab_cur = pin(ggml_scale(ctx0, ab_cur, scale));
+        res = pin(ggml_add(ctx0, res, ab_cur));
     }
 
     return res;
@@ -2205,9 +2213,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // check if layer has MoE heterogeneous residency partition
+    // check if layer has MoE heterogeneous residency partition (decode token generation)
     ggml_tensor * moe_key = up_exps ? up_exps : gate_up_exps;
-    if (moe_partitions && moe_key) {
+    if (moe_partitions && moe_key && n_tokens == 1) {
         const auto * part = moe_partitions->find(moe_key);
         if (part && part->n_expert_accel > 0) {
             return build_moe_ffn_partitioned(
@@ -2650,25 +2658,49 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
     const int64_t n_expert_accel = part.n_expert_accel;
     const int64_t n_tokens       = cur->ne[1];
 
+    ggml_backend_t be_gpu = nullptr;
+    if (sched) {
+        for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
+            ggml_backend_t be = ggml_backend_sched_get_backend(sched, b);
+            if (ggml_backend_get_device(be) == part.dev) {
+                be_gpu = be;
+                break;
+            }
+        }
+    }
+
+    auto pin_tensor = [&](ggml_tensor * t, ggml_backend_t be) -> ggml_tensor * {
+        if (sched && be && t) {
+            ggml_backend_sched_set_tensor_backend(sched, t, be);
+        }
+        return t;
+    };
+
     // Ensure selected_experts is contiguous before 1D reshape
     ggml_tensor * sel_cont = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
     ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, sel_cont, n_expert_used * n_tokens);
 
-    // 1. Look up is_gpu / is_cpu masks from expert_mask_table [2, n_expert_total]
-    ggml_tensor * looked_up_masks = ggml_get_rows(ctx0, part.expert_mask_table, sel_flat);
-    looked_up_masks = ggml_reshape_3d(ctx0, looked_up_masks, 2, n_expert_used, n_tokens);
+    // 1. Look up contiguous is_gpu / is_cpu masks from dedicated 1D tables on GPU
+    ggml_tensor * is_gpu_expert_1d = pin_tensor(ggml_get_rows(ctx0, part.expert_gpu_mask_table, sel_flat), be_gpu);
+    ggml_tensor * is_gpu_expert    = pin_tensor(ggml_reshape_3d(ctx0, is_gpu_expert_1d, 1, n_expert_used, n_tokens), be_gpu);
 
-    ggml_tensor * is_gpu_expert = ggml_view_3d(ctx0, looked_up_masks, 1, n_expert_used, n_tokens, looked_up_masks->nb[1], looked_up_masks->nb[2], 0 * sizeof(float));
-    ggml_tensor * is_cpu_expert = ggml_view_3d(ctx0, looked_up_masks, 1, n_expert_used, n_tokens, looked_up_masks->nb[1], looked_up_masks->nb[2], 1 * sizeof(float));
+    ggml_tensor * is_cpu_expert_1d = pin_tensor(ggml_get_rows(ctx0, part.expert_cpu_mask_table, sel_flat), be_gpu);
+    ggml_tensor * is_cpu_expert    = pin_tensor(ggml_reshape_3d(ctx0, is_cpu_expert_1d, 1, n_expert_used, n_tokens), be_gpu);
 
-    ggml_tensor * gpu_weights = ggml_mul(ctx0, weights, is_gpu_expert);
-    ggml_tensor * cpu_weights = ggml_mul(ctx0, weights, is_cpu_expert);
+    ggml_tensor * gpu_weights = pin_tensor(ggml_mul(ctx0, weights, is_gpu_expert), be_gpu);
+    ggml_tensor * cpu_weights = pin_tensor(ggml_mul(ctx0, weights, is_cpu_expert), be_gpu);
 
     // 2. Look up resident slot indices from expert_slot_table [1, n_expert_total] (I32)
-    ggml_tensor * gpu_experts_1d = ggml_get_rows(ctx0, part.expert_slot_table, sel_flat);
-    ggml_tensor * gpu_experts    = ggml_reshape_2d(ctx0, gpu_experts_1d, n_expert_used, n_tokens);
+    ggml_tensor * gpu_experts_1d = pin_tensor(ggml_get_rows(ctx0, part.expert_slot_table, sel_flat), be_gpu);
+    ggml_tensor * gpu_experts    = pin_tensor(ggml_reshape_2d(ctx0, gpu_experts_1d, n_expert_used, n_tokens), be_gpu);
+
+    // 3. Create isolated CPU-resident bridge copies to prevent CPU from dereferencing GPU memory
+    ggml_tensor * selected_experts_cpu = pin_tensor(ggml_dup(ctx0, selected_experts), backend_cpu);
+    ggml_tensor * cpu_weights_cpu      = pin_tensor(ggml_dup(ctx0, cpu_weights), backend_cpu);
+    ggml_tensor * cur_cpu              = pin_tensor(ggml_dup(ctx0, cur), backend_cpu);
 
     auto build_branch = [&](
+            ggml_tensor * cur_in,
             ggml_tensor * up_e,
             ggml_tensor * up_e_b,
             ggml_tensor * up_e_s,
@@ -2682,15 +2714,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
             ggml_tensor * gate_up_e_b,
             ggml_tensor * sel_exp,
             ggml_tensor * wgt,
-            const char  * suffix) -> ggml_tensor * {
-        const int64_t n_embd_b   = cur->ne[0];
-        const int64_t n_tokens_b = cur->ne[1];
+            const char  * suffix,
+            ggml_backend_t branch_be) -> ggml_tensor * {
+        const int64_t n_embd_b   = cur_in->ne[0];
+        const int64_t n_tokens_b = cur_in->ne[1];
 
-        ggml_tensor * cur_b = ggml_reshape_3d(ctx0, cur, n_embd_b, 1, n_tokens_b);
+        auto pin = [&](ggml_tensor * t) -> ggml_tensor * {
+            if (sched && branch_be && t) {
+                ggml_backend_sched_set_tensor_backend(sched, t, branch_be);
+            }
+            return t;
+        };
+
+        ggml_tensor * cur_b = pin(ggml_reshape_3d(ctx0, cur_in, n_embd_b, 1, n_tokens_b));
 
         if (weight_before_ffn) {
-            ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur_b, n_embd_b, n_expert_used, n_tokens_b, 1);
-            cur_b = ggml_mul(ctx0, repeated, wgt);
+            ggml_tensor * repeated = pin(ggml_repeat_4d(ctx0, cur_b, n_embd_b, n_expert_used, n_tokens_b, 1));
+            cur_b = pin(ggml_mul(ctx0, repeated, wgt));
             char name[64];
             snprintf(name, sizeof(name), "ffn_moe_weighted%s", suffix);
             cb(cur_b, name, il);
@@ -2700,7 +2740,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
         ggml_tensor * experts = nullptr;
 
         if (gate_up_e) {
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_e, cur_b, sel_exp, up_e_s);
+            ggml_tensor * gate_up = pin(build_lora_mm_id(gate_up_e, cur_b, sel_exp, up_e_s, branch_be));
             char name[64];
             snprintf(name, sizeof(name), "ffn_moe_gate_up%s", suffix);
             cb(gate_up, name, il);
@@ -2711,21 +2751,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
             }
 
             if (gate_up_e_b) {
-                gate_up = ggml_add_id(ctx0, gate_up, gate_up_e_b, sel_exp);
+                gate_up = pin(ggml_add_id(ctx0, gate_up, gate_up_e_b, sel_exp));
                 snprintf(name, sizeof(name), "ffn_moe_gate_up_biased%s", suffix);
                 cb(gate_up, name, il);
             }
 
             const int64_t n_ff = gate_up->ne[0] / 2;
-            cur_b = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+            cur_b = pin(ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0));
             snprintf(name, sizeof(name), "ffn_moe_gate%s", suffix);
             cb(cur_b, name, il);
 
-            up = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+            up = pin(ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]));
             snprintf(name, sizeof(name), "ffn_moe_up%s", suffix);
             cb(up, name, il);
         } else {
-            up = build_lora_mm_id(up_e, cur_b, sel_exp, up_e_s);
+            up = pin(build_lora_mm_id(up_e, cur_b, sel_exp, up_e_s, branch_be));
             char name[64];
             snprintf(name, sizeof(name), "ffn_moe_up%s", suffix);
             cb(up, name, il);
@@ -2736,13 +2776,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
             }
 
             if (up_e_b) {
-                up = ggml_add_id(ctx0, up, up_e_b, sel_exp);
+                up = pin(ggml_add_id(ctx0, up, up_e_b, sel_exp));
                 snprintf(name, sizeof(name), "ffn_moe_up_biased%s", suffix);
                 cb(up, name, il);
             }
 
             if (gate_e) {
-                cur_b = build_lora_mm_id(gate_e, cur_b, sel_exp, gate_e_s);
+                cur_b = pin(build_lora_mm_id(gate_e, cur_b, sel_exp, gate_e_s, branch_be));
                 snprintf(name, sizeof(name), "ffn_moe_gate%s", suffix);
                 cb(cur_b, name, il);
             } else {
@@ -2755,7 +2795,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
             }
 
             if (gate_e_b) {
-                cur_b = ggml_add_id(ctx0, cur_b, gate_e_b, sel_exp);
+                cur_b = pin(ggml_add_id(ctx0, cur_b, gate_e_b, sel_exp));
                 snprintf(name, sizeof(name), "ffn_moe_gate_biased%s", suffix);
                 cb(cur_b, name, il);
             }
@@ -2770,24 +2810,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
                         const float limit = hparams.swiglu_clamp_exp[il];
                         constexpr float eps = 1e-6f;
                         if (limit > eps) {
-                            up = ggml_clamp(ctx0, up, -limit, limit);
+                            up = pin(ggml_clamp(ctx0, up, -limit, limit));
                             char name[64];
                             snprintf(name, sizeof(name), "ffn_moe_up_clamped%s", suffix);
                             cb(up, name, il);
 
                             if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
-                                cur_b = ggml_clamp(ctx0, cur_b, -INFINITY, limit);
+                                cur_b = pin(ggml_clamp(ctx0, cur_b, -INFINITY, limit));
                                 snprintf(name, sizeof(name), "ffn_moe_gate_clamped%s", suffix);
                                 cb(cur_b, name, il);
-                                cur_b = ggml_swiglu_split(ctx0, cur_b, up);
+                                cur_b = pin(ggml_swiglu_split(ctx0, cur_b, up));
                             } else {
-                                ggml_tensor * gate_act = ggml_silu(ctx0, cur_b);
+                                ggml_tensor * gate_act = pin(ggml_silu(ctx0, cur_b));
                                 snprintf(name, sizeof(name), "ffn_moe_silu%s", suffix);
                                 cb(gate_act, name, il);
-                                gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                                gate_act = pin(ggml_clamp(ctx0, gate_act, -INFINITY, limit));
                                 snprintf(name, sizeof(name), "ffn_moe_silu_clamped%s", suffix);
                                 cb(gate_act, name, il);
-                                cur_b = ggml_mul(ctx0, gate_act, up);
+                                cur_b = pin(ggml_mul(ctx0, gate_act, up));
                             }
                             snprintf(name, sizeof(name), "ffn_moe_swiglu_limited%s", suffix);
                             cb(cur_b, name, il);
@@ -2797,12 +2837,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
                 }
 
                 if (has_gate) {
-                    cur_b = ggml_swiglu_split(ctx0, cur_b, up);
+                    cur_b = pin(ggml_swiglu_split(ctx0, cur_b, up));
                     char name[64];
                     snprintf(name, sizeof(name), "ffn_moe_swiglu%s", suffix);
                     cb(cur_b, name, il);
                 } else {
-                    cur_b = ggml_silu(ctx0, cur_b);
+                    cur_b = pin(ggml_silu(ctx0, cur_b));
                     char name[64];
                     snprintf(name, sizeof(name), "ffn_moe_silu%s", suffix);
                     cb(cur_b, name, il);
@@ -2813,24 +2853,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
-                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur_b, 1.0f/beta)), beta);
-                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur_b));
+                    ggml_tensor * act = pin(ggml_scale(ctx0, pin(ggml_tanh(ctx0, pin(ggml_scale(ctx0, cur_b, 1.0f/beta)))), beta));
+                    act = pin(ggml_mul(ctx0, act, pin(ggml_sigmoid(ctx0, cur_b))));
                     if (lb > 0.0f) {
-                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
+                        up = pin(ggml_scale(ctx0, pin(ggml_tanh(ctx0, pin(ggml_scale(ctx0, up, 1.0f/lb)))), lb));
                     }
-                    cur_b = ggml_mul(ctx0, act, up);
+                    cur_b = pin(ggml_mul(ctx0, act, up));
                     char name[64];
                     snprintf(name, sizeof(name), "ffn_moe_situ%s", suffix);
                     cb(cur_b, name, il);
                 } break;
             case LLM_FFN_GELU:
                 if (has_gate) {
-                    cur_b = ggml_geglu_split(ctx0, cur_b, up);
+                    cur_b = pin(ggml_geglu_split(ctx0, cur_b, up));
                     char name[64];
                     snprintf(name, sizeof(name), "ffn_moe_geglu%s", suffix);
                     cb(cur_b, name, il);
                 } else {
-                    cur_b = ggml_gelu(ctx0, cur_b);
+                    cur_b = pin(ggml_gelu(ctx0, cur_b));
                     char name[64];
                     snprintf(name, sizeof(name), "ffn_moe_gelu%s", suffix);
                     cb(cur_b, name, il);
@@ -2839,19 +2879,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
                 {
                     constexpr float alpha = 1.702f;
                     constexpr float limit = 7.0f;
-                    cur_b = ggml_swiglu_oai(ctx0, cur_b, up, alpha, limit);
+                    cur_b = pin(ggml_swiglu_oai(ctx0, cur_b, up, alpha, limit));
                     char name[64];
                     snprintf(name, sizeof(name), "ffn_moe_swiglu_oai%s", suffix);
                     cb(cur_b, name, il);
                 } break;
             case LLM_FFN_RELU:
                 if (has_gate) {
-                    cur_b = ggml_reglu_split(ctx0, cur_b, up);
+                    cur_b = pin(ggml_reglu_split(ctx0, cur_b, up));
                     char name[64];
                     snprintf(name, sizeof(name), "ffn_moe_reglu%s", suffix);
                     cb(cur_b, name, il);
                 } else {
-                    cur_b = ggml_relu(ctx0, cur_b);
+                    cur_b = pin(ggml_relu(ctx0, cur_b));
                     char name[64];
                     snprintf(name, sizeof(name), "ffn_moe_relu%s", suffix);
                     cb(cur_b, name, il);
@@ -2860,8 +2900,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
                 if (has_gate) {
                     GGML_ABORT("fatal error: gated squared relu not implemented");
                 } else {
-                    cur_b = ggml_relu(ctx0, cur_b);
-                    cur_b = ggml_sqr(ctx0, cur_b);
+                    cur_b = pin(ggml_relu(ctx0, cur_b));
+                    cur_b = pin(ggml_sqr(ctx0, cur_b));
                     char name[64];
                     snprintf(name, sizeof(name), "ffn_moe_relu_sqr%s", suffix);
                     cb(cur_b, name, il);
@@ -2870,7 +2910,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
                 GGML_ABORT("fatal error");
         }
 
-        experts = build_lora_mm_id(down_e, cur_b, sel_exp, down_e_s);
+        experts = pin(build_lora_mm_id(down_e, cur_b, sel_exp, down_e_s, branch_be));
         char name[64];
         snprintf(name, sizeof(name), "ffn_moe_down%s", suffix);
         cb(experts, name, il);
@@ -2881,13 +2921,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
         }
 
         if (down_e_b) {
-            experts = ggml_add_id(ctx0, experts, down_e_b, sel_exp);
+            experts = pin(ggml_add_id(ctx0, experts, down_e_b, sel_exp));
             snprintf(name, sizeof(name), "ffn_moe_down_biased%s", suffix);
             cb(experts, name, il);
         }
 
         if (!weight_before_ffn) {
-            experts = ggml_mul(ctx0, experts, wgt);
+            experts = pin(ggml_mul(ctx0, experts, wgt));
             snprintf(name, sizeof(name), "ffn_moe_weighted%s", suffix);
             cb(experts, name, il);
         }
@@ -2899,19 +2939,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
         assert(n_expert_used > 0);
 
         for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
-            cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd_b, n_tokens_b, experts->nb[2], i*experts->nb[1]);
+            cur_experts[i] = pin(ggml_view_2d(ctx0, experts, n_embd_b, n_tokens_b, experts->nb[2], i*experts->nb[1]));
             ggml_build_forward_expand(gf, cur_experts[i]);
         }
 
         ggml_tensor * moe_out = cur_experts[0];
 
         for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-            moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+            moe_out = pin(ggml_add(ctx0, moe_out, cur_experts[i]));
             ggml_build_forward_expand(gf, moe_out);
         }
 
         if (hparams.n_expert_used == 1) {
-            moe_out = ggml_cont(ctx0, moe_out);
+            moe_out = pin(ggml_cont(ctx0, moe_out));
         }
 
         snprintf(name, sizeof(name), "ffn_moe_out%s", suffix);
@@ -2920,40 +2960,32 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
         return moe_out;
     };
 
-    // 2. Build GPU branch
+    // 4. Build GPU branch (all tensors pinned to GPU backend)
     ggml_tensor * gpu_branch = build_branch(
+        cur,
         part.up_exps_accel, part.up_exps_b_accel, part.up_exps_s_accel,
         part.gate_exps_accel, part.gate_exps_b_accel, part.gate_exps_s_accel,
         part.down_exps_accel, part.down_exps_b_accel, part.down_exps_s_accel,
         part.gate_up_exps_accel, part.gate_up_exps_b_accel,
         gpu_experts, gpu_weights,
-        "_gpu");
+        "_gpu", be_gpu);
 
-    // 3. Build CPU branch
+    // 5. Build CPU branch (all tensors pinned to CPU backend)
     ggml_tensor * cpu_branch = build_branch(
+        cur_cpu,
         up_exps, up_exps_b, up_exps_s,
         gate_exps, gate_exps_b, gate_exps_s,
         down_exps, down_exps_b, down_exps_s,
         gate_up_exps, gate_up_exps_b,
-        selected_experts, cpu_weights,
-        "_cpu");
+        selected_experts_cpu, cpu_weights_cpu,
+        "_cpu", backend_cpu);
 
-    // 4. Pin backends
-    if (sched) {
-        for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); ++b) {
-            ggml_backend_t be = ggml_backend_sched_get_backend(sched, b);
-            if (ggml_backend_get_device(be) == part.dev) {
-                ggml_backend_sched_set_tensor_backend(sched, gpu_branch, be);
-                break;
-            }
-        }
-        if (backend_cpu) {
-            ggml_backend_sched_set_tensor_backend(sched, cpu_branch, backend_cpu);
-        }
-    }
+    // 6. Pin branch root outputs
+    pin_tensor(gpu_branch, be_gpu);
+    pin_tensor(cpu_branch, backend_cpu);
 
-    // 5. Merge branches
-    ggml_tensor * out = ggml_add(ctx0, gpu_branch, cpu_branch);
+    // 7. Merge branches on GPU
+    ggml_tensor * out = pin_tensor(ggml_add(ctx0, gpu_branch, cpu_branch), be_gpu);
     cb(out, "ffn_moe_split_out", il);
 
     return out;

@@ -92,27 +92,31 @@ int main() {
         expert_to_slot[slot_to_expert[s]] = s;
     }
 
-    // Lookup table tensors:
-    // mask_table: [2, n_expert] (F32: row 0 = is_gpu, row 1 = is_cpu)
-    // slot_table: [1, n_expert] (I32: resident slot index, 0 if non-resident)
-    ggml_tensor * mask_table_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, n_expert);
-    ggml_tensor * slot_table_t = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+    // Contiguous lookup table tensors:
+    // gpu_mask_table: [1, n_expert] (F32: 1.0 if is_gpu, 0.0 if is_cpu)
+    // cpu_mask_table: [1, n_expert] (F32: 0.0 if is_gpu, 1.0 if is_cpu)
+    // slot_table:     [1, n_expert] (I32: resident slot index, 0 if non-resident)
+    ggml_tensor * gpu_mask_table_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
+    ggml_tensor * cpu_mask_table_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
+    ggml_tensor * slot_table_t     = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
 
-    std::vector<float> mask_table(2 * n_expert, 0.0f);
+    std::vector<float> gpu_mask(n_expert, 0.0f);
+    std::vector<float> cpu_mask(n_expert, 1.0f);
     std::vector<int32_t> slot_table(n_expert, 0);
     for (int32_t e = 0; e < n_expert; ++e) {
         int32_t s = expert_to_slot[e];
         if (s >= 0) {
-            mask_table[2 * e + 0] = 1.0f;
-            mask_table[2 * e + 1] = 0.0f;
-            slot_table[e]         = s;
+            gpu_mask[e]   = 1.0f;
+            cpu_mask[e]   = 0.0f;
+            slot_table[e] = s;
         } else {
-            mask_table[2 * e + 0] = 0.0f;
-            mask_table[2 * e + 1] = 1.0f;
-            slot_table[e]         = 0;
+            gpu_mask[e]   = 0.0f;
+            cpu_mask[e]   = 1.0f;
+            slot_table[e] = 0;
         }
     }
-    memcpy(mask_table_t->data, mask_table.data(), mask_table.size() * sizeof(float));
+    memcpy(gpu_mask_table_t->data, gpu_mask.data(), gpu_mask.size() * sizeof(float));
+    memcpy(cpu_mask_table_t->data, cpu_mask.data(), cpu_mask.size() * sizeof(float));
     memcpy(slot_table_t->data, slot_table.data(), slot_table.size() * sizeof(int32_t));
 
     // Accelerator packed tensors [n_embd, n_ff, n_accel]
@@ -138,11 +142,11 @@ int main() {
     ggml_tensor * sel_cont = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx, selected_experts);
     ggml_tensor * sel_flat = ggml_reshape_1d(ctx, sel_cont, n_expert_used * n_tok);
 
-    ggml_tensor * looked_up_masks = ggml_get_rows(ctx, mask_table_t, sel_flat);
-    looked_up_masks = ggml_reshape_3d(ctx, looked_up_masks, 2, n_expert_used, n_tok);
+    ggml_tensor * is_gpu_expert_1d = ggml_get_rows(ctx, gpu_mask_table_t, sel_flat);
+    ggml_tensor * is_gpu_expert    = ggml_reshape_3d(ctx, is_gpu_expert_1d, 1, n_expert_used, n_tok);
 
-    ggml_tensor * is_gpu_expert = ggml_view_3d(ctx, looked_up_masks, 1, n_expert_used, n_tok, looked_up_masks->nb[1], looked_up_masks->nb[2], 0 * sizeof(float));
-    ggml_tensor * is_cpu_expert = ggml_view_3d(ctx, looked_up_masks, 1, n_expert_used, n_tok, looked_up_masks->nb[1], looked_up_masks->nb[2], 1 * sizeof(float));
+    ggml_tensor * is_cpu_expert_1d = ggml_get_rows(ctx, cpu_mask_table_t, sel_flat);
+    ggml_tensor * is_cpu_expert    = ggml_reshape_3d(ctx, is_cpu_expert_1d, 1, n_expert_used, n_tok);
 
     ggml_tensor * gpu_weights = ggml_mul(ctx, weights, is_gpu_expert);
     ggml_tensor * cpu_weights = ggml_mul(ctx, weights, is_cpu_expert);
@@ -235,16 +239,17 @@ int main() {
     for (int32_t e = 0; e < n_expert; ++e) {
         int32_t s = expert_to_slot[e];
         if (s >= 0) {
-            mask_table[2 * e + 0] = 1.0f;
-            mask_table[2 * e + 1] = 0.0f;
-            slot_table[e]         = s;
+            gpu_mask[e]   = 1.0f;
+            cpu_mask[e]   = 0.0f;
+            slot_table[e] = s;
         } else {
-            mask_table[2 * e + 0] = 0.0f;
-            mask_table[2 * e + 1] = 1.0f;
-            slot_table[e]         = 0;
+            gpu_mask[e]   = 0.0f;
+            cpu_mask[e]   = 1.0f;
+            slot_table[e] = 0;
         }
     }
-    memcpy(mask_table_t->data, mask_table.data(), mask_table.size() * sizeof(float));
+    memcpy(gpu_mask_table_t->data, gpu_mask.data(), gpu_mask.size() * sizeof(float));
+    memcpy(cpu_mask_table_t->data, cpu_mask.data(), cpu_mask.size() * sizeof(float));
     memcpy(slot_table_t->data, slot_table.data(), slot_table.size() * sizeof(int32_t));
 
     // Recompute graph

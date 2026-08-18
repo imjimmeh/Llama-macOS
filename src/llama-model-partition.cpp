@@ -292,15 +292,16 @@ void llama_moe_partition::promote_expert(int32_t candidate_id, int32_t slot_id) 
     }
 
     auto copy_slice = [&](ggml_tensor * dst_accel, const ggml_tensor * src_host) {
-        if (!dst_accel || !src_host || !src_host->data) {
+        if (!dst_accel || !src_host) {
             return;
         }
         const size_t slice_size = dst_accel->nb[2];
         const size_t src_offset = (size_t)candidate_id * src_host->nb[2];
         const size_t dst_offset = (size_t)slot_id * dst_accel->nb[2];
 
-        const uint8_t * src_ptr = (const uint8_t *) src_host->data + src_offset;
-        ggml_backend_tensor_set(dst_accel, src_ptr, dst_offset, slice_size);
+        std::vector<uint8_t> tmp(slice_size);
+        ggml_backend_tensor_get(src_host, tmp.data(), src_offset, slice_size);
+        ggml_backend_tensor_set(dst_accel, tmp.data(), dst_offset, slice_size);
     };
 
     if (gate_up_exps_accel) {
@@ -327,22 +328,24 @@ void llama_moe_partition::promote_expert(int32_t candidate_id, int32_t slot_id) 
     expert_to_slot[candidate_id] = slot_id;
 
     // Update accelerator lookup tables
-    if (expert_mask_table && expert_slot_table) {
-        std::vector<float> mask_table(2 * n_expert_total, 0.0f);
+    if (expert_gpu_mask_table && expert_cpu_mask_table && expert_slot_table) {
+        std::vector<float> gpu_mask(n_expert_total, 0.0f);
+        std::vector<float> cpu_mask(n_expert_total, 1.0f);
         std::vector<int32_t> slot_table(n_expert_total, 0);
         for (int32_t e = 0; e < n_expert_total; ++e) {
             int32_t s = expert_to_slot[e];
             if (s >= 0) {
-                mask_table[2 * e + 0] = 1.0f;
-                mask_table[2 * e + 1] = 0.0f;
-                slot_table[e]         = s;
+                gpu_mask[e]   = 1.0f;
+                cpu_mask[e]   = 0.0f;
+                slot_table[e] = s;
             } else {
-                mask_table[2 * e + 0] = 0.0f;
-                mask_table[2 * e + 1] = 1.0f;
-                slot_table[e]         = 0;
+                gpu_mask[e]   = 0.0f;
+                cpu_mask[e]   = 1.0f;
+                slot_table[e] = 0;
             }
         }
-        ggml_backend_tensor_set(expert_mask_table, mask_table.data(), 0, mask_table.size() * sizeof(float));
+        ggml_backend_tensor_set(expert_gpu_mask_table, gpu_mask.data(), 0, gpu_mask.size() * sizeof(float));
+        ggml_backend_tensor_set(expert_cpu_mask_table, cpu_mask.data(), 0, cpu_mask.size() * sizeof(float));
         ggml_backend_tensor_set(expert_slot_table, slot_table.data(), 0, slot_table.size() * sizeof(int32_t));
     }
 }
@@ -555,8 +558,8 @@ std::unique_ptr<llama_moe_partition_set> llama_moe_partition_build(
     auto result = std::make_unique<llama_moe_partition_set>();
     result->ordered_partitions.resize(n_layer, nullptr);
 
-    // create accelerator metadata context (each layer has up to 8 tensors + 1 lookup table)
-    const size_t n_tensors_accel = candidates.size() * 9;
+    // create accelerator metadata context (each layer has up to 8 tensors + 3 lookup tables)
+    const size_t n_tensors_accel = candidates.size() * 11;
     struct ggml_init_params params_accel = {
         /*.mem_size   =*/ ggml_tensor_overhead() * n_tensors_accel + 4096,
         /*.mem_buffer =*/ nullptr,
@@ -602,9 +605,13 @@ std::unique_ptr<llama_moe_partition_set> llama_moe_partition_build(
         const int64_t ne_accel = cand.n_expert_accel;
 
         // Lookup tables
-        snprintf(name, sizeof(name), "blk.%zu.moe_mask_table", cand.il);
-        part->expert_mask_table = ggml_new_tensor_2d(result->ctx_accel.get(), GGML_TYPE_F32, 2, cand.n_expert_total);
-        ggml_set_name(part->expert_mask_table, name);
+        snprintf(name, sizeof(name), "blk.%zu.moe_gpu_mask_table", cand.il);
+        part->expert_gpu_mask_table = ggml_new_tensor_2d(result->ctx_accel.get(), GGML_TYPE_F32, 1, cand.n_expert_total);
+        ggml_set_name(part->expert_gpu_mask_table, name);
+
+        snprintf(name, sizeof(name), "blk.%zu.moe_cpu_mask_table", cand.il);
+        part->expert_cpu_mask_table = ggml_new_tensor_2d(result->ctx_accel.get(), GGML_TYPE_F32, 1, cand.n_expert_total);
+        ggml_set_name(part->expert_cpu_mask_table, name);
 
         snprintf(name, sizeof(name), "blk.%zu.moe_slot_table", cand.il);
         part->expert_slot_table = ggml_new_tensor_2d(result->ctx_accel.get(), GGML_TYPE_I32, 1, cand.n_expert_total);
@@ -679,21 +686,23 @@ std::unique_ptr<llama_moe_partition_set> llama_moe_partition_build(
         const int64_t ne  = cand.n_expert_accel;
 
         // Initialize lookup tables on device
-        std::vector<float> mask_table(2 * cand.n_expert_total, 0.0f);
+        std::vector<float> gpu_mask(cand.n_expert_total, 0.0f);
+        std::vector<float> cpu_mask(cand.n_expert_total, 1.0f);
         std::vector<int32_t> slot_table(cand.n_expert_total, 0);
         for (int32_t e = 0; e < cand.n_expert_total; ++e) {
             int32_t s = part->expert_to_slot[e];
             if (s >= 0) {
-                mask_table[2 * e + 0] = 1.0f; // is_gpu
-                mask_table[2 * e + 1] = 0.0f; // is_cpu
-                slot_table[e]         = s;    // resident slot index
+                gpu_mask[e]   = 1.0f; // is_gpu
+                cpu_mask[e]   = 0.0f; // is_cpu
+                slot_table[e] = s;    // resident slot index
             } else {
-                mask_table[2 * e + 0] = 0.0f; // is_gpu
-                mask_table[2 * e + 1] = 1.0f; // is_cpu
-                slot_table[e]         = 0;    // safe clamped slot
+                gpu_mask[e]   = 0.0f; // is_gpu
+                cpu_mask[e]   = 1.0f; // is_cpu
+                slot_table[e] = 0;    // safe clamped slot
             }
         }
-        ggml_backend_tensor_set(part->expert_mask_table, mask_table.data(), 0, mask_table.size() * sizeof(float));
+        ggml_backend_tensor_set(part->expert_gpu_mask_table, gpu_mask.data(), 0, gpu_mask.size() * sizeof(float));
+        ggml_backend_tensor_set(part->expert_cpu_mask_table, cpu_mask.data(), 0, cpu_mask.size() * sizeof(float));
         ggml_backend_tensor_set(part->expert_slot_table, slot_table.data(), 0, slot_table.size() * sizeof(int32_t));
 
         // Copy initial resident slices
