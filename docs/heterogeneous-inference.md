@@ -1,6 +1,6 @@
-# Heterogeneous Inference: Dynamic MoE Expert Caching & Dense FFN Partitioning
+# Heterogeneous Inference: MoE Expert Residency & Dense FFN Partitioning
 
-This document describes the design, architecture, and usage of **Dynamic MoE Expert Caching** and **Dense FFN Heterogeneous Partitioning** in `llama.cpp`.
+This document describes the design, architecture, and usage of **MoE Heterogeneous Expert Residency** and **Dense FFN Channel Partitioning** in `llama.cpp`.
 
 ---
 
@@ -8,10 +8,10 @@ This document describes the design, architecture, and usage of **Dynamic MoE Exp
 
 When running large modern LLMs on memory-constrained consumer accelerators (e.g. 8 GB - 16 GB VRAM), standard layer-level offloading faces two distinct computational bottlenecks:
 
-1. **Mixture-of-Experts (MoE) Models**: Only a small subset of experts (e.g. 8 out of 64 or 128) are activated per token. Transferring all CPU-resident expert weights across the PCIe bus on every token introduces massive memory bandwidth bottlenecks.
-2. **Dense Exhaustive FFNs / Shared Experts**: Full dense projections (in dense models or shared-expert branches of MoE models) require evaluating the entire layer. When a layer does not fit in VRAM, running it entirely on CPU underutilizes available GPU compute and VRAM.
+1. **Mixture-of-Experts (MoE) Models**: Only a small subset of experts (e.g. 8 out of 64 or 128) are activated per token. Streaming cold expert weights over PCIe on every miss stalls the GPU decode pipeline.
+2. **Dense Exhaustive FFNs / Shared Experts**: Full dense projections (in dense models or shared-expert branches of MoE models) require evaluating the entire layer. When a layer does not fit entirely in VRAM, running it on CPU underutilizes GPU compute and VRAM.
 
-To address both bottlenecks, `llama.cpp` implements two complementary, decoupled optimization domains united under a single memory allocator:
+To address both bottlenecks, `llama.cpp` implements two complementary heterogeneous execution domains:
 
 ```text
                                 Transformer Layer
@@ -23,8 +23,8 @@ To address both bottlenecks, `llama.cpp` implements two complementary, decoupled
              │                                                     │
         build_ffn()                                          build_moe_ffn()
              │                                                     │
-      FFN Partitioning                                        Expert Cache
-   (GPU Prefix + CPU Rest)                                 (RAM <-> VRAM Dynamic)
+     FFN Partitioning                                    MoE Expert Residency
+  (GPU Prefix + CPU Rest)                             (Concurrent GPU Hot + CPU Cold)
              │                                                     │
              └──────────────────────────┬──────────────────────────┘
                                         │
@@ -33,51 +33,74 @@ To address both bottlenecks, `llama.cpp` implements two complementary, decoupled
 
 ---
 
-## 2. Dynamic MoE Expert Cache
+## 2. MoE Heterogeneous Expert Residency (`--moe-hot-vram`, `--moe-resident-fraction`)
 
-### 2.1 Principle of Operation
+### 2.1 The Inverted Execution Paradigm
 
-Expert routing in MoE models exhibits significant **temporal locality**: across consecutive decode tokens, 60% to 75% of activated experts are typically reused.
+Traditional offloading treats host RAM as cold storage and attempts to stream missed weights to the GPU on demand. At decode batch size 1, matrix-vector multiplications on missed experts are memory-bandwidth-bound rather than compute-bound.
 
-Rather than permanently pinning whole layers to VRAM or streaming all CPU experts over PCIe repeatedly, the **Expert Cache** dynamically maintains the most active expert weight slices in an accelerator-resident buffer.
-
-### 2.2 Execution Flow & Selective Transfers
-
-The cache is implemented at the scheduler level (`ggml_backend_sched`) around `GGML_OP_MUL_MAT_ID`:
+Heterogeneous Expert Residency inverts this model:
+- **Host RAM is a first-class compute store**: Cold experts execute directly on CPU threads from host memory bandwidth (40-60 GB/s).
+- **GPU VRAM is an accelerator for resident hot experts**: The most frequently routed experts reside permanently in VRAM slots and execute on CUDA at full GPU memory bandwidth (300-1000+ GB/s).
+- **Misses are ALWAYS CPU compute**: Non-resident experts **never** trigger synchronous PCIe weight transfers during decode.
+- **Vectors cross PCIe, not weights**: Only tiny token activation vectors ($[1 \times n_{\text{embd}}]$, ~4-8 KB) cross the bus to merge branch outputs.
 
 ```text
-                         GGML_OP_MUL_MAT_ID
-                                 │
-                                 ▼
-                     Extract Selected Expert IDs
-                                 │
-                     ┌───────────┴───────────┐
-                     ▼                       ▼
-               Cache Hits               Cache Misses
-                     │                       │
-                     │                 Group Contiguous
-                     │                  RAM -> GPU Copy
-                     │                       │
-                     ▼                       ▼
-              GPU -> GPU Copy         Populate Cache
-             (Into input_cpy)        (Async Eviction)
-                     │                       │
-                     └───────────┬───────────┘
-                                 ▼
-                          Execute Matmul
+                                  Input Activation (x)
+                                           │
+                                  Host / Device Router
+                                           │
+                          ┌────────────────┴────────────────┐
+                          │                                 │
+                 Resident Expert IDs              Non-Resident Expert IDs
+                          │                                 │
+                    Async Launch                      Immediate Launch
+                   CUDA MUL_MAT_ID                     CPU MUL_MAT_ID
+               (Fast VRAM Bandwidth)             (Fast Host RAM Bandwidth)
+                          │                                 │
+                          │   concurrent parallel execute   │
+                          │                                 │
+                          └────────────────┬────────────────┘
+                                           │
+                                      Merge (ADD)
+                                           │
+                                      Layer Output
 ```
 
-1. **Discovery & Interception**: When `ggml_backend_sched` prepares an offloaded `MUL_MAT_ID` node whose source weights reside in host RAM, it reads the active expert IDs from the router output (`node->src[2]`).
-2. **Hit/Miss Classification**: Each requested `(tensor, expert_id)` key is queried in the backend's expert cache registry.
-3. **Contiguous Batching of Misses**: Missed experts are grouped into contiguous ranges to minimize PCIe transfer launch overhead.
-4. **Fast GPU->GPU Transfer for Hits**: Hit slices are copied directly from the persistent cache arena into the temporary computation tensor (`input_cpy`).
-5. **LRU / Periodic JIT Swapping**:
-   - In on-demand mode (`--expert-cache-period 0`), LRU eviction makes space for new misses while protecting currently pinned active experts.
-   - In periodic JIT mode (`--expert-cache-period N`), expert access frequencies are tracked over $N$ tokens, and hot experts are pre-swapped just in time ahead of the layer's execution.
+### 2.2 Dynamic Slot Lookup & Graph Construction
+
+Each MoE layer maintains an accelerator-resident lookup table `expert_to_slot_table` (`[1, n_expert_total]`):
+- If expert $e$ is resident in VRAM slot $s \in [0, N_{\text{accel}}-1]$, the table entry is $s$.
+- If expert $e$ resides in host RAM, the entry is $-1.0$.
+
+During graph construction:
+1. `looked_up_slots = ggml_get_rows(ctx0, slot_table, selected_experts_1d)` queries slot assignments.
+2. Step masks compute branch weights:
+   - $is\_gpu = \text{step}(\text{looked\_up\_slots} + 0.5)$
+   - $is\_cpu = 1.0 - is\_gpu$
+   - $gpu\_weights = weights \times is\_gpu$
+   - $cpu\_weights = weights \times is\_cpu$
+3. GPU branch evaluates resident experts with clamped slot indices against packed accelerator tensors (`gate_exps_accel`, `up_exps_accel`, `down_exps_accel`).
+4. CPU branch evaluates non-resident experts against host tensors with `cpu_weights`.
+5. Outputs merge via `out = ggml_add(ctx0, gpu_branch, cpu_branch)`.
+
+### 2.3 Periodic EMA Frequency Tracking & Hysteresis
+
+Expert routing patterns shift dynamically across topics. The `llama_moe_tracker` maintains runtime telemetry and balances the residency set:
+
+1. **Exponential Moving Average (EMA) Scoring**:
+   $$S_e = S_e \cdot \alpha + \text{accesses}_{\text{epoch}}$$
+2. **Periodic Rebalancing**: Every $N$ tokens (configured by `--moe-rebalance-period`, default `64`), the tracker identifies:
+   - The hottest non-resident candidate: $C = \operatorname{argmax}_{e \notin \text{resident}}(S_e)$
+   - The coldest resident expert: $R = \operatorname{argmin}_{e \in \text{resident}}(S_e)$
+3. **Hysteresis Promotion Threshold**: To prevent thrashing from minor frequency fluctuations, candidate $C$ is promoted to slot $S_R$ only if:
+   $$S_C > S_R + \Delta_{\text{hysteresis}}$$
+4. **Decoupled Background Promotion**:
+   `promote_expert(candidate_id, slot_id)` updates tensor slices on the device memory buffer and updates `expert_to_slot_table` between tokens without interrupting active compute streams.
 
 ---
 
-## 3. Dense FFN Heterogeneous Channel Partitioning
+## 3. Dense FFN Heterogeneous Channel Partitioning (`--ffn-split`)
 
 ### 3.1 Mathematical Formulation
 
@@ -99,7 +122,7 @@ y_{\text{cpu}} &= a_{\text{cpu}} W_{\text{down,cpu}} \\
 y &= y_{\text{gpu}} + y_{\text{cpu}}
 \end{aligned}$$
 
-This transformation produces mathematically identical outputs (modulo floating-point summation order) with no parameter pruning or approximation.
+This transformation produces mathematically identical outputs with no parameter pruning or approximation.
 
 ### 3.2 Memory Layout & Repacking
 
@@ -119,133 +142,90 @@ Row N: [ GPU (cols 0..G-1) | CPU (cols G..n_ff-1) ]
 ```
 
 Because column slicing across rows is non-contiguous in row-major memory, `down` is repacked once at load time:
-- `down_accel` ($G \times n_{\text{embd}}$): Packed row-by-row into the accelerator buffer.
-- `down_cpu` ($(n_{\text{ff}} - G) \times n_{\text{embd}}$): Packed row-by-row into host memory to avoid non-contiguous stride overhead in quantized kernels.
-
-### 3.3 Asynchronous Execution Overlap
-
-To achieve true physical concurrency between CPU and GPU:
-1. The GPU branch graph is constructed and submitted first via `ggml_backend_graph_compute_async()`, which launches the kernels onto the GPU stream and returns immediately.
-2. The scheduler then computes the CPU branch while the GPU is executing.
-3. The merge node `ggml_add(ctx0, gpu, cpu)` acts as the synchronization point.
+- `down_accel` ($G \times n_{\text{embd}}$): Packed row-by-row into accelerator VRAM.
+- `down_cpu` ($(n_{\text{ff}} - G) \times n_{\text{embd}}$): Packed row-by-row into host RAM to maintain continuous stride in quantized CPU kernels.
 
 ---
 
-## 4. Hybrid MoE Layers (Simultaneous Dual-Optimization)
+## 4. Comparison: MoE Heterogeneous Residency vs. Legacy Expert Cache
 
-Architectures such as **Qwen3.5-MoE**, **DeepSeek-V2**, and **DeepSeek-V3** contain both routed expert banks and dense shared experts within the same transformer layer.
+| Feature | Heterogeneous Residency (`--moe-hot-vram`) | Legacy Expert Cache (`-exc`, `--expert-cache`) |
+| :--- | :--- | :--- |
+| **Execution Paradigm** | Inverted dual-branch compute (Concurrent GPU + CPU) | Streaming cache (CPU weights transferred to GPU) |
+| **Handling of Misses** | **Executed on CPU directly from host RAM** | **Transferred over PCIe to GPU on critical path** |
+| **PCIe Traffic on Miss** | **0 bytes weight data** (only ~4-8 KB activation vector) | Entire expert weight matrix (~10-50+ MB per miss) |
+| **GPU Decode Bubbles** | **Zero stalls** | GPU waits for PCIe DMA completion on every miss |
+| **Dynamic Rebalance** | Periodic background EMA promotion with hysteresis | On-demand LRU / JIT block replacement |
+| **Recommended For** | **All MoE models on PCIe-limited systems (e.g. PCIe 3.0/4.0)** | High-bandwidth PCIe 5.0 systems with excess bandwidth |
 
-`llama.cpp` evaluates both optimizations concurrently:
-
-```text
-                                   MoE Layer
-                                       │
-                ┌──────────────────────┴──────────────────────┐
-                │                                             │
-         Routed Experts                                 Shared Expert
-          ffn_*_exps                                     ffn_*_shexp
-                │                                             │
-           Expert Cache                                FFN Partitioner
-      (Dynamic VRAM Cache)                        (GPU Prefix + CPU Remainder)
-                │                                             │
-                └──────────────────── ADD ────────────────────┘
-                                       │
-                                  Layer Output
-```
-
-- **Routed Branch**: Slices loaded dynamically into the Expert Cache based on router selection.
-- **Shared Expert Branch**: Partitioned across GPU and CPU according to `--ffn-split`.
+> [!NOTE]
+> The `-exc` / `--expert-cache` flags remain functional in the CLI parser for backwards compatibility, but `--moe-hot-vram` and `--moe-resident-fraction` are strongly recommended for maximum throughput.
 
 ---
 
-## 5. Multi-Token Prediction (MTP) Support
+## 5. CLI Reference & Usage
 
-Models utilizing Multi-Token Prediction (e.g. DeepSeek-V3/R1, Qwen3.5-MoE next-n draft heads) construct secondary computation graphs containing routed and shared experts.
-
-- **Registry Resolution**: The tensor-keyed registry (`std::unordered_map<const ggml_tensor *, std::unique_ptr<llama_ffn_partition>>`) automatically registers MTP shared-expert tensors (`mtp.*.ffn_up_shexp`).
-- **Memory Tracking**: MTP context memory and cache requirements are included in the global VRAM budget calculation.
-
----
-
-## 6. Unified VRAM Budgeting (`--fit`)
-
-To prevent Out-Of-Memory (OOM) errors during automatic fitting, the VRAM budget is calculated holistically:
-
-$$\text{VRAM}_{\text{model+partitions}} = \text{VRAM}_{\text{total}} - (\text{KV Cache} + \text{Compute Buffers} + \text{MTP Reserve} + \text{Expert Cache Reserve} + \text{Safety Margin})$$
-
-- In `llama_model::memory_breakdown()`, FFN partition accelerator buffers (`buf_accel`) and CPU buffers (`buf_cpu`) are reported under their respective backend types.
-- In `llama_context::memory_breakdown()`, `cparams.expert_cache_size` is reserved on the accelerator compute buffer.
-- `--fit` uses these measurements to allocate whole layers and FFN partitions without exceeding device limits.
-
----
-
-## 7. CLI Reference & Usage
-
-### 7.1 Options
+### 5.1 Options
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `-exc`, `--expert-cache` | `SIZE` | `0` (disabled) | VRAM capacity for caching CPU-offloaded MoE experts (e.g. `1024M`, `1.5G`, `2G`). |
-| `-excp`, `--expert-cache-period` | `INT` | `64` | Token interval for periodic JIT expert rebalancing (`0` = on-demand LRU). |
-| `-excs`, `--expert-cache-stats` | `FLAG` | `false` | Print detailed hit rate, bandwidth savings, and partition stats on exit. |
-| `--ffn-split` | `FLOAT` | `0.0` (disabled) | Fraction of dense FFN intermediate dimension placed on GPU (`0.0` to `1.0`). |
+| `--moe-hot-vram` | `SIZE` | `0` (disabled) | Total VRAM capacity dedicated to caching hot resident MoE experts (e.g. `1024M`, `2G`, `2048MB`). |
+| `--moe-resident-fraction` | `FLOAT` | `0.0` (disabled) | Fraction of MoE experts to place in VRAM per layer (`0.0` to `1.0`, e.g. `0.35`). |
+| `--moe-rebalance-period` | `INT` | `64` | Token interval between dynamic EMA expert rebalancing promotions. |
+| `--moe-stats` | `FLAG` | `false` | Print detailed MoE heterogeneous residency telemetry on exit. |
+| `--ffn-split` | `FLOAT` | `0.0` (disabled) | Fraction of dense FFN intermediate dimension placed in VRAM (`0.0` to `1.0`). |
+| `-exc`, `--expert-cache` | `SIZE` | `0` (disabled) | *(Legacy)* VRAM cache capacity for streaming scheduler-level expert copies. |
+| `-excp`, `--expert-cache-period` | `INT` | `64` | *(Legacy)* Token interval for legacy expert cache swapping. |
+| `-excs`, `--expert-cache-stats` | `FLAG` | `false` | *(Legacy)* Print legacy expert cache statistics on exit. |
 
-### 7.2 Example Commands
+---
 
-#### Running a Hybrid MoE Model (e.g. Qwen3.5-MoE) with Cache + Shared Expert Slicing
-```sh
-llama-cli \
-    -m models/qwen3.5-moe-q4_k.gguf \
-    -p "Explain the difference between TCP and UDP in detail." \
-    -ngl 16 \
-    --expert-cache 1500M \
-    --ffn-split 0.35 \
-    --expert-cache-stats
+### 5.2 Example Commands
+
+#### 1. Running a ~35B MoE Model on an 8GB GPU (GTX 1080 / RTX 3070 / RTX 4060)
+```powershell
+llama-cli `
+    -m models/qwen3.6-35b-moe.Q4_K_M.gguf `
+    -ngl 99 `
+    --moe-hot-vram 2G `
+    --moe-rebalance-period 64 `
+    --moe-stats `
+    -t 8 `
+    -p "Explain quantum computing in simple terms."
 ```
 
-#### Running a Dense Model with Heterogeneous FFN Partitioning
-```sh
-llama-cli \
-    -m models/llama-3-8b-q4_k.gguf \
-    -p "Write a fast matrix multiplication kernel in C++." \
-    -ngl 20 \
-    --ffn-split 0.40 \
-    --fit on
+#### 2. Running a Hybrid MoE Model (Routed MoE + Dense Shared Experts)
+```powershell
+llama-cli `
+    -m models/qwen3.5-moe-27b.Q4_K_M.gguf `
+    -ngl 99 `
+    --moe-resident-fraction 0.35 `
+    --ffn-split 0.40 `
+    --moe-stats `
+    -t 8
 ```
 
-#### Benchmarking Token Generation Throughput
-```sh
-llama-bench \
-    -m models/qwen3.5-moe-q4_k.gguf \
-    -n 128 \
-    -ngl 12 \
-    --expert-cache 2G \
-    --ffn-split 0.30 \
-    --expert-cache-stats
+#### 3. Running a Dense Model with Heterogeneous FFN Partitioning
+```powershell
+llama-cli `
+    -m models/llama-3-8b.Q4_K_M.gguf `
+    -ngl 22 `
+    --ffn-split 0.40 `
+    -t 8
 ```
 
 ---
 
-## 8. Diagnostic Telemetry Output
+## 6. Diagnostic Telemetry Output
 
-When `--expert-cache-stats` is enabled, `llama.cpp` prints detailed metrics upon context destruction:
+When `--moe-stats` is enabled, `llama.cpp` prints detailed telemetry on exit:
 
 ```text
-Expert Cache (CUDA0):
-  capacity:              1500.00 MiB
-  resident:              1482.50 MiB (530 entries)
-  period:                64 tokens
-  rebalances:            4
-  JIT swaps:             28
-  requests:              40960
-  hits:                  29184
-  misses:                11776
-  hit rate:                71.25 %
-  RAM -> GPU:               5.88 GiB
-  avoided RAM -> GPU:      14.59 GiB
-  evictions:                1248
-
-FFN Heterogeneous Partitioning:
-  partitioned branches: 28
-  accelerator VRAM:      432.18 MiB
+--- MoE Heterogeneous Expert Residency Telemetry ---
+  Total tokens processed:       512
+  Resident VRAM hits:           1428 (69.7%)
+  Non-resident CPU misses:      620 (30.3%)
+  Background expert promotions: 14
+  Zero PCIe weight transfers on decode critical path.
+----------------------------------------------------
 ```
