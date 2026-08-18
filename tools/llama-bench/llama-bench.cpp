@@ -354,6 +354,7 @@ struct cmd_params {
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
     std::vector<size_t>              expert_cache_size;
+    std::vector<int32_t>             expert_cache_period;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -400,6 +401,7 @@ static const cmd_params cmd_params_defaults = {
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
     /* expert_cache_size    */ { 0 },
+    /* expert_cache_period  */ { 64 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -429,6 +431,7 @@ static void print_usage(int /*argc*/, const char * const * argv) {
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     printf("  -exc, --expert-cache <MiB>                  size of VRAM expert cache in MiB (default: 0)\n");
+    printf("  -excp, --expert-cache-period <n0,n1,...>    token interval for expert cache rebalancing (0 = on-demand LRU, default: 64)\n");
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
     }
@@ -1080,6 +1083,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 for (const auto & v : p) {
                     params.expert_cache_size.push_back(std::stoull(v));
                 }
+            } else if (arg == "-excp" || arg == "--expert-cache-period") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & v : p) {
+                    params.expert_cache_period.push_back(std::stoi(v));
+                }
             } else {
                 invalid_param = true;
                 break;
@@ -1209,6 +1221,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.expert_cache_size.empty()) {
         params.expert_cache_size = cmd_params_defaults.expert_cache_size;
     }
+    if (params.expert_cache_period.empty()) {
+        params.expert_cache_period = cmd_params_defaults.expert_cache_period;
+    }
 
     return params;
 }
@@ -1243,6 +1258,7 @@ struct cmd_params_instance {
     size_t             fit_target;
     uint32_t           fit_min_ctx;
     size_t             expert_cache_size;
+    int32_t            expert_cache_period;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1309,18 +1325,19 @@ struct cmd_params_instance {
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
-        cparams.n_ctx           = n_prompt + n_gen + n_depth;
-        cparams.n_batch         = n_batch;
-        cparams.n_ubatch        = n_ubatch;
-        cparams.type_k          = type_k;
-        cparams.type_v          = type_v;
-        cparams.offload_kqv     = !no_kv_offload;
-        cparams.flash_attn_type = flash_attn;
-        cparams.embeddings      = embeddings;
-        cparams.op_offload         = !no_op_offload;
-        cparams.swa_full           = false;
-        cparams.expert_cache_size  = expert_cache_size * 1024 * 1024;
-        cparams.expert_cache_stats = true;
+        cparams.n_ctx               = n_prompt + n_gen + n_depth;
+        cparams.n_batch             = n_batch;
+        cparams.n_ubatch            = n_ubatch;
+        cparams.type_k              = type_k;
+        cparams.type_v              = type_v;
+        cparams.offload_kqv         = !no_kv_offload;
+        cparams.flash_attn_type     = flash_attn;
+        cparams.embeddings          = embeddings;
+        cparams.op_offload          = !no_op_offload;
+        cparams.swa_full            = false;
+        cparams.expert_cache_size   = expert_cache_size * 1024 * 1024;
+        cparams.expert_cache_period = expert_cache_period;
+        cparams.expert_cache_stats  = true;
 
         return cparams;
     }
@@ -1335,6 +1352,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & fpt : params.fit_params_target)
     for (const auto & fpc : params.fit_params_min_ctx)
     for (const auto & exc : params.expert_cache_size)
+    for (const auto & excp : params.expert_cache_period)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & fs : params.ffn_split)
     for (const auto & ncmoe : params.n_cpu_moe)
@@ -1392,6 +1410,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
                 /* .expert_cache_size     = */ exc,
+                /* .expert_cache_period   = */ excp,
             };
             instances.push_back(instance);
         }
@@ -1430,6 +1449,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
                 /* .expert_cache_size     = */ exc,
+                /* .expert_cache_period   = */ excp,
             };
             instances.push_back(instance);
         }
@@ -1468,6 +1488,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
                 /* .expert_cache_size     = */ exc,
+                /* .expert_cache_period   = */ excp,
             };
             instances.push_back(instance);
         }
@@ -1511,6 +1532,7 @@ struct test {
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
     size_t                   expert_cache_size;
+    int32_t                  expert_cache_period;
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
@@ -1551,7 +1573,8 @@ struct test {
         no_host        = inst.no_host;
         fit_target     = inst.fit_target;
         fit_min_ctx    = inst.fit_min_ctx;
-        expert_cache_size = inst.expert_cache_size;
+        expert_cache_size   = inst.expert_cache_size;
+        expert_cache_period = inst.expert_cache_period;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
@@ -1610,7 +1633,7 @@ struct test {
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
-            "expert_cache_size",
+            "expert_cache_size", "expert_cache_period",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1624,7 +1647,7 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "expert_cache_size" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "expert_cache_size" || field == "expert_cache_period" || field == "flash_attn") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1711,6 +1734,7 @@ struct test {
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
                                             std::to_string(expert_cache_size),
+                                            std::to_string(expert_cache_period),
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
@@ -1957,6 +1981,9 @@ struct markdown_printer : public printer {
         if (field == "expert_cache_size") {
             return "exc";
         }
+        if (field == "expert_cache_period") {
+            return "excp";
+        }
         return field;
     }
 
@@ -2043,6 +2070,9 @@ struct markdown_printer : public printer {
         }
         if (params.expert_cache_size.size() > 1 || params.expert_cache_size != cmd_params_defaults.expert_cache_size) {
             fields.emplace_back("expert_cache_size");
+        }
+        if (params.expert_cache_period.size() > 1 || params.expert_cache_period != cmd_params_defaults.expert_cache_period) {
+            fields.emplace_back("expert_cache_period");
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");

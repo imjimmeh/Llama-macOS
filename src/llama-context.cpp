@@ -4254,3 +4254,21 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+
+void llama_context::set_expert_cache_period(int32_t period) {
+    cparams.expert_cache_period = period;
+    if (sched) {
+        ggml_backend_sched_set_expert_cache_period(sched.get(), period);
+    }
+}
+
+void llama_set_expert_cache_period(struct llama_context * ctx, int32_t period) {
+    if (!ctx) {
+        return;
+    }
+    ctx->set_expert_cache_period(period);
+}
+
+int32_t llama_get_expert_cache_period(const struct llama_context * ctx) {
+    return ctx ? ctx->get_cparams().expert_cache_period : 0;
+}

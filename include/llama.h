@@ -1018,6 +1018,10 @@ extern "C" {
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
+    // Set the token interval for expert cache rebalancing (0 = on-demand LRU)
+    LLAMA_API void    llama_set_expert_cache_period(struct llama_context * ctx, int32_t period);
+    LLAMA_API int32_t llama_get_expert_cache_period(const struct llama_context * ctx);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
