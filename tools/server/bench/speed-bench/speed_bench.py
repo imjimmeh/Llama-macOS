@@ -7,6 +7,7 @@ import json
 import statistics
 import sys
 import time
+import threading
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -358,6 +359,7 @@ def save_output(path: str, args: argparse.Namespace, samples: list[Sample], resu
             "extra_inputs": args.extra_inputs,
         },
         "selected_samples": len(samples),
+        "attempted_samples": len(results),
         "completed_samples": sum(1 for result in results if result.ok),
         "failed_samples": sum(1 for result in results if not result.ok),
         "summary": summary,
@@ -366,6 +368,42 @@ def save_output(path: str, args: argparse.Namespace, samples: list[Sample], resu
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
 
+
+
+def watch_for_escape(stop_event: threading.Event) -> None:
+    """Set stop_event when Escape is pressed, where terminal input permits it."""
+    if not sys.stdin.isatty():
+        return
+
+    if sys.platform == "win32":
+        import msvcrt
+
+        while not stop_event.is_set():
+            if msvcrt.kbhit():
+                key = msvcrt.getwch()
+                if key == "\x1b":
+                    stop_event.set()
+                    return
+            time.sleep(0.05)
+        return
+
+    # POSIX terminals: temporarily switch stdin to cbreak mode so Esc can be
+    # detected without requiring Enter. Restore the terminal before returning.
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while not stop_event.is_set():
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if ready and sys.stdin.read(1) == "\x1b":
+                stop_event.set()
+                return
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run SPEED-Bench against an OpenAI-compatible llama-server.")
@@ -394,14 +432,79 @@ def main(argv: list[str] | None = None) -> int:
 
     results: list[RequestResult] = []
     started = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = [
-            executor.submit(run_one, sample, endpoint, args.model, args.osl, extra_inputs, args.timeout)
-            for sample in samples
-        ]
-        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="speed_bench", unit="sample"):
-            result = future.result()
-            results.append(result)
+    stop_event = threading.Event()
+    interrupted = False
+
+    # Keep only up to --concurrency requests in flight. This is important for
+    # graceful stopping: samples that have not yet been submitted can simply
+    # be skipped instead of sitting in the executor queue.
+    sample_iter = iter(samples)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency)
+    futures: dict[concurrent.futures.Future[RequestResult], Sample] = {}
+
+    def submit_next() -> bool:
+        if stop_event.is_set():
+            return False
+        try:
+            sample = next(sample_iter)
+        except StopIteration:
+            return False
+        future = executor.submit(run_one, sample, endpoint, args.model, args.osl, extra_inputs, args.timeout)
+        futures[future] = sample
+        return True
+
+    for _ in range(args.concurrency):
+        if not submit_next():
+            break
+
+    escape_thread = threading.Thread(target=watch_for_escape, args=(stop_event,), daemon=True)
+    escape_thread.start()
+
+    progress = tqdm(total=len(samples), desc="speed_bench", unit="sample")
+    try:
+        while futures:
+            if stop_event.is_set():
+                interrupted = True
+                break
+
+            done, _ = concurrent.futures.wait(
+                futures,
+                timeout=0.1,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                futures.pop(future, None)
+                results.append(future.result())
+                progress.update(1)
+                submit_next()
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_event.set()
+    finally:
+        if interrupted or stop_event.is_set():
+            interrupted = True
+            stop_event.set()
+            progress.set_description("speed_bench (stopping)")
+            print("\nspeed_bench: stop requested; finishing active request(s) and skipping remaining samples...", file=sys.stderr)
+
+            # With bounded submission there are at most --concurrency futures
+            # here. cancel() removes any that have not started; running HTTP
+            # requests cannot be safely killed, so collect them when they end.
+            for future in list(futures):
+                if future.cancel():
+                    futures.pop(future, None)
+
+            for future in concurrent.futures.as_completed(list(futures)):
+                futures.pop(future, None)
+                try:
+                    results.append(future.result())
+                    progress.update(1)
+                except concurrent.futures.CancelledError:
+                    pass
+
+        executor.shutdown(wait=True, cancel_futures=True)
+        progress.close()
+        stop_event.set()
 
     elapsed = time.perf_counter() - started
     categories = list(dict.fromkeys(sample.category for sample in samples))
@@ -411,12 +514,19 @@ def main(argv: list[str] | None = None) -> int:
     ]
     summary.append(summarize_group("overall", results))
     print()
-    print(f"Summary (elapsed={elapsed:.2f}s)")
+    if interrupted:
+        skipped_count = len(samples) - len(results)
+        print(f"Partial summary (stopped early; attempted={len(results)}/{len(samples)}, skipped={skipped_count}, elapsed={elapsed:.2f}s)")
+    else:
+        print(f"Summary (elapsed={elapsed:.2f}s)")
     print_table(summary)
 
     if args.output:
         save_output(args.output, args, samples, results, summary)
         print(f"\nspeed_bench: wrote {args.output}")
+
+    if interrupted:
+        return 130
 
     failed = sum(1 for result in results if not result.ok)
     if failed:

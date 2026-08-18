@@ -352,3 +352,4 @@ endif()
 
 llama_build_and_test(test-ffn-partition-align.cpp)
 llama_build_and_test(test-ffn-split.cpp)
+llama_build_and_test(test-moe-expert-partition.cpp)

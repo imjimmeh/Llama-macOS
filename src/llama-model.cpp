@@ -1068,6 +1068,9 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    if (params.moe_stats && moe_partitions) {
+        moe_partitions->print_stats();
+    }
     for (auto * lora : loras) {
         delete lora;
     }
@@ -1717,6 +1720,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    if ((params.moe_resident_fraction > 0.0f || params.moe_hot_vram > 0) && !devices.empty()) {
+        ggml_backend_dev_t accel_dev = nullptr;
+        for (const auto & d : devices) {
+            if (ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                accel_dev = d.dev;
+                break;
+            }
+        }
+        if (accel_dev) {
+            moe_partitions = llama_moe_partition_build(*this, params.moe_resident_fraction, params.moe_hot_vram, accel_dev, params.moe_rebalance_period);
+            if (moe_partitions) {
+                const size_t n_part = moe_partitions->partitions.size();
+                LLAMA_LOG_INFO("%s: MoE expert heterogeneous residency: %zu MoE layers on %s (%.2f MiB VRAM)\n",
+                    __func__, n_part,
+                    ggml_backend_dev_name(accel_dev),
+                    ggml_backend_buffer_get_size(moe_partitions->buf_accel.get()) / (1024.0 * 1024.0));
+            }
+        }
+    }
+
     return true;
 }
 
@@ -1790,6 +1813,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
         }
         if (ffn_partitions->buf_cpu) {
             ret[ggml_backend_buffer_get_type(ffn_partitions->buf_cpu.get())] += ggml_backend_buffer_get_size(ffn_partitions->buf_cpu.get());
+        }
+    }
+    if (moe_partitions) {
+        if (moe_partitions->buf_accel) {
+            ret[ggml_backend_buffer_get_type(moe_partitions->buf_accel.get())] += ggml_backend_buffer_get_size(moe_partitions->buf_accel.get());
         }
     }
     return ret;
@@ -2519,7 +2547,11 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_stats                   =*/ false,
+        /*.moe_hot_vram                =*/ 0,
+        /*.moe_rebalance_period        =*/ 64,
         /*.ffn_split                   =*/ 0.0f,
+        /*.moe_resident_fraction       =*/ 0.0f,
     };
 
     return result;

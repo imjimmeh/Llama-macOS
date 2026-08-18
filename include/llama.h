@@ -339,8 +339,12 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool moe_stats;       // print MoE heterogeneous residency telemetry on exit
 
-        float ffn_split;      // fraction of dense FFN intermediate dimension to place on GPU (0.0 = disabled)
+        size_t moe_hot_vram;          // total VRAM capacity in bytes for resident MoE experts (0 = disabled/use fraction)
+        int32_t moe_rebalance_period; // token interval for MoE expert frequency rebalancing (default: 64)
+        float ffn_split;              // fraction of dense FFN intermediate dimension to place on GPU (0.0 = disabled)
+        float moe_resident_fraction;  // fraction of MoE experts to place on GPU per layer (0.0 = disabled)
     };
 
     struct llama_sampler_seq_config {

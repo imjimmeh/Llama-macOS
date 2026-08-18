@@ -18,6 +18,7 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 struct llama_ffn_partition_set;
+struct llama_moe_partition_set;
 
 // available models
 enum llm_type {
@@ -652,6 +653,7 @@ struct llama_model {
 
     std::vector<llama_layer> layers;
     std::unique_ptr<llama_ffn_partition_set> ffn_partitions;
+    std::unique_ptr<llama_moe_partition_set> moe_partitions;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see

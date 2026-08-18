@@ -465,8 +465,9 @@ struct common_params {
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
-    float   ffn_split          = 0.0f;  // fraction of dense FFN intermediate dimension to place on GPU (0.0 = disabled)
-    bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
+    float   ffn_split             = 0.0f;  // fraction of dense FFN intermediate dimension to place on GPU (0.0 = disabled)
+    float   moe_resident_fraction = 0.0f;  // fraction of MoE experts to place on GPU per layer (0.0 = disabled)
+    bool    fit_params            = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
@@ -476,6 +477,10 @@ struct common_params {
     size_t  expert_cache_size   = 0;     // expert cache capacity in bytes (0 = disabled)
     int32_t expert_cache_period = 64;    // token interval for expert cache rebalancing (0 = on-demand LRU, default = 64)
     bool    expert_cache_stats  = false; // print expert cache performance stats on exit
+
+    size_t  moe_hot_vram          = 0;     // total VRAM capacity in bytes for resident MoE experts (0 = disabled/use fraction)
+    int32_t moe_rebalance_period  = 64;    // token interval for MoE expert frequency rebalancing (default = 64)
+    bool    moe_stats             = false; // print MoE heterogeneous residency telemetry on exit
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model

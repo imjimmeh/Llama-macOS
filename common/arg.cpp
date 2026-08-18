@@ -2809,6 +2809,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FFN_SPLIT"));
     add_opt(common_arg(
+        {"--moe-resident-fraction"}, "P",
+        "fraction of MoE experts to place in VRAM per layer (0.0-1.0, default: 0.0)",
+        [](common_params & params, const std::string & value) {
+            params.moe_resident_fraction = std::stof(value);
+            if (params.moe_resident_fraction < 0.0f || params.moe_resident_fraction > 1.0f) {
+                throw std::invalid_argument("--moe-resident-fraction must be between 0.0 and 1.0");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_RESIDENT_FRACTION"));
+    add_opt(common_arg(
+        {"--moe-hot-vram"}, "SIZE",
+        "total VRAM capacity for hot resident MoE experts (e.g. 1024M, 2G, 2048MB)",
+        [](common_params & params, const std::string & value) {
+            size_t idx = 0;
+            double val = std::stod(value, &idx);
+            std::string unit = value.substr(idx);
+            while (!unit.empty() && (unit.front() == ' ' || unit.front() == '\t')) unit.erase(unit.begin());
+            while (!unit.empty() && (unit.back() == ' ' || unit.back() == '\t')) unit.pop_back();
+            for (char & c : unit) c = toupper(c);
+
+            if (unit.empty() || unit == "B") {
+                params.moe_hot_vram = (size_t)val;
+            } else if (unit == "K" || unit == "KB" || unit == "KIB") {
+                params.moe_hot_vram = (size_t)(val * 1024.0);
+            } else if (unit == "M" || unit == "MB" || unit == "MIB") {
+                params.moe_hot_vram = (size_t)(val * 1024.0 * 1024.0);
+            } else if (unit == "G" || unit == "GB" || unit == "GIB") {
+                params.moe_hot_vram = (size_t)(val * 1024.0 * 1024.0 * 1024.0);
+            } else if (unit == "T" || unit == "TB" || unit == "TIB") {
+                params.moe_hot_vram = (size_t)(val * 1024.0 * 1024.0 * 1024.0 * 1024.0);
+            } else {
+                throw std::invalid_argument("invalid unit in --moe-hot-vram: " + unit);
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_HOT_VRAM"));
+    add_opt(common_arg(
+        {"--moe-rebalance-period"}, "N",
+        "token interval between MoE expert frequency rebalancing swaps (default: 64)",
+        [](common_params & params, const std::string & value) {
+            params.moe_rebalance_period = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_REBALANCE_PERIOD"));
+    add_opt(common_arg(
+        {"--moe-stats"},
+        "print MoE heterogeneous expert residency performance statistics on exit",
+        [](common_params & params) {
+            params.moe_stats = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STATS"));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"

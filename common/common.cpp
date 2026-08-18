@@ -1667,8 +1667,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
-    mparams.no_host         = params.no_host;
-    mparams.ffn_split       = params.ffn_split;
+    mparams.no_host               = params.no_host;
+    mparams.ffn_split             = params.ffn_split;
+    mparams.moe_resident_fraction = params.moe_resident_fraction;
+    mparams.moe_hot_vram          = params.moe_hot_vram;
+    mparams.moe_rebalance_period  = params.moe_rebalance_period;
+    mparams.moe_stats             = params.moe_stats;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
