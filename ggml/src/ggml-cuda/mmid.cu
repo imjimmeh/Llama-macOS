@@ -41,21 +41,15 @@ static __global__ void mm_ids_helper(
     if constexpr (n_expert_used_template == 0) {
         // Generic implementation:
         for (int it = 0; it < n_tokens; ++it) {
-            int iex_used = -1; // The index at which the expert is used, if any.
-            for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
+            for (int iex = 0; iex < n_expert_used; ++iex) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
-                if (expert_used == expert) {
-                    iex_used = iex;
+                if (threadIdx.x == 0) {
+                    nex_prev += expert_used < expert;
+                    if (expert_used == expert) {
+                        store[it_compact] = mm_ids_helper_store(it, iex);
+                        it_compact++;
+                    }
                 }
-            }
-
-            if (iex_used != -1) {
-                store[it_compact] = mm_ids_helper_store(it, iex_used);
-            }
-
-            if (warp_reduce_any<warp_size>(iex_used != -1)) {
-                it_compact++;
             }
         }
     } else {
@@ -71,14 +65,14 @@ static __global__ void mm_ids_helper(
             const int iex_used = expert_used == expert ? iex : -1;
             nex_prev += expert_used < expert;
 
-            // Whether the threads at this token position have used the expert:
-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
+            // Each thread that matched expert adds 1:
+            const int it_compact_add_self = (iex_used != -1) ? 1 : 0;
 
-            // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
+            // Do a prefix scan over all lower threads in the warp:
             int it_compact_add_lower = 0;
 #pragma unroll
-            for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
+            for (int offset = 1; offset < warp_size; offset *= 2) {
+                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self + it_compact_add_lower, offset, warp_size);
                 if (threadIdx.x >= static_cast<unsigned int>(offset)) {
                     it_compact_add_lower += tmp;
                 }
@@ -88,8 +82,9 @@ static __global__ void mm_ids_helper(
                 store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
             }
 
-            // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+            // Total matches in warp:
+            const int warp_matches = __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+            it_compact += warp_matches;
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
@@ -134,7 +129,7 @@ static void launch_mm_ids_helper(
 
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+    const size_t nbytes_shared = n_tokens*n_expert_used_var*sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);

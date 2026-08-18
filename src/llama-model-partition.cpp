@@ -326,13 +326,24 @@ void llama_moe_partition::promote_expert(int32_t candidate_id, int32_t slot_id) 
     slot_to_expert[slot_id] = candidate_id;
     expert_to_slot[candidate_id] = slot_id;
 
-    // Update accelerator lookup table
-    if (expert_to_slot_table) {
-        std::vector<float> table(n_expert_total);
-        for (int i = 0; i < n_expert_total; ++i) {
-            table[i] = (float) expert_to_slot[i];
+    // Update accelerator lookup tables
+    if (expert_mask_table && expert_slot_table) {
+        std::vector<float> mask_table(2 * n_expert_total, 0.0f);
+        std::vector<int32_t> slot_table(n_expert_total, 0);
+        for (int32_t e = 0; e < n_expert_total; ++e) {
+            int32_t s = expert_to_slot[e];
+            if (s >= 0) {
+                mask_table[2 * e + 0] = 1.0f;
+                mask_table[2 * e + 1] = 0.0f;
+                slot_table[e]         = s;
+            } else {
+                mask_table[2 * e + 0] = 0.0f;
+                mask_table[2 * e + 1] = 1.0f;
+                slot_table[e]         = 0;
+            }
         }
-        ggml_backend_tensor_set(expert_to_slot_table, table.data(), 0, table.size() * sizeof(float));
+        ggml_backend_tensor_set(expert_mask_table, mask_table.data(), 0, mask_table.size() * sizeof(float));
+        ggml_backend_tensor_set(expert_slot_table, slot_table.data(), 0, slot_table.size() * sizeof(int32_t));
     }
 }
 
@@ -590,10 +601,14 @@ std::unique_ptr<llama_moe_partition_set> llama_moe_partition_build(
         char name[128];
         const int64_t ne_accel = cand.n_expert_accel;
 
-        // Lookup table [1, n_expert_total]
+        // Lookup tables
+        snprintf(name, sizeof(name), "blk.%zu.moe_mask_table", cand.il);
+        part->expert_mask_table = ggml_new_tensor_2d(result->ctx_accel.get(), GGML_TYPE_F32, 2, cand.n_expert_total);
+        ggml_set_name(part->expert_mask_table, name);
+
         snprintf(name, sizeof(name), "blk.%zu.moe_slot_table", cand.il);
-        part->expert_to_slot_table = ggml_new_tensor_2d(result->ctx_accel.get(), GGML_TYPE_F32, 1, cand.n_expert_total);
-        ggml_set_name(part->expert_to_slot_table, name);
+        part->expert_slot_table = ggml_new_tensor_2d(result->ctx_accel.get(), GGML_TYPE_I32, 1, cand.n_expert_total);
+        ggml_set_name(part->expert_slot_table, name);
 
         if (cand.gate_up) {
             snprintf(name, sizeof(name), "blk.%zu.ffn_gate_up_exps.moe_gpu", cand.il);
@@ -663,12 +678,23 @@ std::unique_ptr<llama_moe_partition_set> llama_moe_partition_build(
         auto & part       = target.part;
         const int64_t ne  = cand.n_expert_accel;
 
-        // Initialize lookup table on device
-        std::vector<float> table(cand.n_expert_total, -1.0f);
-        for (int32_t s = 0; s < ne; ++s) {
-            table[s] = (float)s;
+        // Initialize lookup tables on device
+        std::vector<float> mask_table(2 * cand.n_expert_total, 0.0f);
+        std::vector<int32_t> slot_table(cand.n_expert_total, 0);
+        for (int32_t e = 0; e < cand.n_expert_total; ++e) {
+            int32_t s = part->expert_to_slot[e];
+            if (s >= 0) {
+                mask_table[2 * e + 0] = 1.0f; // is_gpu
+                mask_table[2 * e + 1] = 0.0f; // is_cpu
+                slot_table[e]         = s;    // resident slot index
+            } else {
+                mask_table[2 * e + 0] = 0.0f; // is_gpu
+                mask_table[2 * e + 1] = 1.0f; // is_cpu
+                slot_table[e]         = 0;    // safe clamped slot
+            }
         }
-        ggml_backend_tensor_set(part->expert_to_slot_table, table.data(), 0, table.size() * sizeof(float));
+        ggml_backend_tensor_set(part->expert_mask_table, mask_table.data(), 0, mask_table.size() * sizeof(float));
+        ggml_backend_tensor_set(part->expert_slot_table, slot_table.data(), 0, slot_table.size() * sizeof(int32_t));
 
         // Copy initial resident slices
         if (cand.gate_up) {

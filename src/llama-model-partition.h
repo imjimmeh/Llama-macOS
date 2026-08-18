@@ -57,8 +57,9 @@ struct llama_moe_partition {
     std::vector<int32_t> slot_to_expert; // [n_expert_accel]
     std::vector<int32_t> expert_to_slot; // [n_expert_total], -1 if in host RAM
 
-    // Accelerator-resident expert-to-slot lookup table tensor [1, n_expert_total] (F32)
-    ggml_tensor * expert_to_slot_table = nullptr;
+    // Accelerator-resident expert lookup table tensors
+    ggml_tensor * expert_mask_table = nullptr; // [2, n_expert_total] (F32: row 0 = is_gpu, row 1 = is_cpu)
+    ggml_tensor * expert_slot_table = nullptr; // [1, n_expert_total] (I32: resident slot index, 0 if non-resident)
 
     // Accelerator-resident expert tensors [n_embd, n_ff, n_expert_accel]
     ggml_tensor * gate_exps_accel    = nullptr;

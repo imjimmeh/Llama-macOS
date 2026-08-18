@@ -2650,47 +2650,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn_partitioned(
     const int64_t n_expert_accel = part.n_expert_accel;
     const int64_t n_tokens       = cur->ne[1];
 
-    // 1. Compute GPU/CPU selection masks
-    ggml_tensor * gpu_weights = nullptr;
-    ggml_tensor * cpu_weights = nullptr;
-    ggml_tensor * gpu_experts = nullptr;
+    // Ensure selected_experts is contiguous before 1D reshape
+    ggml_tensor * sel_cont = ggml_is_contiguous(selected_experts) ? selected_experts : ggml_cont(ctx0, selected_experts);
+    ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, sel_cont, n_expert_used * n_tokens);
 
-    if (part.expert_to_slot_table) {
-        // Look up resident slot index for each selected expert
-        ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, selected_experts, n_expert_used * n_tokens);
-        ggml_tensor * looked_up_slots = ggml_get_rows(ctx0, part.expert_to_slot_table, sel_flat);
-        looked_up_slots = ggml_reshape_3d(ctx0, looked_up_slots, 1, n_expert_used, n_tokens);
+    // 1. Look up is_gpu / is_cpu masks from expert_mask_table [2, n_expert_total]
+    ggml_tensor * looked_up_masks = ggml_get_rows(ctx0, part.expert_mask_table, sel_flat);
+    looked_up_masks = ggml_reshape_3d(ctx0, looked_up_masks, 2, n_expert_used, n_tokens);
 
-        // If slot >= 0: slot + 0.5 > 0 -> step = 1.0 (GPU)
-        // If slot == -1: -1 + 0.5 = -0.5 <= 0 -> step = 0.0 (CPU)
-        ggml_tensor * diff_gpu = ggml_add(ctx0, looked_up_slots, ggml_new_f32(ctx0, 0.5f));
-        ggml_tensor * is_gpu_expert = ggml_step(ctx0, diff_gpu);
-        ggml_tensor * is_cpu_expert = ggml_add(ctx0, ggml_scale(ctx0, is_gpu_expert, -1.0f), ggml_new_f32(ctx0, 1.0f));
+    ggml_tensor * is_gpu_expert = ggml_view_3d(ctx0, looked_up_masks, 1, n_expert_used, n_tokens, looked_up_masks->nb[1], looked_up_masks->nb[2], 0 * sizeof(float));
+    ggml_tensor * is_cpu_expert = ggml_view_3d(ctx0, looked_up_masks, 1, n_expert_used, n_tokens, looked_up_masks->nb[1], looked_up_masks->nb[2], 1 * sizeof(float));
 
-        gpu_weights = ggml_mul(ctx0, weights, is_gpu_expert);
-        cpu_weights = ggml_mul(ctx0, weights, is_cpu_expert);
+    ggml_tensor * gpu_weights = ggml_mul(ctx0, weights, is_gpu_expert);
+    ggml_tensor * cpu_weights = ggml_mul(ctx0, weights, is_cpu_expert);
 
-        ggml_tensor * slots_clamped = ggml_clamp(ctx0, ggml_dup(ctx0, looked_up_slots), 0.0f, (float)(n_expert_accel - 1));
-        gpu_experts = ggml_cast(ctx0, slots_clamped, GGML_TYPE_I32);
-        gpu_experts = ggml_reshape_2d(ctx0, gpu_experts, n_expert_used, n_tokens);
-    } else {
-        ggml_tensor * cast_exp = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
-        ggml_tensor * diff_gpu = ggml_add(ctx0,
-            ggml_scale(ctx0, cast_exp, -1.0f),
-            ggml_new_f32(ctx0, (float)n_expert_accel - 0.5f));
-        ggml_tensor * diff_cpu = ggml_add(ctx0,
-            cast_exp,
-            ggml_new_f32(ctx0, -(float)n_expert_accel + 0.5f));
-
-        ggml_tensor * is_gpu_expert = ggml_reshape_3d(ctx0, ggml_step(ctx0, diff_gpu), 1, n_expert_used, n_tokens);
-        ggml_tensor * is_cpu_expert = ggml_reshape_3d(ctx0, ggml_step(ctx0, diff_cpu), 1, n_expert_used, n_tokens);
-
-        gpu_weights = ggml_mul(ctx0, weights, is_gpu_expert);
-        cpu_weights = ggml_mul(ctx0, weights, is_cpu_expert);
-
-        ggml_tensor * cast_exp_gpu = ggml_dup(ctx0, cast_exp);
-        gpu_experts = ggml_cast(ctx0, ggml_clamp(ctx0, cast_exp_gpu, 0.0f, (float)(n_expert_accel - 1)), GGML_TYPE_I32);
-    }
+    // 2. Look up resident slot indices from expert_slot_table [1, n_expert_total] (I32)
+    ggml_tensor * gpu_experts_1d = ggml_get_rows(ctx0, part.expert_slot_table, sel_flat);
+    ggml_tensor * gpu_experts    = ggml_reshape_2d(ctx0, gpu_experts_1d, n_expert_used, n_tokens);
 
     auto build_branch = [&](
             ggml_tensor * up_e,
