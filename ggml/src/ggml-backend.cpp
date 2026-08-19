@@ -1719,8 +1719,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         bool used_zero_copy = false;
                         const bool is_single_token_decode = (ids_tensor->ne[1] == 1);
 
-                        // Process any pending JIT expert swaps for this tensor
-                        ggml_backend_expert_cache_process_jit_swaps(cache, input, split_backend);
+                        if (is_single_token_decode) {
+                            // Process any pending prompt-tail warmup or JIT swaps for this tensor
+                            ggml_backend_expert_cache_warmup_from_prompt_tail(cache, split_backend);
+                            ggml_backend_expert_cache_process_jit_swaps(cache, input, split_backend);
+                        }
 
                         // Vector 1 & 6: Zero-Copy Slot Pool execution during single-token decode
                         if (is_single_token_decode && slot_tensor != NULL && requested_experts.size() <= (size_t)slot_tensor->ne[2]) {
@@ -1809,6 +1812,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         if (!used_zero_copy) {
+                            if (!is_single_token_decode && input_id == 0) {
+                                ggml_backend_expert_cache_record_prompt_tail(cache, input, ids.data(), ids_tensor->ne[0], ids_tensor->ne[1], 64);
+                            }
+
                             // partition into hits and misses
                             std::vector<ggml_bitset_t> miss_bitset(ggml_bitset_size(n_expert), 0);
                             struct cache_hit_info {
@@ -2419,6 +2426,24 @@ void ggml_backend_sched_register_host_memory(
             ggml_backend_expert_cache_register_host_memory(sched->expert_caches[b], tensor->data, ggml_nbytes(tensor));
         }
     }
+}
+
+bool ggml_backend_sched_pin_anchor(
+        ggml_backend_sched_t sched,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id) {
+    if (sched == NULL || tensor == NULL || expert_id < 0) {
+        return false;
+    }
+    bool any_success = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b]) {
+            if (ggml_backend_expert_cache_pin_anchor(sched->expert_caches[b], tensor, expert_id)) {
+                any_success = true;
+            }
+        }
+    }
+    return any_success;
 }
 
 void ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched) {

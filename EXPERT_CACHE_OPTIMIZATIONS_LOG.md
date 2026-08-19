@@ -98,3 +98,26 @@
 
 ---
 
+## Expert Cache V3 Architecture: Prompt-Tail Warmup & Core Anchor Pinning
+
+### V3 Optimizations Implemented:
+1. **Component 1: Prompt-Tail Locality Seeding (`ggml_backend_expert_cache_record_prompt_tail`)**:
+   - Captures expert routing decisions from the final 64 tokens of the prompt ($K=64$).
+   - On transition to autoregressive decode (`is_single_token_decode == true`), promotes the top-frequency prompt-tail experts directly into the slot pools via high-speed DMA before Token 1 begins.
+2. **Component 2: Universal Core Anchor Pinning (`ggml_backend_expert_cache_pin_anchor`)**:
+   - Designates permanent immutable anchor slots (`is_anchor = true`, `GGML_EXPERT_CACHE_SEG_ANCHOR`) per pool.
+   - Core anchor slots are strictly exempt from SLRU/LRU eviction, providing a guaranteed zero-overhead floor across all queries.
+
+### Multi-Run Benchmark Validation (`-r 10`, `p=512, n=64,256,512`):
+
+| Test Mode | V1 Baseline (`-exc 256`, `-r 10`) | V2 Optimized (`-exc 256`, `-r 10`) | V3 Tail & Anchor (`-exc 256`, `-r 10`) | V3 Tail & Anchor (`-exc 512`, `-r 10`) | Notes |
+|---|---|---|---|---|---|
+| **Prompt Processing (`pp512`)** | 465.02 ± 10.32 tok/s | **467.67 ± 10.30 tok/s** | 454.00 ± 9.40 tok/s | 448.27 ± 8.81 tok/s | High prefill throughput |
+| **Cold Decode (`tg64`)** | 25.61 ± 0.67 tok/s | **26.38 ± 0.36 tok/s** | 25.53 ± 0.44 tok/s | 25.90 ± 0.46 tok/s | Low jitter |
+| **Warm Decode (`tg256`)** | 25.37 ± 0.63 tok/s | **26.43 ± 0.32 tok/s** | 24.60 ± 1.42 tok/s | 25.49 ± 0.82 tok/s | Multi-step decode |
+| **Steady-State Decode (`tg512`)** | 25.37 ± 0.95 tok/s | **25.49 ± 0.90 tok/s** | 25.35 ± 0.65 tok/s | 24.96 ± 1.09 tok/s | Extended generation |
+
+---
+
+
+

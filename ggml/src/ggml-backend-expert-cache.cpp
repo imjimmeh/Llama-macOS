@@ -58,6 +58,7 @@ struct ggml_expert_cache_slot_entry {
     int32_t expert_id = -1;
     int32_t layer = -1;
     enum ggml_expert_cache_segment segment = GGML_EXPERT_CACHE_SEG_PROBATIONARY;
+    bool is_anchor = false;
     uint64_t last_used = 0;
     uint64_t hit_count = 0;
     uint32_t access_in_window = 0;
@@ -167,6 +168,9 @@ struct ggml_backend_expert_cache {
     std::vector<std::pair<uintptr_t, size_t>> registered_host_ranges;
     size_t registered_host_bytes = 0;
     size_t max_registered_host_bytes = 1024 * 1024 * 1024; // 1 GiB safety cap
+
+    // Phase 8: Prompt-Tail Warmup Tracker
+    std::unordered_map<ggml_expert_cache_key, uint32_t, ggml_expert_cache_key_hash, ggml_expert_cache_key_eq> prompt_tail_freq;
 
     struct ggml_backend_expert_cache_stats stats;
 };
@@ -773,7 +777,7 @@ int32_t ggml_backend_expert_cache_alloc_slot_idx(
     // 1. Look for an empty slot
     for (int32_t s = 0; s < pool->max_slots; s++) {
         if (pool->slots[s].tensor == NULL) {
-            pool->slots[s] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1 };
+            pool->slots[s] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, false, ++cache->clock, 0, 1 };
             pool->key_to_slot[key] = s;
             pool->used_slots++;
             pool->probationary_used++;
@@ -799,7 +803,7 @@ int32_t ggml_backend_expert_cache_alloc_slot_idx(
     // Prefer evicting from probationary segment first
     for (int32_t s = 0; s < pool->max_slots; s++) {
         const auto & slot = pool->slots[s];
-        if (slot.tensor == NULL) continue;
+        if (slot.tensor == NULL || slot.is_anchor) continue;
 
         bool is_pinned = false;
         if (pinned_keys != NULL && n_pinned > 0) {
@@ -822,7 +826,7 @@ int32_t ggml_backend_expert_cache_alloc_slot_idx(
     if (victim_slot == -1) {
         for (int32_t s = 0; s < pool->max_slots; s++) {
             const auto & slot = pool->slots[s];
-            if (slot.tensor == NULL) continue;
+            if (slot.tensor == NULL || slot.is_anchor) continue;
 
             bool is_pinned = false;
             if (pinned_keys != NULL && n_pinned > 0) {
@@ -861,7 +865,7 @@ int32_t ggml_backend_expert_cache_alloc_slot_idx(
         cache->entries.erase(vkey);
         cache->stats.n_evictions++;
 
-        pool->slots[victim_slot] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1 };
+        pool->slots[victim_slot] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, false, ++cache->clock, 0, 1 };
         pool->key_to_slot[key] = victim_slot;
         pool->probationary_used++;
         if (layer >= 0) cache->layer_slots[layer]++;
@@ -1019,6 +1023,106 @@ bool ggml_backend_expert_cache_is_host_memory_registered(
         }
     }
     return false;
+}
+
+bool ggml_backend_expert_cache_pin_anchor(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id) {
+    if (cache == NULL || tensor == NULL || expert_id < 0) {
+        return false;
+    }
+
+    int32_t slot = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, expert_id, NULL, 0);
+    if (slot >= 0) {
+        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
+        if (pool != NULL && slot < (int32_t)pool->slots.size()) {
+            pool->slots[slot].is_anchor = true;
+            pool->slots[slot].segment = GGML_EXPERT_CACHE_SEG_PROTECTED;
+            return true;
+        }
+    }
+    return false;
+}
+
+void ggml_backend_expert_cache_record_prompt_tail(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * weight_tensor,
+        const int32_t * ids_data,
+        int64_t n_expert_used,
+        int64_t n_tokens,
+        int64_t tail_window_tokens) {
+    if (cache == NULL || weight_tensor == NULL || ids_data == NULL || n_tokens <= 0 || n_expert_used <= 0) {
+        return;
+    }
+
+    int64_t start_token = std::max((int64_t)0, n_tokens - tail_window_tokens);
+    for (int64_t t = start_token; t < n_tokens; t++) {
+        for (int64_t e = 0; e < n_expert_used; e++) {
+            int32_t exp_id = ids_data[t * n_expert_used + e];
+            if (exp_id >= 0) {
+                ggml_expert_cache_key key = { weight_tensor, exp_id };
+                cache->prompt_tail_freq[key]++;
+            }
+        }
+    }
+}
+
+void ggml_backend_expert_cache_warmup_from_prompt_tail(
+        ggml_backend_expert_cache_t cache,
+        ggml_backend_t backend) {
+    if (cache == NULL || backend == NULL || cache->prompt_tail_freq.empty()) {
+        return;
+    }
+
+    struct cand {
+        ggml_expert_cache_key key;
+        uint32_t freq;
+    };
+    std::vector<cand> cands;
+    cands.reserve(cache->prompt_tail_freq.size());
+    for (const auto & kv : cache->prompt_tail_freq) {
+        cands.push_back({ kv.first, kv.second });
+    }
+    std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) {
+        return a.freq > b.freq;
+    });
+
+    for (const auto & c : cands) {
+        const auto * tensor = c.key.tensor;
+        const int32_t exp_id = c.key.expert_id;
+        if (tensor == NULL || exp_id < 0) continue;
+
+        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
+        if (pool == NULL) continue;
+
+        int32_t existing_slot = ggml_backend_expert_cache_find_slot(cache, tensor, exp_id);
+        if (existing_slot < 0) {
+            int32_t slot = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, exp_id, NULL, 0);
+            if (slot >= 0) {
+                const size_t expert_size = tensor->nb[2];
+                const size_t expert_offset = (size_t)exp_id * expert_size;
+                const size_t dst_offset = (size_t)slot * expert_size;
+                const void * src_ptr = (const uint8_t *)tensor->data + expert_offset;
+
+                if (ggml_backend_expert_cache_is_host_memory_registered(cache, src_ptr, expert_size)) {
+                    ggml_backend_tensor_set_async(backend, pool->tensor, src_ptr, dst_offset, expert_size);
+                    ggml_backend_expert_cache_record_direct_dma(cache, expert_size);
+                } else {
+                    void * pinned_buf = ggml_backend_expert_cache_get_pinned_slot_buffer(cache, slot, expert_size);
+                    if (pinned_buf != NULL) {
+                        memcpy(pinned_buf, src_ptr, expert_size);
+                        ggml_backend_expert_cache_record_staging_memcpy(cache, expert_size);
+                        ggml_backend_tensor_set_async(backend, pool->tensor, pinned_buf, dst_offset, expert_size);
+                    } else {
+                        ggml_backend_tensor_set_async(backend, pool->tensor, src_ptr, dst_offset, expert_size);
+                    }
+                }
+            }
+        }
+    }
+    cache->prompt_tail_freq.clear();
+    ggml_backend_expert_cache_flush_slot_maps(cache, backend);
 }
 
 size_t ggml_backend_expert_cache_alloc_slot(
