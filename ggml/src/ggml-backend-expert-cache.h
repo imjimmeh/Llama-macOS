@@ -154,6 +154,11 @@ GGML_API void * ggml_backend_expert_cache_get_pinned_buffer(
     ggml_backend_expert_cache_t cache,
     size_t required_size);
 
+GGML_API void * ggml_backend_expert_cache_get_pinned_slot_buffer(
+    ggml_backend_expert_cache_t cache,
+    int32_t slot_idx,
+    size_t required_size);
+
 // Phase 6: Transition Predictor & Speculative Prefetch
 GGML_API void ggml_backend_expert_cache_record_step_experts(
     ggml_backend_expert_cache_t cache,
@@ -169,9 +174,18 @@ GGML_API int32_t ggml_backend_expert_cache_predict_next(
     int32_t * out_predicted,
     int32_t max_predict);
 
+GGML_API int32_t ggml_backend_expert_cache_get_tensor_layer(
+    const struct ggml_tensor * tensor);
+
 GGML_API void ggml_backend_expert_cache_prefetch(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * tensor,
+    const int32_t * expert_ids,
+    int32_t n_experts);
+
+GGML_API void ggml_backend_expert_cache_prefetch_layer(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
     const int32_t * expert_ids,
     int32_t n_experts);
 

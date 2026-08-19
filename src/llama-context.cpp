@@ -613,6 +613,15 @@ void llama_context::sched_reserve() {
     if (cparams.expert_cache_size > 0) {
         ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
         ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
+        for (int il = 0; il < (int)model.layers.size(); il++) {
+            const auto & layer = model.layers[il];
+            const struct ggml_tensor * gate = layer.ffn_gate_exps ? layer.ffn_gate_exps : layer.ffn_gate_up_exps;
+            const struct ggml_tensor * up   = layer.ffn_up_exps;
+            const struct ggml_tensor * down = layer.ffn_down_exps;
+            if (gate != NULL || up != NULL || down != NULL) {
+                ggml_backend_sched_register_expert_bundle(sched.get(), il, gate, up, down);
+            }
+        }
     }
 
     llama_memory_context_ptr mctx;

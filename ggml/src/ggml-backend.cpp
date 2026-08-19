@@ -1614,6 +1614,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> restored_nodes;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1710,26 +1711,102 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
-                        // partition into hits and misses
-                        std::vector<ggml_bitset_t> miss_bitset(ggml_bitset_size(n_expert), 0);
-                        struct cache_hit_info {
-                            int32_t expert_id;
-                            size_t  cache_offset;
-                        };
-                        std::vector<cache_hit_info> hits;
+                        struct ggml_tensor * slot_tensor = ggml_backend_expert_cache_get_slot_tensor(cache, input);
+                        bool used_zero_copy = false;
+                        const bool is_single_token_decode = (ids_tensor->ne[1] == 1);
 
-                        struct ggml_tensor * cache_tensor = ggml_backend_expert_cache_get_tensor(cache);
+                        // Process any pending JIT expert swaps for this tensor
+                        ggml_backend_expert_cache_process_jit_swaps(cache, input, split_backend);
 
-                        for (int32_t exp_id : requested_experts) {
-                            size_t c_offset = ggml_backend_expert_cache_find_offset(cache, input, exp_id);
-                            if (c_offset != SIZE_MAX) {
-                                ggml_backend_expert_cache_record_hit(cache, input, exp_id, expert_size);
-                                hits.push_back({ exp_id, c_offset });
-                            } else {
-                                ggml_backend_expert_cache_record_miss(cache, expert_size);
-                                ggml_bitset_set(miss_bitset.data(), exp_id);
+                        // Vector 1 & 6: Zero-Copy Slot Pool execution during single-token decode
+                        if (is_single_token_decode && slot_tensor != NULL && requested_experts.size() <= (size_t)slot_tensor->ne[2]) {
+                            std::vector<int32_t> remapped_ids(ids.size(), -1);
+                            bool all_slots_ready = true;
+
+                            for (size_t i = 0; i < ids.size(); i++) {
+                                int32_t exp_id = ids[i];
+                                if (exp_id < 0 || exp_id >= n_expert) {
+                                    remapped_ids[i] = -1;
+                                    continue;
+                                }
+
+                                int32_t slot = ggml_backend_expert_cache_find_slot(cache, input, exp_id);
+                                if (slot >= 0) {
+                                    remapped_ids[i] = slot;
+                                    ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
+                                } else {
+                                    slot = ggml_backend_expert_cache_alloc_slot_idx(
+                                        cache, input, exp_id, pinned_keys.data(), pinned_keys.size());
+                                    if (slot >= 0) {
+                                        remapped_ids[i] = slot;
+                                        ggml_backend_expert_cache_record_miss(cache, expert_size);
+
+                                        const size_t expert_offset = (size_t)exp_id * expert_size;
+                                        const size_t dst_offset = (size_t)slot * expert_size;
+
+                                        // Vector 3: High-throughput Pinned Host DMA Staging (per-slot isolated buffer)
+                                        void * pinned_buf = ggml_backend_expert_cache_get_pinned_slot_buffer(cache, slot, expert_size);
+                                        if (pinned_buf != NULL) {
+                                            memcpy(pinned_buf, (const uint8_t *)input->data + expert_offset, expert_size);
+                                            ggml_backend_tensor_set_async(split_backend,
+                                                slot_tensor,
+                                                pinned_buf,
+                                                dst_offset,
+                                                expert_size);
+                                        } else {
+                                            ggml_backend_tensor_set_async(split_backend,
+                                                slot_tensor,
+                                                (const uint8_t *)input->data + expert_offset,
+                                                dst_offset,
+                                                expert_size);
+                                        }
+                                    } else {
+                                        all_slots_ready = false;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (all_slots_ready) {
+                                ggml_backend_tensor_set_async(split_backend,
+                                    ids_tensor,
+                                    remapped_ids.data(),
+                                    0,
+                                    remapped_ids.size() * sizeof(int32_t));
+
+                                node->src[0] = slot_tensor;
+                                restored_nodes.push_back({ node, input_cpy });
+                                used_zero_copy = true;
+
+                                // Vector 4: Markov transition predictor (learning phase)
+                                const int32_t current_layer = ggml_backend_expert_cache_get_tensor_layer(input);
+                                if (current_layer >= 0 && !requested_experts.empty() && input_id == 0) {
+                                    ggml_backend_expert_cache_record_step_experts(cache, current_layer, requested_experts.data(), (int32_t)requested_experts.size());
+                                }
                             }
                         }
+
+                        if (!used_zero_copy) {
+                            // partition into hits and misses
+                            std::vector<ggml_bitset_t> miss_bitset(ggml_bitset_size(n_expert), 0);
+                            struct cache_hit_info {
+                                int32_t expert_id;
+                                size_t  cache_offset;
+                            };
+                            std::vector<cache_hit_info> hits;
+
+                            struct ggml_tensor * cache_tensor = ggml_backend_expert_cache_get_tensor(cache);
+
+                            for (int32_t exp_id : requested_experts) {
+                                size_t c_offset = ggml_backend_expert_cache_find_offset(cache, input, exp_id);
+                                if (c_offset != SIZE_MAX) {
+                                    ggml_backend_expert_cache_record_hit(cache, input, exp_id, expert_size);
+                                    hits.push_back({ exp_id, c_offset });
+                                } else {
+                                    ggml_backend_expert_cache_record_miss(cache, expert_size);
+                                    ggml_bitset_set(miss_bitset.data(), exp_id);
+                                }
+                            }
 
                         // 1. Process hits via Device-to-Device async copies
                         for (const auto & hit : hits) {
@@ -1847,6 +1924,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                             copy_miss_range(first_id, last_id);
                         }
+                        }
                     } else {
                         // group consecutive experts and copy them together
                         auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -1940,6 +2018,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
+        }
+
+        // restore any modified node src[0] pointers for graph idempotency
+        for (auto & rn : restored_nodes) {
+            rn.first->src[0] = rn.second;
         }
 
         // record the event of this copy
@@ -2285,6 +2368,22 @@ bool ggml_backend_sched_expert_cache_seed(
         }
     }
     return any_success;
+}
+
+void ggml_backend_sched_register_expert_bundle(
+        ggml_backend_sched_t sched,
+        int32_t layer,
+        const struct ggml_tensor * gate_tensor,
+        const struct ggml_tensor * up_tensor,
+        const struct ggml_tensor * down_tensor) {
+    if (sched == NULL) {
+        return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b]) {
+            ggml_backend_expert_cache_register_bundle(sched->expert_caches[b], layer, gate_tensor, up_tensor, down_tensor);
+        }
+    }
 }
 
 void ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched) {

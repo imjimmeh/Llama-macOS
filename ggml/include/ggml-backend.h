@@ -381,6 +381,7 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_get_expert_cache_stats(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_stats * out_stats);
     GGML_API size_t               ggml_backend_sched_expert_cache_export_entries(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_export_entry * out_entries, size_t max_entries);
     GGML_API bool                 ggml_backend_sched_expert_cache_seed(ggml_backend_sched_t sched, int backend_idx, const struct ggml_tensor * tensor, int32_t expert_id, uint32_t frequency);
+    GGML_API void                 ggml_backend_sched_register_expert_bundle(ggml_backend_sched_t sched, int32_t layer, const struct ggml_tensor * gate_tensor, const struct ggml_tensor * up_tensor, const struct ggml_tensor * down_tensor);
     GGML_API void                 ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched);
 
     //

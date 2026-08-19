@@ -138,6 +138,7 @@ struct ggml_backend_expert_cache {
     std::vector<ggml_expert_cache_swap_op> pending_forward_swaps;
 
     // Phase 1: Slot Pools
+    size_t pool_alloc_offset = 0;
     std::unordered_map<ggml_expert_cache_pool_key, ggml_expert_cache_slot_pool, ggml_expert_cache_pool_key_hash> slot_pools;
 
     // Phase 3: Expert Bundles
@@ -213,11 +214,9 @@ static ggml_expert_cache_slot_pool * ggml_backend_expert_cache_get_or_create_poo
         return &it->second;
     }
 
-    if (stride == 0) {
-        return NULL;
-    }
-
-    int32_t max_slots = (int32_t)(cache->capacity / stride);
+    // Proportional slots: share total capacity across potential tensor types (gate/up and down)
+    const size_t pool_cap = cache->capacity >= 2 * stride ? cache->capacity / 2 : cache->capacity;
+    int32_t max_slots = (int32_t)(pool_cap / stride);
     if (max_slots <= 0) {
         max_slots = 1;
     }
@@ -239,22 +238,24 @@ static ggml_expert_cache_slot_pool * ggml_backend_expert_cache_get_or_create_poo
     }
 
     const size_t pool_bytes = max_slots * stride;
-    ggml_backend_buffer_t pbuffer = ggml_backend_alloc_buffer(cache->backend, pool_bytes);
-    if (pbuffer == NULL) {
-        // Fall back to sharing the main cache buffer if backend buffer alloc is limited
-        pbuffer = cache->buffer;
-    }
+    ggml_backend_buffer_t pbuffer = NULL;
 
-    if (pbuffer != NULL && pbuffer != cache->buffer) {
-        if (ggml_backend_tensor_alloc(pbuffer, ptensor, ggml_backend_buffer_get_base(pbuffer)) != GGML_STATUS_SUCCESS) {
-            ggml_free(pctx);
-            ggml_backend_buffer_free(pbuffer);
-            return NULL;
-        }
-    } else {
-        // map directly onto the main cache buffer
-        ptensor->data = cache->tensor->data;
+    if (cache->pool_alloc_offset + pool_bytes <= cache->capacity && cache->tensor != NULL && cache->tensor->data != NULL) {
+        ptensor->data = (uint8_t *)cache->tensor->data + cache->pool_alloc_offset;
         ptensor->buffer = cache->buffer;
+        cache->pool_alloc_offset += pool_bytes;
+    } else {
+        pbuffer = ggml_backend_alloc_buffer(cache->backend, pool_bytes);
+        if (pbuffer != NULL) {
+            if (ggml_backend_tensor_alloc(pbuffer, ptensor, ggml_backend_buffer_get_base(pbuffer)) != GGML_STATUS_SUCCESS) {
+                ggml_free(pctx);
+                ggml_backend_buffer_free(pbuffer);
+                return NULL;
+            }
+        } else {
+            ptensor->data = cache->tensor->data;
+            ptensor->buffer = cache->buffer;
+        }
     }
 
     ptensor->nb[0] = weight_tensor->nb[0];
@@ -1043,6 +1044,25 @@ void * ggml_backend_expert_cache_get_pinned_buffer(
     return cache->pinned_host_buffer;
 }
 
+void * ggml_backend_expert_cache_get_pinned_slot_buffer(
+        ggml_backend_expert_cache_t cache,
+        int32_t slot_idx,
+        size_t required_size) {
+    if (cache == NULL || required_size == 0) {
+        return NULL;
+    }
+
+    const size_t slot_stride = GGML_EXPERT_CACHE_PAD(required_size);
+    const size_t total_capacity = slot_stride * 16;
+    void * base = ggml_backend_expert_cache_get_pinned_buffer(cache, total_capacity);
+    if (base == NULL) {
+        return NULL;
+    }
+
+    const size_t offset = (size_t)(std::abs(slot_idx) % 16) * slot_stride;
+    return (uint8_t *)base + offset;
+}
+
 // Phase 6: Transition Predictor & Speculative Prefetch
 void ggml_backend_expert_cache_record_step_experts(
         ggml_backend_expert_cache_t cache,
@@ -1110,7 +1130,9 @@ int32_t ggml_backend_expert_cache_predict_next(
     int32_t count = 0;
     for (const auto & p : sorted_cands) {
         if (count >= max_predict) break;
-        out_predicted[count++] = p.first;
+        if (p.second >= 2) {
+            out_predicted[count++] = p.first;
+        }
     }
     return count;
 }
@@ -1142,14 +1164,46 @@ void ggml_backend_expert_cache_prefetch(
         if (slot >= 0) {
             const size_t src_off = (size_t)eid * expert_size;
             const size_t dst_off = (size_t)slot * expert_size;
-            ggml_backend_tensor_set_async(
-                cache->backend,
-                pool->tensor,
-                (const uint8_t *)tensor->data + src_off,
-                dst_off,
-                expert_size);
+
+            void * pinned_buf = ggml_backend_expert_cache_get_pinned_buffer(cache, expert_size);
+            if (pinned_buf != NULL) {
+                memcpy(pinned_buf, (const uint8_t *)tensor->data + src_off, expert_size);
+                ggml_backend_tensor_set_async(
+                    cache->backend,
+                    pool->tensor,
+                    pinned_buf,
+                    dst_off,
+                    expert_size);
+            } else {
+                ggml_backend_tensor_set_async(
+                    cache->backend,
+                    pool->tensor,
+                    (const uint8_t *)tensor->data + src_off,
+                    dst_off,
+                    expert_size);
+            }
             cache->stats.n_speculative_prefetches++;
         }
+    }
+}
+
+int32_t ggml_backend_expert_cache_get_tensor_layer(const struct ggml_tensor * tensor) {
+    return ggml_expert_cache_get_tensor_layer(tensor);
+}
+
+void ggml_backend_expert_cache_prefetch_layer(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const int32_t * expert_ids,
+        int32_t n_experts) {
+    if (cache == NULL || layer < 0 || expert_ids == NULL || n_experts <= 0) {
+        return;
+    }
+    auto bit = cache->bundle_registrations.find(layer);
+    if (bit != cache->bundle_registrations.end()) {
+        if (bit->second.gate) ggml_backend_expert_cache_prefetch(cache, bit->second.gate, expert_ids, n_experts);
+        if (bit->second.up)   ggml_backend_expert_cache_prefetch(cache, bit->second.up,   expert_ids, n_experts);
+        if (bit->second.down) ggml_backend_expert_cache_prefetch(cache, bit->second.down, expert_ids, n_experts);
     }
 }
 
