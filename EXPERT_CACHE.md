@@ -206,6 +206,12 @@ GGML_API bool   ggml_backend_sched_expert_cache_seed(
     const struct ggml_tensor * tensor,
     int32_t expert_id,
     uint32_t frequency);
+
+// Pin expert permanently into the core anchor partition
+GGML_API bool   ggml_backend_sched_pin_anchor(
+    ggml_backend_sched_t sched,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
 ```
 
 ### 5.2 Internal Subsystem APIs (`ggml-backend-expert-cache.h`)
@@ -226,6 +232,11 @@ GGML_API void                 ggml_backend_expert_cache_record_gpu_id_resolution
 GGML_API bool                 ggml_backend_expert_cache_register_host_memory(ggml_backend_expert_cache_t cache, void * ptr, size_t size);
 GGML_API bool                 ggml_backend_expert_cache_is_host_memory_registered(ggml_backend_expert_cache_t cache, const void * ptr, size_t size);
 
+// Prompt-Tail Warmup & Core Anchor Pinning (V3)
+GGML_API void                 ggml_backend_expert_cache_record_prompt_tail(ggml_backend_expert_cache_t cache, const struct ggml_tensor * weight_tensor, const int32_t * ids_data, int64_t n_expert_used, int64_t n_tokens, int64_t tail_window_tokens);
+GGML_API void                 ggml_backend_expert_cache_warmup_from_prompt_tail(ggml_backend_expert_cache_t cache, ggml_backend_t backend);
+GGML_API bool                 ggml_backend_expert_cache_pin_anchor(ggml_backend_expert_cache_t cache, const struct ggml_tensor * tensor, int32_t expert_id);
+
 // Pinned Memory Staging
 GGML_API void *               ggml_backend_expert_cache_get_pinned_slot_buffer(ggml_backend_expert_cache_t cache, int32_t slot_idx, size_t required_size);
 
@@ -244,12 +255,12 @@ GGML_API void                 ggml_backend_expert_cache_process_jit_swaps(ggml_b
 
 Evaluated on **Qwen3.6-35B-A3B-APEX-Compact.gguf** (35B total params, 3B active params, 64 experts per layer, 8 active per token) on NVIDIA GeForce GTX 1080 (8 GB VRAM) + CPU Host (14 threads) using **10-repetition multi-run benchmarking (`-r 10`)**:
 
-| Benchmark Mode | Baseline (`-r 10`) | V2 Optimized (`-r 10`) | Throughput Delta | Variance / Stability Delta |
-|---|---|---|---|---|
-| **Prompt Processing (`pp512`)** | 465.02 ± 10.32 tok/s | **467.67 ± 10.30 tok/s** | +0.6% | Zero prefill regression |
-| **Cold Decode (`tg64`)** | 25.61 ± 0.67 tok/s | **26.38 ± 0.36 tok/s** | **+3.0% speedup** | **Standard deviation cut in half (-46% jitter)** |
-| **Warm Decode (`tg256`)** | 25.37 ± 0.63 tok/s | **26.43 ± 0.32 tok/s** | **+4.2% speedup** | **Standard deviation cut in half (-49% jitter)** |
-| **Steady-State Decode (`tg512`)** | 25.37 ± 0.95 tok/s | **25.49 ± 0.90 tok/s** | +0.5% | Consistent sustained throughput across long contexts |
+| Benchmark Mode | Baseline (`-r 10`) | V2 Optimized (`-r 10`) | V3 Tail & Anchor (`-r 10`) |
+|---|---|---|---|
+| **Prompt Processing (`pp512`)** | 465.02 ± 10.32 tok/s | **467.67 ± 10.30 tok/s** | 454.00 ± 9.40 tok/s |
+| **Cold Decode (`tg64`)** | 25.61 ± 0.67 tok/s | **26.38 ± 0.36 tok/s** | 25.53 ± 0.44 tok/s |
+| **Warm Decode (`tg256`)** | 25.37 ± 0.63 tok/s | **26.43 ± 0.32 tok/s** | 24.60 ± 1.42 tok/s |
+| **Steady-State Decode (`tg512`)** | 25.37 ± 0.95 tok/s | **25.49 ± 0.90 tok/s** | 25.35 ± 0.65 tok/s |
 
 ---
 
