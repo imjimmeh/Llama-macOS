@@ -1616,6 +1616,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         std::vector<std::pair<ggml_tensor *, ggml_tensor *>> restored_nodes;
 
+        if (sched->expert_caches[split_backend_id] != NULL) {
+            ggml_backend_expert_cache_flush_slot_maps(sched->expert_caches[split_backend_id], split_backend);
+        }
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1722,6 +1726,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (is_single_token_decode && slot_tensor != NULL && requested_experts.size() <= (size_t)slot_tensor->ne[2]) {
                             std::vector<int32_t> remapped_ids(ids.size(), -1);
                             bool all_slots_ready = true;
+                            bool all_hit = true;
 
                             for (size_t i = 0; i < ids.size(); i++) {
                                 int32_t exp_id = ids[i];
@@ -1735,6 +1740,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     remapped_ids[i] = slot;
                                     ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
                                 } else {
+                                    all_hit = false;
                                     slot = ggml_backend_expert_cache_alloc_slot_idx(
                                         cache, input, exp_id, pinned_keys.data(), pinned_keys.size());
                                     if (slot >= 0) {
@@ -1744,21 +1750,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                         const size_t expert_offset = (size_t)exp_id * expert_size;
                                         const size_t dst_offset = (size_t)slot * expert_size;
 
-                                        // Vector 3: High-throughput Pinned Host DMA Staging (per-slot isolated buffer)
-                                        void * pinned_buf = ggml_backend_expert_cache_get_pinned_slot_buffer(cache, slot, expert_size);
-                                        if (pinned_buf != NULL) {
-                                            memcpy(pinned_buf, (const uint8_t *)input->data + expert_offset, expert_size);
+                                        // V2.2: Bounded Direct Registered Host DMA or Isolated Pinned DMA Staging
+                                        const void * src_ptr = (const uint8_t *)input->data + expert_offset;
+                                        if (ggml_backend_expert_cache_is_host_memory_registered(cache, src_ptr, expert_size)) {
                                             ggml_backend_tensor_set_async(split_backend,
                                                 slot_tensor,
-                                                pinned_buf,
+                                                src_ptr,
                                                 dst_offset,
                                                 expert_size);
+                                            ggml_backend_expert_cache_record_direct_dma(cache, expert_size);
                                         } else {
-                                            ggml_backend_tensor_set_async(split_backend,
-                                                slot_tensor,
-                                                (const uint8_t *)input->data + expert_offset,
-                                                dst_offset,
-                                                expert_size);
+                                            void * pinned_buf = ggml_backend_expert_cache_get_pinned_slot_buffer(cache, slot, expert_size);
+                                            if (pinned_buf != NULL) {
+                                                memcpy(pinned_buf, src_ptr, expert_size);
+                                                ggml_backend_expert_cache_record_staging_memcpy(cache, expert_size);
+                                                ggml_backend_tensor_set_async(split_backend,
+                                                    slot_tensor,
+                                                    pinned_buf,
+                                                    dst_offset,
+                                                    expert_size);
+                                            } else {
+                                                ggml_backend_tensor_set_async(split_backend,
+                                                    slot_tensor,
+                                                    src_ptr,
+                                                    dst_offset,
+                                                    expert_size);
+                                            }
                                         }
                                     } else {
                                         all_slots_ready = false;
@@ -1768,6 +1785,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
 
                             if (all_slots_ready) {
+                                if (all_hit) {
+                                    ggml_backend_expert_cache_record_gpu_id_resolution(cache);
+                                } else {
+                                    ggml_backend_expert_cache_record_cpu_id_remap(cache);
+                                }
                                 ggml_backend_tensor_set_async(split_backend,
                                     ids_tensor,
                                     remapped_ids.data(),
@@ -2382,6 +2404,19 @@ void ggml_backend_sched_register_expert_bundle(
     for (int b = 0; b < sched->n_backends; b++) {
         if (sched->expert_caches[b]) {
             ggml_backend_expert_cache_register_bundle(sched->expert_caches[b], layer, gate_tensor, up_tensor, down_tensor);
+        }
+    }
+}
+
+void ggml_backend_sched_register_host_memory(
+        ggml_backend_sched_t sched,
+        const struct ggml_tensor * tensor) {
+    if (sched == NULL || tensor == NULL || tensor->data == NULL) {
+        return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b]) {
+            ggml_backend_expert_cache_register_host_memory(sched->expert_caches[b], tensor->data, ggml_nbytes(tensor));
         }
     }
 }

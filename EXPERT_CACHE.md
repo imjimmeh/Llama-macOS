@@ -99,7 +99,7 @@ struct ggml_expert_cache_key {
 
 ### 3.2 Slot Pool Structure (`ggml_backend_expert_slot_pool`)
 
-Maintains 3D sub-allocated slot buffers matching projection dimensions:
+Maintains 3D sub-allocated slot buffers matching projection dimensions, with per-pool GPU device mapping:
 
 ```cpp
 struct ggml_backend_expert_slot_pool {
@@ -116,6 +116,13 @@ struct ggml_backend_expert_slot_pool {
     int32_t protected_cap = 0;
     int32_t probationary_used = 0;
     int32_t protected_used = 0;
+
+    // V2: Per-Pool GPU-Resident Slot Mapping
+    int32_t n_experts = 64;
+    std::vector<int16_t> h_expert_to_slot; // CPU shadow map
+    struct ggml_tensor * d_expert_to_slot_tensor = nullptr; // Device-resident mapping array
+    bool map_dirty = false;
+
     std::vector<ggml_backend_expert_slot> slots;
     std::unordered_map<ggml_expert_cache_key, int32_t, ggml_expert_cache_key_hash> key_to_slot;
 };
@@ -134,6 +141,7 @@ Expert cache instances are allocated per accelerator backend:
 - `slot_pools`: Dimension-matched 3D slot pools sub-allocated from `tensor->data`.
 - `bundle_registrations`: Mapping of layer IDs to `{gate, up, down}` tensor definitions.
 - `pinned_host_buffer`: 16-slot 512-byte aligned page-locked host memory staging buffer.
+- `registered_host_ranges`: Vector of host memory pointer ranges registered via `cudaHostRegister` for direct DMA (1 GiB budget cap).
 - `layer_transitions`: Transition matrix tracking step transitions $P(E_{t+1} \mid E_t)$.
 - `pending_forward_swaps`: JIT queue for amortized periodic rebalancing transfers.
 
@@ -146,8 +154,8 @@ Expert cache instances are allocated per accelerator backend:
 In periodic mode:
 1. During token generation, `ggml_backend_expert_cache_record_access_count` increments expert access frequencies in `access_freq`.
 2. Every `period` decode steps (`decode_step % period_tokens == 0`), `ggml_backend_expert_cache_rebalance` executes:
-   - Evaluates expert access frequencies across all layers.
-   - Determines the optimal set of top-k experts that fit within `capacity`.
+   - Evaluates expert utility using global **Value-per-Byte**: $V = \frac{\text{Access Frequency} \times \text{Payload Size}}{\text{Allocated Slot Bytes}}$.
+   - Determines the optimal global set of candidates across all layers that fit within `capacity`.
    - Evicts unneeded entries, returning blocks to `free_blocks` and coalescing adjacent spans.
    - Enqueues promoted hot experts for JIT staged transfer across upcoming layer executions.
    - Decays access frequencies (`freq = (freq * 7) >> 3`, 0.875 multiplier) to adapt smoothly to shifting conversation contexts.
@@ -180,6 +188,11 @@ GGML_API void   ggml_backend_sched_register_expert_bundle(
     const struct ggml_tensor * up_tensor,
     const struct ggml_tensor * down_tensor);
 
+// Register CPU host tensor memory for direct DMA (cudaHostRegister)
+GGML_API void   ggml_backend_sched_register_host_memory(
+    ggml_backend_sched_t sched,
+    const struct ggml_tensor * tensor);
+
 // Retrieve runtime expert cache performance statistics
 GGML_API bool   ggml_backend_sched_get_expert_cache_stats(
     ggml_backend_sched_t sched,
@@ -204,6 +217,15 @@ GGML_API int32_t              ggml_backend_expert_cache_find_slot(ggml_backend_e
 GGML_API int32_t              ggml_backend_expert_cache_alloc_slot_idx(ggml_backend_expert_cache_t cache, const struct ggml_tensor * tensor, int32_t expert_id, const struct ggml_expert_cache_key * pinned_keys, size_t n_pinned);
 GGML_API void                 ggml_backend_expert_cache_record_zero_copy_hit(ggml_backend_expert_cache_t cache, const struct ggml_tensor * tensor, int32_t expert_id, size_t size);
 
+// GPU-Resident Slot Maps (V2.1)
+GGML_API void                 ggml_backend_expert_cache_flush_slot_maps(ggml_backend_expert_cache_t cache, ggml_backend_t backend);
+GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_slot_map_tensor(ggml_backend_expert_cache_t cache, const struct ggml_tensor * weight_tensor);
+GGML_API void                 ggml_backend_expert_cache_record_gpu_id_resolution(ggml_backend_expert_cache_t cache);
+
+// Direct Host Memory Registration (V2.2)
+GGML_API bool                 ggml_backend_expert_cache_register_host_memory(ggml_backend_expert_cache_t cache, void * ptr, size_t size);
+GGML_API bool                 ggml_backend_expert_cache_is_host_memory_registered(ggml_backend_expert_cache_t cache, const void * ptr, size_t size);
+
 // Pinned Memory Staging
 GGML_API void *               ggml_backend_expert_cache_get_pinned_slot_buffer(ggml_backend_expert_cache_t cache, int32_t slot_idx, size_t required_size);
 
@@ -220,17 +242,14 @@ GGML_API void                 ggml_backend_expert_cache_process_jit_swaps(ggml_b
 
 ## 6. Validated Benchmark Results
 
-Evaluated on **Qwen3.6-35B-A3B-APEX-Compact.gguf** (35B total params, 3B active params, 64 experts per layer, 8 active per token) on NVIDIA GeForce GTX 1080 (8 GB VRAM) + CPU Host (14 threads):
+Evaluated on **Qwen3.6-35B-A3B-APEX-Compact.gguf** (35B total params, 3B active params, 64 experts per layer, 8 active per token) on NVIDIA GeForce GTX 1080 (8 GB VRAM) + CPU Host (14 threads) using **10-repetition multi-run benchmarking (`-r 10`)**:
 
-| Configuration / Optimization Phase | Prompt Processing (`pp512`) | Token Generation (`tg64`) | Avoided Host $\to$ GPU Bandwidth | Key Takeaway |
+| Benchmark Mode | Baseline (`-r 10`) | V2 Optimized (`-r 10`) | Throughput Delta | Variance / Stability Delta |
 |---|---|---|---|---|
-| **Baseline** (Prior to Vectors 1–7) | 468.51 tok/s | 25.12 tok/s | - | Initial benchmark |
-| **Vector 1: Zero-Copy Slot Pool Execution** | 10.04 tok/s | **27.25 tok/s** | ~2.1 GiB | **+8.5% tg speedup** via direct `MUL_MAT_ID` index remapping |
-| **Vector 2 + 6: Prefill Adaptive Switching & Sync** | **481.27 tok/s** | **25.74 tok/s** | ~2.2 GiB | **+2.7% pp speedup**; eliminates prefill slot contention |
-| **Vector 3: Pinned Host DMA Staging** | **481.27 tok/s** | **25.74 tok/s** | ~2.2 GiB | 16-slot isolated page-locked memory staging |
-| **Vector 4: Markov Transition Predictor** | 472.80 tok/s | 23.48 tok/s | ~2.4 GiB | Inter-step transition matrix trained |
-| **Vector 5: Atomic Layer Bundling (`{gate, up, down}`)** | 458.47 tok/s | 25.34 tok/s | ~2.3 GiB | Synchronized residency across all 64 layers |
-| **Vector 7: JIT Incremental Staged Rebalancing** | **481.27 tok/s** | **25.74 tok/s** | ~2.2 GiB | Amortizes periodic rebalance transfers smoothly |
+| **Prompt Processing (`pp512`)** | 465.02 ± 10.32 tok/s | **467.67 ± 10.30 tok/s** | +0.6% | Zero prefill regression |
+| **Cold Decode (`tg64`)** | 25.61 ± 0.67 tok/s | **26.38 ± 0.36 tok/s** | **+3.0% speedup** | **Standard deviation cut in half (-46% jitter)** |
+| **Warm Decode (`tg256`)** | 25.37 ± 0.63 tok/s | **26.43 ± 0.32 tok/s** | **+4.2% speedup** | **Standard deviation cut in half (-49% jitter)** |
+| **Steady-State Decode (`tg512`)** | 25.37 ± 0.95 tok/s | **25.49 ± 0.90 tok/s** | +0.5% | Consistent sustained throughput across long contexts |
 
 ---
 

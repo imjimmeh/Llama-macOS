@@ -78,3 +78,23 @@
 - **Mechanism**: Intercepts periodic rebalancing promotions and distributes the physical weight transfers smoothly across layers just before each layer executes via `ggml_backend_expert_cache_process_jit_swaps`, eliminating periodic frame drops or latency spikes.
 
 ---
+
+## Expert Cache V2 Architecture & Multi-Run Benchmarks (-r 10)
+
+### V2 Optimizations Implemented:
+1. **Component 0: Fine-Grained Diagnostic Telemetry**: Added exact counters for CPU ID remaps, GPU ID resolutions, staging memcpy bytes, direct registered-host DMA bytes, slot map updates, and DMA wait time.
+2. **Component 1: Per-Pool GPU-Resident Slot Resolution (`d_expert_to_slot`)**: Attached device mapping tensors directly to each slot pool with CPU shadow tables and batched dirty flushes, eliminating chatty per-mutation host-to-device transfers.
+3. **Component 2: Bounded Direct Registered-Host DMA (`cudaHostRegister`)**: Registered CPU-offloaded MoE weight tensors into page-locked memory (with 1 GiB safety cap), eliminating the intermediate CPU `memcpy` into staging slots on misses.
+4. **Component 3: Empirical Global Value-per-Byte Rebalancing**: Replaced static layer allocation formulas with global dynamic competition based on measured $\text{value} = \frac{\text{hits} \times \text{size}}{\text{alloc\_size}}$.
+
+### Multi-Run Benchmark Results (`-r 10`, `p=512, n=64,256,512`):
+
+| Test Mode | V1 Baseline (`-r 10`) | V2 Optimized (`-r 10`) | Throughput Delta | Variance / Stability Delta |
+|---|---|---|---|---|
+| **Prompt Processing (`pp512`)** | 465.02 ± 10.32 tok/s | **467.67 ± 10.30 tok/s** | +0.6% | Identical high throughput, zero prefill regression |
+| **Cold Decode (`tg64`)** | 25.61 ± 0.67 tok/s | **26.38 ± 0.36 tok/s** | **+3.0% speedup** | **Standard deviation cut in half (-46% jitter)** |
+| **Warm Decode (`tg256`)** | 25.37 ± 0.63 tok/s | **26.43 ± 0.32 tok/s** | **+4.2% speedup** | **Standard deviation cut in half (-49% jitter)** |
+| **Steady-State Decode (`tg512`)** | 25.37 ± 0.95 tok/s | **25.49 ± 0.90 tok/s** | +0.5% | Consistent sustained throughput across extended generation |
+
+---
+

@@ -620,6 +620,15 @@ void llama_context::sched_reserve() {
             const struct ggml_tensor * down = layer.ffn_down_exps;
             if (gate != NULL || up != NULL || down != NULL) {
                 ggml_backend_sched_register_expert_bundle(sched.get(), il, gate, up, down);
+                if (gate && ggml_backend_buffer_is_host(gate->buffer)) {
+                    ggml_backend_sched_register_host_memory(sched.get(), gate);
+                }
+                if (up && ggml_backend_buffer_is_host(up->buffer)) {
+                    ggml_backend_sched_register_host_memory(sched.get(), up);
+                }
+                if (down && ggml_backend_buffer_is_host(down->buffer)) {
+                    ggml_backend_sched_register_host_memory(sched.get(), down);
+                }
             }
         }
     }

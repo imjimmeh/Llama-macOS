@@ -127,6 +127,17 @@ GGML_API int32_t ggml_backend_expert_cache_remap_ids(
     int32_t * out_remapped_ids,
     bool * out_is_hit);
 
+GGML_API void ggml_backend_expert_cache_record_cpu_id_remap(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_record_staging_memcpy(
+    ggml_backend_expert_cache_t cache,
+    size_t bytes);
+
+GGML_API void ggml_backend_expert_cache_record_direct_dma(
+    ggml_backend_expert_cache_t cache,
+    size_t bytes);
+
 // Legacy byte-based slot allocation
 GGML_API size_t ggml_backend_expert_cache_alloc_slot(
     ggml_backend_expert_cache_t cache,
@@ -148,6 +159,29 @@ GGML_API bool ggml_backend_expert_cache_is_bundle_resident(
     ggml_backend_expert_cache_t cache,
     int32_t layer,
     int32_t expert_id);
+
+// V2.1: GPU-Resident Slot Maps
+GGML_API void ggml_backend_expert_cache_flush_slot_maps(
+    ggml_backend_expert_cache_t cache,
+    ggml_backend_t backend);
+
+GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_slot_map_tensor(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * weight_tensor);
+
+GGML_API void ggml_backend_expert_cache_record_gpu_id_resolution(
+    ggml_backend_expert_cache_t cache);
+
+// V2.2: Bounded Direct Host Page Registration
+GGML_API bool ggml_backend_expert_cache_register_host_memory(
+    ggml_backend_expert_cache_t cache,
+    void * ptr,
+    size_t size);
+
+GGML_API bool ggml_backend_expert_cache_is_host_memory_registered(
+    ggml_backend_expert_cache_t cache,
+    const void * ptr,
+    size_t size);
 
 // Phase 5: Pinned Host Memory & Staging
 GGML_API void * ggml_backend_expert_cache_get_pinned_buffer(

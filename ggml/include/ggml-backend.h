@@ -373,6 +373,16 @@ extern "C" {
         uint64_t n_jit_swaps;
         size_t   bytes_ram_to_gpu;
         size_t   bytes_avoided;
+
+        // V2 Diagnostic Telemetry
+        uint64_t n_cpu_id_remaps;
+        uint64_t n_gpu_id_resolutions;
+        size_t   staging_memcpy_bytes;
+        size_t   direct_pinned_dma_bytes;
+        uint64_t n_map_updates;
+        size_t   map_update_bytes;
+        uint64_t dma_ns;
+        uint64_t dma_wait_ns;
     };
 
     GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size);
@@ -382,6 +392,7 @@ extern "C" {
     GGML_API size_t               ggml_backend_sched_expert_cache_export_entries(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_export_entry * out_entries, size_t max_entries);
     GGML_API bool                 ggml_backend_sched_expert_cache_seed(ggml_backend_sched_t sched, int backend_idx, const struct ggml_tensor * tensor, int32_t expert_id, uint32_t frequency);
     GGML_API void                 ggml_backend_sched_register_expert_bundle(ggml_backend_sched_t sched, int32_t layer, const struct ggml_tensor * gate_tensor, const struct ggml_tensor * up_tensor, const struct ggml_tensor * down_tensor);
+    GGML_API void                 ggml_backend_sched_register_host_memory(ggml_backend_sched_t sched, const struct ggml_tensor * tensor);
     GGML_API void                 ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched);
 
     //
