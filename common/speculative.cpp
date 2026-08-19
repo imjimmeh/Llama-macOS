@@ -1460,6 +1460,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
+            if (ctx_dft) {
+                auto * model_dft = llama_get_model(ctx_dft);
+                if (llama_model_has_mtp(model_dft) && !llama_model_mtp_is_gpu_resident(model_dft)) {
+                    llama_model_mtp_promote_to_gpu(model_dft, ctx_dft);
+                }
+            }
+
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {

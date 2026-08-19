@@ -355,4 +355,5 @@ llama_build_and_test(test-ffn-split.cpp)
 llama_build_and_test(test-expert-cache-profile.cpp)
 llama_build_and_test(test-expert-cache.cpp)
 llama_build_and_test(test-mtp-dynamic-offload.cpp)
+llama_build(test-benchmark-mtp.cpp)
 

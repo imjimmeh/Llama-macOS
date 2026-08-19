@@ -1367,15 +1367,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
-    const bool mtp_dyn = params.mtp_dynamic_offload && hparams.n_layer_nextn > 0 && params.load_mtp;
+    const bool mtp_active_static = params.load_mtp && !params.mtp_dynamic_offload && hparams.n_layer_nextn > 0;
     const int n_trunk = hparams.n_layer();
-    const int n_layers_budget = mtp_dyn ? n_trunk : n_layer_all;
+    const int n_layers_budget = n_layer_budget();
 
     const int i_gpu_start = std::max(n_layers_budget + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layers_budget + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
-        if (mtp_dyn && il >= n_trunk && il < n_layer_all) {
+        if (!mtp_active_static && il >= n_trunk && il < n_layer_all) {
             LLAMA_LOG_DEBUG("load_tensors: MTP layer %3d assigned to host (%s), is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
@@ -1684,7 +1684,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, n_layer_all);
+        const int n_gpu = std::min(n_gpu_layers, n_layers_budget);
 
         int n_repeating = n_gpu;
         if (n_repeating > 0) {
@@ -1693,8 +1693,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
 
-        const int max_backend_supported_layers = n_layer_all + 1;
-        const int max_offloadable_layers       = n_layer_all + 1;
+        const int max_backend_supported_layers = n_layers_budget + 1;
+        const int max_offloadable_layers       = n_layers_budget + 1;
 
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
@@ -1828,9 +1828,14 @@ const float * llama_model::tensor_split() const {
     return params.tensor_split;
 }
 
+uint32_t llama_model::n_layer_budget() const {
+    const bool mtp_active_static = params.load_mtp && !params.mtp_dynamic_offload && hparams.n_layer_nextn > 0;
+    return mtp_active_static ? hparams.n_layer_all : hparams.n_layer();
+}
+
 uint32_t llama_model::n_gpu_layers() const {
     // note: plus 1 for the "output" layer
-    return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
+    return params.n_gpu_layers >= 0 ? params.n_gpu_layers : n_layer_budget() + 1;
 }
 
 llama_split_mode llama_model::split_mode() const {

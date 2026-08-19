@@ -110,6 +110,23 @@ See:
 
 - #25173
 
+### Multi-Token Prediction (`draft-mtp`)
+
+Multi-Token Prediction (MTP) / NextN uses the specialized MTP decoder layers packaged directly
+inside the target model checkpoint (e.g. Qwen 3.5, Qwen 3.6, and Qwen 3.5 MoE). The MTP block takes
+the trunk model's final hidden state and iteratively predicts additional draft tokens.
+
+When running on memory-constrained GPUs, use `--mtp-dynamic-offload` to keep MTP layers staged in
+host RAM during the prompt processing (prefill) phase, maximizing base trunk layers in GPU VRAM,
+and dynamically promote MTP weights to GPU via high-speed DMA once token generation begins.
+
+```bash
+# Run with MTP speculative drafting and dynamic offload:
+llama-cli -m Qwen3.5-35B-A3B-MoE.gguf --draft-mtp --mtp-dynamic-offload -ngl 33 -p "Prompt here"
+```
+
+For detailed architectural documentation and benchmarks, see [EXPERT_CACHE.md](file:///G:/code/AI/llamacpptuned/llama.cpp/EXPERT_CACHE.md#7-dynamic-mtp-offload-and-phase-aware-residency).
+
 ### n-gram Cache (`ngram-cache`)
 
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
@@ -296,6 +313,9 @@ Unsupported samplers and device layouts fall back to CPU sampling. Tensor split 
 --spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft  N
                                         keep the MoE weights of the first N layers in the CPU for the draft model
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE)
+--mtp-dynamic-offload, --no-mtp-dynamic-offload
+                                        stage MTP (NextN) layers in host memory during prompt processing and dynamically promote to GPU for generation (default: disabled)
+                                        (env: LLAMA_ARG_MTP_DYNAMIC_OFFLOAD)
 ```
 
 ### n-gram Mod Parameters

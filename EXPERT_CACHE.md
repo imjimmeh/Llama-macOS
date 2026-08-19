@@ -165,3 +165,82 @@ To prevent weight corruption and activation divergence (such as repetitive token
 - **Defragmentation and Free-Block Coalescing**: All evictions during rebalancing return `{offset, alloc_size}` to `free_blocks` and invoke `ggml_backend_expert_cache_coalesce_free` before allocating new entries.
 - **512-Byte Boundary Alignment**: All slot allocations are padded to `GGML_EXPERT_CACHE_ALIGN` (512 bytes) to satisfy backend DMA, DirectStorage, and SIMD alignment requirements.
 - **Platform-Safe Pinned Deallocation**: Pinned host memory uses `_aligned_free` on Windows and `free` on POSIX systems.
+
+---
+
+## 7. Dynamic MTP Offload and Phase-Aware Residency
+
+Models with Multi-Token Prediction (MTP / NextN), such as Qwen 3.5 and Qwen 3.6 MoE architectures, bundle extra decoder blocks after the main trunk layers (e.g. layer index `n_layer` to `n_layer_all - 1`).
+
+### 7.1 Problem: Compute Residency vs. Weight Residency
+
+In standard execution:
+1. **Prompt Processing (PP)**: Only the base trunk layers (`0 .. n_layer - 1`) are executed in the forward graph. The MTP block is completely idle during prompt processing.
+2. **Static Offload Bottleneck**: Standard layer offloading assigns layers from the top down (`n_layer_all` down to 0). On memory-constrained accelerators (such as 8 GB GPUs), placing idle MTP blocks in VRAM forces active trunk layers (especially Layer 0) onto CPU host memory.
+3. **PCIe Ping-Pong**: Evicting Layer 0 to CPU forces host-device activation synchronization on every token, cutting inference speed in half.
+
+```
+Conventional Static Offload (Suboptimal):
+GPU VRAM:  [ Layer 1..31 ] [ Output ] [ MTP Layer 32 (IDLE during PP) ]
+Host RAM:  [ Layer 0 (ACTIVE during PP -> Forces PCIe Bottleneck)    ]
+
+Dynamic MTP Offload (Optimized):
+PP Phase:  GPU VRAM: [ Layer 0..31 (100% Trunk) ] [ Output ]
+           Host RAM: [ MTP Layer 32 (Staged in RAM)        ]
+TG Phase:  GPU VRAM: [ Layer 0..31 ] [ Output ] [ MTP Layer 32 (Promoted via DMA) ]
+```
+
+### 7.2 Dynamic Weight Residency Lifecycle
+
+When `--mtp-dynamic-offload` is enabled:
+1. **Model Loading Phase**:
+   - Active GPU layer budget is set to `n_trunk` (`hparams.n_layer()`).
+   - Base trunk layers (`0 .. n_trunk - 1`) and the output layer receive full GPU VRAM placement (`i_gpu_start = 0`).
+   - MTP layers (`n_trunk .. n_layer_all - 1`) are staged in host RAM (`cpu_dev`).
+   - MTP tensor metadata, host pointers, and GPU buffer sizes are registered in `llama_model::impl::mtp_state`.
+2. **Prompt Processing (PP) Phase**:
+   - 100% of trunk layers run in GPU VRAM with full compute throughput and zero host synchronization.
+3. **Generation / Speculative Drafting Phase**:
+   - When speculative MTP drafting begins, `llama_model_mtp_promote_to_gpu()` is invoked.
+   - Dedicated GPU weight buffer is allocated if not already present.
+   - MTP weights are transferred asynchronously via high-speed DMA (`ggml_backend_tensor_set_async`).
+   - Tensor data pointers (`tensor->data`, `tensor->buffer`) and layer device mappings (`dev_layer[il]`) are dynamically rebound to the GPU backend.
+   - Speculative draft decodes execute on the GPU backend without reinitializing model or context state.
+
+### 7.3 Layer Budgeting Invariants (`n_layer_budget`)
+
+To guarantee correct device placement across all execution modes:
+
+$$\text{n\_layer\_budget} = \begin{cases} \text{n\_layer\_all}, & \text{if } \text{load\_mtp} \land \neg\text{mtp\_dynamic\_offload} \land (\text{n\_layer\_nextn} > 0) \\ \text{n\_layer}, & \text{otherwise} \end{cases}$$
+
+- **Non-MTP Mode (`load_mtp = false`)**: Active budget is `n_layer`. MTP weights remain on CPU host and never consume VRAM or steal GPU layer slots. Layer 0 is guaranteed on GPU when `-ngl >= n_layer + 1`.
+- **Dynamic MTP Mode (`mtp_dynamic_offload = true`)**: Active budget is `n_layer`. Trunk layers occupy VRAM during prefill, and MTP is promoted dynamically for token generation.
+- **Static MTP Mode (`load_mtp = true && !mtp_dynamic_offload`)**: Active budget is `n_layer_all`. Both trunk and MTP layers are statically offloaded to GPU.
+
+### 7.4 CLI Options and Environment Variables
+
+- `--mtp-dynamic-offload`, `--no-mtp-dynamic-offload`: Enable or disable dynamic MTP staging and promotion (default: disabled).
+  - Environment variable: `LLAMA_ARG_MTP_DYNAMIC_OFFLOAD`
+
+### 7.5 C API Reference
+
+```c
+// Check if model contains MTP layers and has dynamic offload enabled
+LLAMA_API bool llama_model_has_mtp(const struct llama_model * model);
+
+// Check if MTP layers currently reside in GPU VRAM
+LLAMA_API bool llama_model_mtp_is_gpu_resident(const struct llama_model * model);
+
+// Asynchronously promote MTP weights from host memory to GPU VRAM
+LLAMA_API bool llama_model_mtp_promote_to_gpu(const struct llama_model * model, struct llama_context * ctx);
+
+// Demote MTP weights back to host RAM and restore CPU device bindings
+LLAMA_API bool llama_model_mtp_demote_to_host(const struct llama_model * model);
+```
+
+### 7.6 Synergy with Expert Cache
+
+Dynamic MTP offloading works seamlessly alongside the Expert Cache:
+- Base trunk MoE layers continue to utilize the Expert Cache buffer for frequent routed experts.
+- MTP decoder blocks (which include routed and shared expert matrices) execute on GPU during drafting without displacing or corrupting trunk expert cache entries.
+
