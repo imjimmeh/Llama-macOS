@@ -1054,6 +1054,25 @@ struct llama_model::impl {
 
     bool has_tensor_overrides;
 
+    struct mtp_tensor_info {
+        struct ggml_tensor * tensor = nullptr;
+        void * host_data = nullptr;
+        ggml_backend_buffer_t host_buffer = nullptr;
+        size_t nbytes = 0;
+        size_t gpu_offset = 0;
+    };
+
+    struct mtp_residency_state {
+        bool enabled = false;
+        bool is_gpu_resident = false;
+        ggml_backend_dev_t gpu_dev = nullptr;
+        size_t total_gpu_size = 0;
+        ggml_backend_buffer_ptr buf_gpu;
+        std::vector<mtp_tensor_info> tensors;
+    };
+
+    mtp_residency_state mtp_state;
+
     std::vector<float> tensor_split_owned;
 };
 
@@ -1348,10 +1367,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    const bool mtp_dyn = params.mtp_dynamic_offload && hparams.n_layer_nextn > 0 && params.load_mtp;
+    const int n_trunk = hparams.n_layer();
+    const int n_layers_budget = mtp_dyn ? n_trunk : n_layer_all;
+
+    const int i_gpu_start = std::max(n_layers_budget + 1 - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layers_budget + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        if (mtp_dyn && il >= n_trunk && il < n_layer_all) {
+            LLAMA_LOG_DEBUG("load_tensors: MTP layer %3d assigned to host (%s), is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+            return {cpu_dev, &pimpl->cpu_buft_list};
+        }
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -1373,7 +1400,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    pimpl->dev_output = get_layer_buft_list(n_layers_budget);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -1713,6 +1740,48 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     __func__, n_part, params.ffn_split * 100.0f,
                     ggml_backend_dev_name(accel_dev),
                     ggml_backend_buffer_get_size(ffn_partitions->buf_accel.get()) / (1024.0 * 1024.0));
+            }
+        }
+    }
+
+    if (params.mtp_dynamic_offload && hparams.n_layer_nextn > 0 && !devices.empty() && params.load_mtp) {
+        ggml_backend_dev_t gpu_dev = nullptr;
+        for (const auto & d : devices) {
+            if (ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                gpu_dev = d.dev;
+                break;
+            }
+        }
+        if (gpu_dev) {
+            ggml_backend_buffer_type_t gpu_buft = ggml_backend_dev_buffer_type(gpu_dev);
+            const size_t alignment = ggml_backend_buft_get_alignment(gpu_buft);
+            const int n_trunk = hparams.n_layer();
+            size_t total_gpu_size = 0;
+            pimpl->mtp_state.tensors.clear();
+
+            for (const auto & pair : tensors_by_name) {
+                ggml_tensor * t = pair.second;
+                int il = -1;
+                if (sscanf(t->name, "blk.%d.", &il) == 1 && il >= n_trunk && il < (int)hparams.n_layer_all) {
+                    const size_t alloc_size = GGML_PAD(ggml_backend_buft_get_alloc_size(gpu_buft, t), alignment);
+                    pimpl->mtp_state.tensors.push_back({
+                        t,
+                        t->data,
+                        t->buffer,
+                        ggml_nbytes(t),
+                        total_gpu_size
+                    });
+                    total_gpu_size += alloc_size;
+                }
+            }
+
+            if (!pimpl->mtp_state.tensors.empty()) {
+                pimpl->mtp_state.enabled = true;
+                pimpl->mtp_state.is_gpu_resident = false;
+                pimpl->mtp_state.gpu_dev = gpu_dev;
+                pimpl->mtp_state.total_gpu_size = total_gpu_size;
+                LLAMA_LOG_INFO("%s: MTP dynamic offload enabled: %zu MTP tensors (%.2f MiB) staged in host memory\n",
+                    __func__, pimpl->mtp_state.tensors.size(), total_gpu_size / (1024.0 * 1024.0));
             }
         }
     }
@@ -2076,6 +2145,100 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+bool llama_model::has_mtp() const {
+    return hparams.n_layer_nextn > 0 && pimpl->mtp_state.enabled;
+}
+
+bool llama_model::mtp_is_gpu_resident() const {
+    return pimpl->mtp_state.is_gpu_resident;
+}
+
+bool llama_model::mtp_promote_to_gpu(llama_context * ctx) {
+    GGML_UNUSED(ctx);
+    if (!pimpl->mtp_state.enabled || pimpl->mtp_state.is_gpu_resident) {
+        return true;
+    }
+
+    const auto & state = pimpl->mtp_state;
+    if (state.tensors.empty() || !state.gpu_dev) {
+        return true;
+    }
+
+    ggml_backend_buffer_type_t gpu_buft = ggml_backend_dev_buffer_type(state.gpu_dev);
+    if (!pimpl->mtp_state.buf_gpu) {
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(gpu_buft, state.total_gpu_size);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate %.2f MiB GPU buffer for MTP dynamic offload\n",
+                __func__, state.total_gpu_size / (1024.0 * 1024.0));
+            return false;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        pimpl->mtp_state.buf_gpu.reset(buf);
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    ggml_backend_t backend = ggml_backend_dev_init(state.gpu_dev, nullptr);
+    if (!backend) {
+        LLAMA_LOG_ERROR("%s: failed to initialize backend for GPU device %s\n",
+            __func__, ggml_backend_dev_name(state.gpu_dev));
+        return false;
+    }
+
+    char * gpu_base = (char *) ggml_backend_buffer_get_base(pimpl->mtp_state.buf_gpu.get());
+    for (auto & info : pimpl->mtp_state.tensors) {
+        void * gpu_ptr = gpu_base ? (gpu_base + info.gpu_offset) : nullptr;
+        if (gpu_base) {
+            info.tensor->data = gpu_ptr;
+        }
+        info.tensor->buffer = pimpl->mtp_state.buf_gpu.get();
+        if (info.host_data) {
+            ggml_backend_tensor_set_async(backend, info.tensor, info.host_data, 0, info.nbytes);
+        }
+    }
+
+    ggml_backend_synchronize(backend);
+    ggml_backend_free(backend);
+
+    const int n_trunk = hparams.n_layer();
+    for (int il = n_trunk; il < (int)hparams.n_layer_all; ++il) {
+        if (il < (int)pimpl->dev_layer.size() && pimpl->gpu_buft_list.count(state.gpu_dev)) {
+            pimpl->dev_layer[il] = {state.gpu_dev, &pimpl->gpu_buft_list.at(state.gpu_dev)};
+        }
+    }
+
+    pimpl->mtp_state.is_gpu_resident = true;
+
+    const int64_t t_elapsed_us = ggml_time_us() - t_start_us;
+    LLAMA_LOG_INFO("%s: MTP weights promoted to GPU in %.2f ms (%.2f MiB)\n",
+        __func__, t_elapsed_us / 1000.0, state.total_gpu_size / (1024.0 * 1024.0));
+
+    return true;
+}
+
+bool llama_model::mtp_demote_to_host() {
+    if (!pimpl->mtp_state.enabled || !pimpl->mtp_state.is_gpu_resident) {
+        return true;
+    }
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    for (auto & info : pimpl->mtp_state.tensors) {
+        info.tensor->data = info.host_data;
+        info.tensor->buffer = info.host_buffer;
+    }
+
+    const int n_trunk = hparams.n_layer();
+    for (int il = n_trunk; il < (int)hparams.n_layer_all; ++il) {
+        if (il < (int)pimpl->dev_layer.size()) {
+            pimpl->dev_layer[il] = {cpu_dev, &pimpl->cpu_buft_list};
+        }
+    }
+
+    pimpl->mtp_state.is_gpu_resident = false;
+    LLAMA_LOG_DEBUG("%s: MTP weights demoted to host memory\n", __func__);
+    return true;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
@@ -2526,6 +2689,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.mtp_dynamic_offload         =*/ false,
         /*.ffn_split                   =*/ 0.0f,
     };
 
@@ -2566,6 +2730,22 @@ int32_t llama_model_n_layer(const llama_model * model) {
 
 int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
+}
+
+bool llama_model_has_mtp(const struct llama_model * model) {
+    return model && model->has_mtp();
+}
+
+bool llama_model_mtp_is_gpu_resident(const struct llama_model * model) {
+    return model && model->mtp_is_gpu_resident();
+}
+
+bool llama_model_mtp_promote_to_gpu(const struct llama_model * model, struct llama_context * ctx) {
+    return model && const_cast<llama_model *>(model)->mtp_promote_to_gpu(ctx);
+}
+
+bool llama_model_mtp_demote_to_host(const struct llama_model * model) {
+    return model && const_cast<llama_model *>(model)->mtp_demote_to_host();
 }
 
 int32_t llama_model_n_head(const llama_model * model) {

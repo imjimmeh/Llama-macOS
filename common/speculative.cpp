@@ -1545,6 +1545,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        if (ctx_dft) {
+            auto * model_dft = llama_get_model(ctx_dft);
+            if (llama_model_has_mtp(model_dft) && !llama_model_mtp_is_gpu_resident(model_dft)) {
+                llama_model_mtp_promote_to_gpu(model_dft, ctx_dft);
+            }
+        }
+
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
@@ -2320,6 +2327,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+        result.mtp_dynamic_offload   = params.mtp_dynamic_offload || params_spec.mtp_dynamic_offload;
 
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;

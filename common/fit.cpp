@@ -137,7 +137,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
 
     hp_ngl         = llama_model_n_layer(model);
-    if (mparams->load_mtp) {
+    if (mparams->load_mtp && !mparams->mtp_dynamic_offload) {
         hp_ngl    += llama_model_n_layer_nextn(model);
     }
     hp_n_ctx_train = llama_model_n_ctx_train(model);

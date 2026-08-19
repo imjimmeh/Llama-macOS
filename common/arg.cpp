@@ -2839,6 +2839,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FFN_SPLIT"));
     add_opt(common_arg(
+        {"--mtp-dynamic-offload"},
+        {"--no-mtp-dynamic-offload"},
+        "stage MTP (NextN) layers in host memory during prompt processing and dynamically promote to GPU for generation (default: disabled)",
+        [](common_params & params, bool value) {
+            params.mtp_dynamic_offload = value;
+            params.speculative.draft.mtp_dynamic_offload = value;
+        }
+    ).set_env("LLAMA_ARG_MTP_DYNAMIC_OFFLOAD"));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"

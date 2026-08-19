@@ -338,9 +338,10 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
-        bool load_mtp;        // whether to load MTP layers
+        bool load_mtp;            // whether to load MTP layers
+        bool mtp_dynamic_offload; // stage MTP layers in host memory during prefill and promote to GPU for decode
 
-        float ffn_split;      // fraction of dense FFN intermediate dimension to place on GPU (0.0 = disabled)
+        float ffn_split;          // fraction of dense FFN intermediate dimension to place on GPU (0.0 = disabled)
     };
 
     struct llama_sampler_seq_config {
@@ -590,6 +591,13 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
+
+    // MTP dynamic residency functions
+    LLAMA_API bool llama_model_has_mtp            (const struct llama_model * model);
+    LLAMA_API bool llama_model_mtp_is_gpu_resident(const struct llama_model * model);
+    LLAMA_API bool llama_model_mtp_promote_to_gpu (const struct llama_model * model, struct llama_context * ctx);
+    LLAMA_API bool llama_model_mtp_demote_to_host (const struct llama_model * model);
+
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
