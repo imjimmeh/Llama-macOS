@@ -267,109 +267,14 @@ static void test_transition_predictor_and_prefetch() {
     printf("  transition predictor and prefetch tests passed\n");
 }
 
-static void test_core_anchor_pinning() {
-    printf("testing core anchor pinning...\n");
-
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    assert(backend != nullptr);
-
-    const size_t expert_bytes = 1024;
-    const size_t cache_capacity = 4 * expert_bytes; // room for only 4 experts
-
-    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
-    assert(cache != nullptr);
-
-    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
-    struct ggml_context * ctx = ggml_init(params);
-    assert(ctx != nullptr);
-
-    struct ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
-    ggml_set_name(tensor, "blk.0.ffn_gate_exps.weight");
-    tensor->nb[2] = expert_bytes;
-
-    // Pin expert 2 as a permanent core anchor
-    bool ok_pin = ggml_backend_expert_cache_pin_anchor(cache, tensor, 2);
-    assert(ok_pin);
-    int32_t slot2 = ggml_backend_expert_cache_find_slot(cache, tensor, 2);
-    assert(slot2 >= 0);
-
-    // Fill remaining slots with experts 4, 5, 6
-    int32_t slot4 = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, 4, nullptr, 0);
-    int32_t slot5 = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, 5, nullptr, 0);
-    int32_t slot6 = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, 6, nullptr, 0);
-    assert(slot4 >= 0 && slot5 >= 0 && slot6 >= 0);
-
-    // Cause heavy evictions by allocating experts 7, 8, 9, 10
-    for (int e = 7; e <= 10; e++) {
-        int32_t se = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, e, nullptr, 0);
-        assert(se >= 0);
-    }
-
-    // Anchor expert 2 MUST STILL BE RESIDENT!
-    int32_t check_slot2 = ggml_backend_expert_cache_find_slot(cache, tensor, 2);
-    assert(check_slot2 == slot2);
-
-    ggml_backend_expert_cache_free(cache);
-    ggml_free(ctx);
-    ggml_backend_free(backend);
-
-    printf("  core anchor pinning tests passed\n");
-}
-
-static void test_prompt_tail_warmup() {
-    printf("testing prompt-tail warmup seeding...\n");
-
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    assert(backend != nullptr);
-
-    const size_t expert_bytes = 1024;
-    const size_t cache_capacity = 8 * expert_bytes;
-
-    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
-    assert(cache != nullptr);
-
-    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
-    struct ggml_context * ctx = ggml_init(params);
-    assert(ctx != nullptr);
-
-    struct ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
-    ggml_set_name(tensor, "blk.0.ffn_gate_exps.weight");
-    tensor->nb[2] = expert_bytes;
-
-    // Simulate 128 tokens with 2 experts each, where tail tokens heavily use experts 9 and 13
-    std::vector<int32_t> ids_data(128 * 2, 1);
-    for (int t = 64; t < 128; t++) {
-        ids_data[t * 2 + 0] = 9;
-        ids_data[t * 2 + 1] = 13;
-    }
-
-    ggml_backend_expert_cache_record_prompt_tail(cache, tensor, ids_data.data(), 2, 128, 64);
-    assert(ggml_backend_expert_cache_find_slot(cache, tensor, 9) < 0);
-
-    // Warm up from prompt tail
-    ggml_backend_expert_cache_warmup_from_prompt_tail(cache, backend);
-
-    // Experts 9 and 13 should now be resident in slots
-    assert(ggml_backend_expert_cache_find_slot(cache, tensor, 9) >= 0);
-    assert(ggml_backend_expert_cache_find_slot(cache, tensor, 13) >= 0);
-
-    ggml_backend_expert_cache_free(cache);
-    ggml_free(ctx);
-    ggml_backend_free(backend);
-
-    printf("  prompt-tail warmup seeding tests passed\n");
-}
-
 int main() {
-    printf("running test-expert-cache (V3 features)...\n");
+    printf("running test-expert-cache (V2 features)...\n");
 
     test_slot_pools_and_remapping();
     test_slru_and_admission_policy();
     test_expert_bundles();
     test_pinned_host_buffer();
     test_transition_predictor_and_prefetch();
-    test_core_anchor_pinning();
-    test_prompt_tail_warmup();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

@@ -183,25 +183,6 @@ GGML_API bool ggml_backend_expert_cache_is_host_memory_registered(
     const void * ptr,
     size_t size);
 
-// V3.1: Prompt-Tail Warmup Seeding
-GGML_API void ggml_backend_expert_cache_record_prompt_tail(
-    ggml_backend_expert_cache_t cache,
-    const struct ggml_tensor * weight_tensor,
-    const int32_t * ids_data,
-    int64_t n_expert_used,
-    int64_t n_tokens,
-    int64_t tail_window_tokens);
-
-GGML_API void ggml_backend_expert_cache_warmup_from_prompt_tail(
-    ggml_backend_expert_cache_t cache,
-    ggml_backend_t backend);
-
-// V3.2: Universal Core Anchor Pinning
-GGML_API bool ggml_backend_expert_cache_pin_anchor(
-    ggml_backend_expert_cache_t cache,
-    const struct ggml_tensor * tensor,
-    int32_t expert_id);
-
 // Phase 5: Pinned Host Memory & Staging
 GGML_API void * ggml_backend_expert_cache_get_pinned_buffer(
     ggml_backend_expert_cache_t cache,
