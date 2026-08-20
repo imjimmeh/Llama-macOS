@@ -713,6 +713,7 @@ struct llama_model {
 
     bool has_mtp() const;
     bool mtp_is_gpu_resident() const;
+    size_t mtp_dynamic_gpu_size() const;
     bool mtp_promote_to_gpu(llama_context * ctx = nullptr);
     bool mtp_demote_to_host();
 

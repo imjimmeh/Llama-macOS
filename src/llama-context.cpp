@@ -614,6 +614,11 @@ void llama_context::sched_reserve() {
         ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
         ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
         for (int il = 0; il < (int)model.layers.size(); il++) {
+            // dynamically promoted MTP experts leave host memory on promotion, so the
+            // cache must not register them as host-resident; static MTP stays on host
+            if (model.has_mtp() && il >= (int) model.hparams.n_layer()) {
+                continue;
+            }
             const auto & layer = model.layers[il];
             const struct ggml_tensor * gate = layer.ffn_gate_exps ? layer.ffn_gate_exps : layer.ffn_gate_up_exps;
             const struct ggml_tensor * up   = layer.ffn_up_exps;

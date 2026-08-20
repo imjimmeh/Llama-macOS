@@ -96,6 +96,23 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
+    // the deferred MTP promotion buffer is allocated on the first GPU device when
+    // draft generation promotes the MTP weights; charge it to that device's model size
+    {
+        const size_t mtp_gpu_size = llama_model_mtp_dynamic_gpu_size(model);
+        if (mtp_gpu_size > 0) {
+            for (size_t i = 0; i < nd; i++) {
+                ggml_backend_dev_t dev = llama_model_get_device(model, i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    ret[i].mb.model += mtp_gpu_size;
+                    LOG_TRC("%s: deferred MTP promotion buffer = %.2f MiB on %s\n",
+                            __func__, mtp_gpu_size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+                    break;
+                }
+            }
+        }
+    }
+
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_dev == nullptr) {

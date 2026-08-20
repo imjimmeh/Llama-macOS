@@ -88,6 +88,9 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
+// Size in bytes of the deferred MTP dynamic offload GPU buffer, or 0 if disabled.
+LLAMA_API size_t llama_model_mtp_dynamic_gpu_size(const struct llama_model * model);
+
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
 // Set whether the context outputs nextn embeddings or not
