@@ -98,3 +98,42 @@
 
 ---
 
+## Dynamic MTP Offload Correctness Fixes (2026-08-20)
+
+**Scope**: The expert cache interacts with MTP (Multi-Token Prediction) drafting. Dynamic MTP offload loads the MTP block on host, then promotes it to a contiguous GPU buffer before the first draft decode. The following correctness defects were confirmed and fixed:
+
+1. **Quantized padding was not zero-initialized**. `mtp_promote_to_gpu()` re-pointed each tensor at the GPU allocation and copied `ggml_nbytes()` bytes, but never called `ggml_backend_buffer_init_tensor()`. CUDA's `init_tensor` memsets the padding tail of quantized weights (`padded_size - original_size` bytes); without it, `MUL_MAT_ID` could read uninitialized memory when a full padded slot was consumed.
+   - **Fix**: `ggml_backend_buffer_init_tensor()` is called per tensor after `data`/`buffer` re-pointing and before the async copy. A failed init restores every touched tensor to its captured `host_data`/`host_buffer`, syncs/frees the temp backend, and pins `promotion_failed`.
+2. **MTP experts were registered as host-resident in the expert cache**. `llama_context::sched_reserve` registered all model layers including the MTP block. After promotion, those weights no longer live in host memory, so the cache held stale host pointers.
+   - **Fix**: The registration loop skips dynamically promoted MTP layers (`model.has_mtp() && il >= model.hparams.n_layer()`). Static MTP models are unaffected.
+3. **Dynamic collection accepted view tensors and non-host overrides**. Relocating a view or a non-host tensor independently would corrupt the shared buffer.
+   - **Fix**: Collection is all-or-nothing: every MTP tensor must be an owned host tensor (`t->view_src == NULL && ggml_backend_buffer_is_host(t->buffer)`), else the mode is disabled with a `LOG_WARN` and host-resident MTP fallback is preserved.
+4. **`--fit` did not account for the deferred promotion buffer**. The dynamic MTP collection ran after the `ml.no_alloc` early return, so fit never saw the MTP GPU allocation and could overcommit VRAM.
+   - **Fix**: A sizing pass runs before the no-allocation early return. `llama_model_mtp_dynamic_gpu_size()` returns the deferred buffer size (0 when disabled), and `common/fit.cpp` charges it to the first GPU device (`deferred MTP promotion buffer = <MiB>`).
+5. **Failed promotion retried allocation and repeated error spam**. A transient VRAM shortage caused a new `buf_gpu` allocation and error log on every draft step.
+   - **Fix**: A sticky `promotion_failed` flag is set on buffer-alloc, backend-init, or tensor-init failure; future promotions return `false` without retrying.
+
+### Deterministic Validation Matrix (2026-08-20)
+
+Model: `Qwen3.6-35B-A3B-APEX-MTP-Quality.gguf` (21.87 GB, one MTP block `blk.40`, 20 MTP tensors, 856.36 MiB). Fixed prompt, `temperature = 0`, `top-k = 1`, `seed = 42`, fresh server per row, `parallel = 1` (row F = 2).
+
+| Row | Spec | `exc` | `mtp-dynamic-offload` | draft_n / accepted | Result |
+|---|---|---|---|---|---|
+| A | none | 0 | off | 0 / 0 | coherent, reproducible |
+| B | none | 64M | off | 0 / 0 | token-identical to A (cache does not alter target-only output) |
+| C | draft-mtp | 0 | off | 188 / 160 | coherent |
+| D | draft-mtp | 0 | on | 182 / 164 | coherent, promotion logs confirmed |
+| E | draft-mtp | 64M | on | 186 / 161 | coherent |
+| F | draft-mtp (parallel=2) | 0 | on | 194 / 157 | both slots coherent |
+
+Confirmed with `-lv 4` (model-load `LLAMA_LOG_INFO` is filtered at default verbosity 3):
+
+```text
+load_tensors: MTP dynamic offload enabled: 20 MTP tensors (856.36 MiB) staged in host memory
+mtp_promote_to_gpu: MTP weights promoted to GPU in 101.42 ms (856.36 MiB)
+common_get_device_memory_data_impl: deferred MTP promotion buffer = 856.36 MiB on CUDA0
+slot print_timing: draft acceptance = 0.95238 (20 accepted / 21 generated), mean len = 2.82
+```
+
+**Verdict**: No row reproduced gibberish. All draft-mtp rows produced high acceptance (~85%) with coherent output. The dynamic-MTP correctness fixes are verified in `380f9af17`.
+

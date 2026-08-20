@@ -313,4 +313,38 @@ $$\text{n\_layer\_budget} = \begin{cases} \text{n\_layer\_all}, & \text{if } \te
 - **Dynamic MTP Mode (`mtp_dynamic_offload = true`)**: Active budget is `n_layer`. Trunk layers occupy VRAM during prefill, and MTP is promoted dynamically for token generation.
 - **Static MTP Mode (`load_mtp = true && !mtp_dynamic_offload`)**: Active budget is `n_layer_all`. Both trunk and MTP layers are statically offloaded to GPU.
 
+### 8.3 Correctness Hardening (2026-08-20)
+
+Dynamic MTP offload correctness fixes, verified on `Qwen3.6-35B-A3B-APEX-MTP-Quality.gguf` (21.87 GB, one MTP block `blk.40`, 20 MTP tensors, 856.36 MiB):
+
+1. **Quantized padding initialization**: Promotion now calls `ggml_backend_buffer_init_tensor()` on each tensor after re-pointing `data`/`buffer` at the GPU allocation and before the async weight copy. CUDA's `init_tensor` zeroes the quantized padding tail (`padded_size - original_size` bytes), so uninitialized memory is never visible to `MUL_MAT_ID`. Promotion no longer emits garbage when a full padded slot is read.
+2. **Host expert-cache exclusion**: Dynamically promoted MTP experts are excluded from the host expert-cache registration loop (`llama_context::sched_reserve`). Because promotion moves the MTP weights out of host memory, registering them as host-resident would leave the cache holding stale pointers. Static MTP models are unaffected (`has_mtp()` is true only when the dynamic collection is enabled).
+3. **Owned-host-tensor guard**: Dynamic relocation is enabled only when every collected MTP tensor is an owned host tensor (`t->view_src == NULL && ggml_backend_buffer_is_host(t->buffer)`). If any tensor fails this check, the whole mode is disabled with a `LOG_WARN` and the model falls back to host-resident MTP. No partial relocation is attempted.
+4. **Deferred fit sizing**: The MTP GPU promotion buffer is charged to the first GPU device in `llama_get_memory_breakdown()` (`deferred MTP promotion buffer = <MiB>`), so `--fit` reserves headroom for the lazy promotion instead of silently overcommitting VRAM. The static layer count is not inflated; the allocation is deferred in time but required before MTP generation.
+5. **Promotion failure pinning**: A failed GPU-buffer allocation, backend init, or tensor init sets a sticky `promotion_failed` flag. All tensors touched during the failed init path are restored to their captured `host_data`/`host_buffer`, and future promotion calls return `false` without retrying the allocation or repeating the error log. The host-resident MTP fallback is always preserved.
+
+### 8.4 Dynamic MTP Offload Validation Results (2026-08-20)
+
+Deterministic single-request matrix on `Qwen3.6-35B-A3B-APEX-MTP-Quality.gguf` (fixed prompt, `temperature = 0`, `top-k = 1`, `seed = 42`, fresh server per row):
+
+| Row | Spec | `exc` | `mtp-dynamic-offload` | draft_n / accepted | Result |
+|---|---|---|---|---|---|
+| A | none | 0 | off | 0 / 0 | coherent, reproducible |
+| B | none | 64M | off | 0 / 0 | token-identical to A |
+| C | draft-mtp | 0 | off | 188 / 160 | coherent |
+| D | draft-mtp | 0 | on | 182 / 164 | coherent, promotion logs confirmed |
+| E | draft-mtp | 64M | on | 186 / 161 | coherent |
+| F | draft-mtp, parallel=2 | 0 | on | 194 / 157 | both slots coherent |
+
+Confirmed with `-lv 4`:
+
+```text
+load_tensors: MTP dynamic offload enabled: 20 MTP tensors (856.36 MiB) staged in host memory
+mtp_promote_to_gpu: MTP weights promoted to GPU in 101.42 ms (856.36 MiB)
+common_get_device_memory_data_impl: deferred MTP promotion buffer = 856.36 MiB on CUDA0
+slot print_timing: draft acceptance = 0.95238 (20 accepted / 21 generated), mean len = 2.82
+```
+
+Note: model-load `LLAMA_LOG_INFO` lines are filtered at the default server verbosity (level 3). Use `-lv 4` to see the MTP dynamic-offload and promotion log lines. All rows emitted coherent output; no gibberish reproduced, and expert-cache on/off does not change target-only token IDs.
+
 
