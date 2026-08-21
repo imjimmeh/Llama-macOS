@@ -338,3 +338,60 @@ The reverted tree rebuilt `test-expert-cache` and `llama-bench`; `test-expert-ca
 The scheduler experiment was removed. Compact decode retains normal CPU routing for host-resident MoE weights, and the existing cache remains limited to workloads whose graph already moves the relevant experts to the accelerator.
 
 After removal, the original `-exc 256M` TG128 command measured 26.47 tok/s with zero requests, zero hits, zero eligible operations, and zero capacity bypasses. Do not use cache capacity as a reason to force Compact decode MoE operations onto CUDA. Any new attempt needs a design that reduces the full per-projection boundary cost, not only expert-weight bytes.
+
+---
+
+## Phase 0 Determinism Verification (2026-08-21)
+
+### Goal
+
+Prove the Phase 0 fixes (staging-ring race, descending seed order, timing
+probes) do not change greedy token generation. Fixed prompt, temperature 0,
+top-k 1, seed 42, ignore_eos, 256 generated tokens, one completion per fresh
+llama-server process. Model: `Qwen3.6-35B-A3B-APEX-MTP-Quality.gguf`.
+Preset args (from `G:/qwen3.6-35b-a3b-presets-exc.ini`, `[qwen3.6-35B-mtp]`):
+threads 14, batch 4096, ubatch 2048, Q8_0 KV, Flash Attention, mlock,
+no-mmap, no-context-shift, cram 1024, fit on fit-target 256, parallel 1,
+jinja on, ctx 128000. Runner: `scripts/expert-cache-determinism.py` +
+`expert-cache-determinism-matrix.py`.
+
+| Row | Cache config | Draft | sha256(tokens) | tok/s | wall s |
+|---|---|---|---:|---:|---:|
+| A | `-exc 0` | none | `94e837bd59602c89885f61e77dd670723fe70680f38e3f8671bb7765302ee2c2` | 17.12 | 15.4 |
+| B | `-exc 64M -excp 64` | none | `94e837bd59602c89885f61e77dd670723fe70680f38e3f8671bb7765302ee2c2` | 17.13 | 15.3 |
+| E | `-exc 64M -excp 64` | MTP draft n-max 2 + dynamic offload | `cdf118910faf6a24461aa8b59d5cc95834a3bdde7e05e40e11feb9ac1ed51dd8` | 16.34 | 16.9 |
+| E0 | `-exc 0` | MTP draft n-max 2 + dynamic offload | `cd12df1a3f7b40b7fb6e3899ac21bf7afb48e543872491cca3d25978b247ccf2` | 18.96 | 14.2 |
+
+### Result
+
+Row A and Row B emit byte-identical token streams. The enabled cache (64 MiB,
+period 64, seeded profile) does not alter greedy generation. Phase 0 fixes
+preserve the determinism requirement on the cache path.
+
+Row E differs from Row A. This is not a cache regression: Row E0 (draft with
+cache disabled) also differs from Row A, so the MTP draft path itself changes
+the token stream. The draft context loads a second compute graph against the
+same model and `--mtp-dynamic-offload` moves draft layers at runtime. Row E
+also differs from Row E0, but `-exc 64M` reserves cache memory and seeds 512
+hot experts, which shifts fit layer placement. This matches the documented
+parallel 1 vs 2 placement sensitivity: hash differences caused by placement
+are not a valid cache correctness comparison.
+
+The reference hash `580b417f73e4d58b209b44e5f07ccc269900d4b0d9d5318e8866f1d6f1335fe8`
+was recorded with a different 29-token prompt and is not reproduced by these
+runs. It was a cache-period comparison (0/64/256 equal hashes), not a draft
+comparison. The A == B equality is the fresh cache-correctness proof.
+
+### Notes
+
+- llama-cli was abandoned for this harness: chat-templated models auto-enter
+  conversation mode and never exit after generating, so the process hangs on
+  stdin (`>` prompts). `--no-conversation` is a bare toggle and is required.
+  llama-server performs one completion per HTTP request and exits cleanly.
+- `--jinja` is a bare toggle in this fork (`common/arg.cpp:3707`), not
+  `--jinja on`. `--flash-attn on` and `--fit on` are value forms
+  (`arg.cpp:1744`, `arg.cpp:2917`). The UI preset file writes `on/off`, the
+  CLI differs per flag class.
+- Expert-cache profile seeding: rows with cache enabled log
+  `loaded profile 'default' (512 hot experts seeded ...)`; rows with
+  `-exc 0` log nothing.
