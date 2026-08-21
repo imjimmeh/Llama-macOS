@@ -184,6 +184,22 @@ GGML_API bool ggml_backend_expert_cache_is_bundle_resident(
 GGML_API void ggml_backend_expert_cache_record_gpu_id_resolution(
     ggml_backend_expert_cache_t cache);
 
+GGML_API void ggml_backend_expert_cache_record_probe_layer(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_record_probe_sync(
+    ggml_backend_expert_cache_t cache,
+    uint64_t us);
+
+GGML_API void ggml_backend_expert_cache_record_probe_host(
+    ggml_backend_expert_cache_t cache,
+    uint64_t us);
+
+GGML_API void ggml_backend_expert_cache_record_probe_upload(
+    ggml_backend_expert_cache_t cache,
+    uint64_t us);
+
+
 // V2.2: Bounded Direct Host Page Registration
 GGML_API bool ggml_backend_expert_cache_register_host_memory(
     ggml_backend_expert_cache_t cache,
@@ -200,10 +216,17 @@ GGML_API void * ggml_backend_expert_cache_get_pinned_buffer(
     ggml_backend_expert_cache_t cache,
     size_t required_size);
 
-GGML_API void * ggml_backend_expert_cache_get_pinned_slot_buffer(
+GGML_API void * ggml_backend_expert_cache_stage_acquire(
     ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
     int32_t slot_idx,
     size_t required_size);
+
+GGML_API void ggml_backend_expert_cache_stage_commit(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t slot_idx);
+
 
 
 GGML_API int32_t ggml_backend_expert_cache_get_tensor_layer(

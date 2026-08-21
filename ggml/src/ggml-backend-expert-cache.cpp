@@ -17,6 +17,8 @@
 
 #define GGML_EXPERT_CACHE_ALIGN 512
 #define GGML_EXPERT_CACHE_PAD(x) (((x) + GGML_EXPERT_CACHE_ALIGN - 1) & ~(GGML_EXPERT_CACHE_ALIGN - 1))
+#define GGML_EXPERT_CACHE_STAGING_ENTRIES 32
+
 
 struct ggml_expert_cache_key_hash {
     size_t operator()(const ggml_expert_cache_key & k) const {
@@ -151,6 +153,10 @@ struct ggml_backend_expert_cache {
     // Phase 5: Host Pinned Staging Buffer
     void * pinned_host_buffer = nullptr;
     size_t pinned_host_capacity = 0;
+    // Phase 5b: staging ring keyed by (tensor, slot_idx); waits before reuse
+    std::vector<ggml_backend_event_t> staging_events;
+    std::vector<bool>                 staging_in_flight;
+
 
 
     // Phase 7: Host Registered Direct DMA
@@ -367,6 +373,14 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
 #endif
         cache->pinned_host_buffer = nullptr;
     }
+
+    for (size_t i = 0; i < cache->staging_events.size(); i++) {
+        if (cache->staging_events[i] != NULL) {
+            ggml_backend_event_free(cache->staging_events[i]);
+        }
+    }
+    cache->staging_events.clear();
+
 
 #if defined(GGML_USE_CUDA)
     for (const auto & range : cache->registered_host_ranges) {
@@ -943,6 +957,27 @@ void ggml_backend_expert_cache_record_gpu_id_resolution(ggml_backend_expert_cach
     cache->stats.n_gpu_id_resolutions++;
 }
 
+void ggml_backend_expert_cache_record_probe_layer(ggml_backend_expert_cache_t cache) {
+    if (cache == NULL) return;
+    cache->stats.probe_n_layers++;
+}
+
+void ggml_backend_expert_cache_record_probe_sync(ggml_backend_expert_cache_t cache, uint64_t us) {
+    if (cache == NULL) return;
+    cache->stats.probe_sync_us += us;
+}
+
+void ggml_backend_expert_cache_record_probe_host(ggml_backend_expert_cache_t cache, uint64_t us) {
+    if (cache == NULL) return;
+    cache->stats.probe_host_us += us;
+}
+
+void ggml_backend_expert_cache_record_probe_upload(ggml_backend_expert_cache_t cache, uint64_t us) {
+    if (cache == NULL) return;
+    cache->stats.probe_upload_us += us;
+}
+
+
 
 
 bool ggml_backend_expert_cache_register_host_memory(
@@ -1159,24 +1194,69 @@ void * ggml_backend_expert_cache_get_pinned_buffer(
     return cache->pinned_host_buffer;
 }
 
-void * ggml_backend_expert_cache_get_pinned_slot_buffer(
+static size_t ggml_expert_cache_staging_index(
+        const struct ggml_tensor * tensor,
+        int32_t slot_idx) {
+    const uint64_t h = std::hash<const void *>()(tensor) ^
+                       ((uint64_t)(uint32_t) slot_idx * 2654435761ull);
+    return (size_t)(h & (GGML_EXPERT_CACHE_STAGING_ENTRIES - 1));
+}
+
+void * ggml_backend_expert_cache_stage_acquire(
         ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
         int32_t slot_idx,
         size_t required_size) {
-    if (cache == NULL || required_size == 0) {
+    if (cache == NULL || tensor == NULL || required_size == 0) {
         return NULL;
     }
 
+    const size_t idx = ggml_expert_cache_staging_index(tensor, slot_idx);
+
+    if (cache->staging_events.empty()) {
+        cache->staging_events.resize(GGML_EXPERT_CACHE_STAGING_ENTRIES, NULL);
+        cache->staging_in_flight.assign(GGML_EXPERT_CACHE_STAGING_ENTRIES, false);
+        ggml_backend_dev_t dev = ggml_backend_get_device(cache->backend);
+        for (size_t i = 0; i < GGML_EXPERT_CACHE_STAGING_ENTRIES; i++) {
+            cache->staging_events[i] = ggml_backend_event_new(dev);
+        }
+    }
+
+    // never write over a copy that may still be read by the DMA engine
+    if (cache->staging_in_flight[idx]) {
+        if (cache->staging_events[idx] != NULL) {
+            ggml_backend_event_synchronize(cache->staging_events[idx]);
+        } else {
+            ggml_backend_synchronize(cache->backend);
+        }
+        cache->staging_in_flight[idx] = false;
+        cache->stats.n_staging_waits++;
+    }
+
     const size_t slot_stride = GGML_EXPERT_CACHE_PAD(required_size);
-    const size_t total_capacity = slot_stride * 16;
+    const size_t total_capacity = slot_stride * GGML_EXPERT_CACHE_STAGING_ENTRIES;
     void * base = ggml_backend_expert_cache_get_pinned_buffer(cache, total_capacity);
     if (base == NULL) {
         return NULL;
     }
 
-    const size_t offset = (size_t)(std::abs(slot_idx) % 16) * slot_stride;
-    return (uint8_t *)base + offset;
+    return (uint8_t *) base + idx * slot_stride;
 }
+
+void ggml_backend_expert_cache_stage_commit(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t slot_idx) {
+    if (cache == NULL || tensor == NULL || cache->staging_events.empty()) {
+        return;
+    }
+    const size_t idx = ggml_expert_cache_staging_index(tensor, slot_idx);
+    if (cache->staging_events[idx] != NULL) {
+        ggml_backend_event_record(cache->staging_events[idx], cache->backend);
+    }
+    cache->staging_in_flight[idx] = true;
+}
+
 
 
 void ggml_backend_expert_cache_prefetch(
@@ -1187,12 +1267,10 @@ void ggml_backend_expert_cache_prefetch(
     if (cache == NULL || tensor == NULL || expert_ids == NULL || n_experts <= 0) {
         return;
     }
-
     auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
     if (pool == NULL || tensor->data == NULL) {
         return;
     }
-
     const size_t expert_size = pool->stride;
     for (int32_t i = 0; i < n_experts; i++) {
         int32_t eid = expert_ids[i];
@@ -1207,25 +1285,27 @@ void ggml_backend_expert_cache_prefetch(
             const size_t src_off = (size_t)eid * expert_size;
             const size_t dst_off = (size_t)slot * expert_size;
 
-            void * pinned_buf = ggml_backend_expert_cache_get_pinned_buffer(cache, expert_size);
+            void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, tensor, slot, expert_size);
             if (pinned_buf != NULL) {
-                memcpy(pinned_buf, (const uint8_t *)tensor->data + src_off, expert_size);
+                memcpy(pinned_buf, (const uint8_t *) tensor->data + src_off, expert_size);
                 ggml_backend_tensor_set_async(
                     cache->backend,
                     pool->tensor,
                     pinned_buf,
                     dst_off,
                     expert_size);
+                ggml_backend_expert_cache_stage_commit(cache, tensor, slot);
             } else {
                 ggml_backend_tensor_set_async(
                     cache->backend,
                     pool->tensor,
-                    (const uint8_t *)tensor->data + src_off,
+                    (const uint8_t *) tensor->data + src_off,
                     dst_off,
                     expert_size);
             }
             cache->stats.n_speculative_prefetches++;
         }
+        // else: do nothing (cannot allocate a slot)
     }
 }
 
@@ -1297,6 +1377,18 @@ void ggml_backend_expert_cache_print_stats(ggml_backend_expert_cache_t cache) {
     GGML_LOG_INFO("  staging memcpy bytes: %zu (%8.2f MiB)\n", cache->stats.staging_memcpy_bytes, (double)cache->stats.staging_memcpy_bytes / (1024.0 * 1024.0));
     GGML_LOG_INFO("  direct DMA bytes:     %zu (%8.2f MiB)\n", cache->stats.direct_pinned_dma_bytes, (double)cache->stats.direct_pinned_dma_bytes / (1024.0 * 1024.0));
     GGML_LOG_INFO("  map updates:          %" PRIu64 " (%zu bytes)\n", cache->stats.n_map_updates, cache->stats.map_update_bytes);
+    GGML_LOG_INFO("  staging waits:        %" PRIu64 "\n", cache->stats.n_staging_waits);
+    GGML_LOG_INFO("  probe layers:         %" PRIu64 "\n", cache->stats.probe_n_layers);
+    GGML_LOG_INFO("  probe sync:           %8.2f ms (per layer %6.2f us)\n",
+        (double)cache->stats.probe_sync_us / 1000.0,
+        cache->stats.probe_n_layers > 0 ? (double)cache->stats.probe_sync_us / (double)cache->stats.probe_n_layers : 0.0);
+    GGML_LOG_INFO("  probe host:           %8.2f ms (per layer %6.2f us)\n",
+        (double)cache->stats.probe_host_us / 1000.0,
+        cache->stats.probe_n_layers > 0 ? (double)cache->stats.probe_host_us / (double)cache->stats.probe_n_layers : 0.0);
+    GGML_LOG_INFO("  probe upload:         %8.2f ms (per layer %6.2f us)\n",
+        (double)cache->stats.probe_upload_us / 1000.0,
+        cache->stats.probe_n_layers > 0 ? (double)cache->stats.probe_upload_us / (double)cache->stats.probe_n_layers : 0.0);
+
 }
 
 size_t ggml_backend_expert_cache_export_entries(

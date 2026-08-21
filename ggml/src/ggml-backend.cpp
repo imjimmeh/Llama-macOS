@@ -1724,6 +1724,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 if (cache_can_store) {
+                    const int64_t t_sync_start = ggml_time_us();
+                    int64_t t_host_start = 0;
+
 
                     const int64_t n_expert   = input->ne[2];
                     const size_t expert_size = input->nb[2];
@@ -1761,10 +1764,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         prev_ids_tensor = ids_tensor;
                     }
+                    ggml_backend_expert_cache_record_probe_sync(cache, ggml_time_us() - t_sync_start);
+
 
                     // the cache was checked before router IDs were copied from the backend
 
                     {
+                        ggml_backend_expert_cache_record_probe_layer(cache);
+                        t_host_start = ggml_time_us();
+
                         expert_counts.assign(n_expert, 0);
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
@@ -1793,6 +1801,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         struct ggml_tensor * slot_tensor = ggml_backend_expert_cache_get_slot_tensor(cache, input);
                         bool used_zero_copy = false;
                         const bool is_single_token_decode = (ids_tensor->ne[1] == 1);
+                        ggml_backend_expert_cache_record_probe_host(cache, ggml_time_us() - t_host_start);
+
 
                         // Process any pending JIT expert swaps for this tensor
                         ggml_backend_expert_cache_process_jit_swaps(cache, input, split_backend);
@@ -1828,14 +1838,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                         // V2.2: Bounded Direct Registered Host DMA or Isolated Pinned DMA Staging
                                         const void * src_ptr = (const uint8_t *)input->data + expert_offset;
                                         if (ggml_backend_expert_cache_is_host_memory_registered(cache, src_ptr, expert_size)) {
+                                            const int64_t t_upload_start = ggml_time_us();
+
                                             ggml_backend_tensor_set_async(split_backend,
                                                 slot_tensor,
                                                 src_ptr,
                                                 dst_offset,
                                                 expert_size);
                                             ggml_backend_expert_cache_record_direct_dma(cache, expert_size);
+                                            ggml_backend_expert_cache_record_probe_upload(cache, ggml_time_us() - t_upload_start);
+
                                         } else {
-                                            void * pinned_buf = ggml_backend_expert_cache_get_pinned_slot_buffer(cache, slot, expert_size);
+                                            const int64_t t_upload_start = ggml_time_us();
+
+                                            void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, input, slot, expert_size);
+
                                             if (pinned_buf != NULL) {
                                                 memcpy(pinned_buf, src_ptr, expert_size);
                                                 ggml_backend_expert_cache_record_staging_memcpy(cache, expert_size);
@@ -1844,6 +1861,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                                     pinned_buf,
                                                     dst_offset,
                                                     expert_size);
+                                                ggml_backend_expert_cache_stage_commit(cache, input, slot);
+
                                             } else {
                                                 ggml_backend_tensor_set_async(split_backend,
                                                     slot_tensor,
@@ -1851,6 +1870,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                                     dst_offset,
                                                     expert_size);
                                             }
+                                            ggml_backend_expert_cache_record_probe_upload(cache, ggml_time_us() - t_upload_start);
+
                                         }
                                     } else {
                                         all_slots_ready = false;

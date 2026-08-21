@@ -320,6 +320,61 @@ static void test_prefetch() {
 
     printf("  prefetch tests passed\n");
 }
+static void test_pinned_staging_no_overwrite() {
+    printf("testing pinned staging ring acquire/commit discipline...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    const size_t expert_bytes = 1024;
+    const size_t cache_capacity = 64 * 1024;
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    assert(cache != nullptr);
+
+    size_t mem_size = 16 * 1024 * 1024;
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ mem_size,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+
+    struct ggml_tensor * tensor_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
+    ggml_set_name(tensor_a, "blk.0.ffn_gate_exps.weight");
+
+    struct ggml_backend_expert_cache_stats stats_before;
+    ggml_backend_expert_cache_get_stats(cache, &stats_before);
+
+    // acquire + commit marks the entry in-flight; a second acquire of the SAME
+    // (tensor, slot) must wait (n_staging_waits increments) and return the same pointer
+    void * p1 = ggml_backend_expert_cache_stage_acquire(cache, tensor_a, 3, expert_bytes);
+    assert(p1 != nullptr);
+    assert(((uintptr_t) p1 % 512) == 0);
+    ggml_backend_expert_cache_stage_commit(cache, tensor_a, 3);
+
+    void * p2 = ggml_backend_expert_cache_stage_acquire(cache, tensor_a, 3, expert_bytes);
+    assert(p2 != nullptr);
+    assert(p2 == p1); // same ring entry
+
+    struct ggml_backend_expert_cache_stats stats_after;
+    ggml_backend_expert_cache_get_stats(cache, &stats_after);
+    assert(stats_after.n_staging_waits == stats_before.n_staging_waits + 1);
+
+    // after the wait the entry is free: acquiring again must not wait again
+    void * p3 = ggml_backend_expert_cache_stage_acquire(cache, tensor_a, 3, expert_bytes);
+    assert(p3 == p1);
+    ggml_backend_expert_cache_get_stats(cache, &stats_after);
+    assert(stats_after.n_staging_waits == stats_before.n_staging_waits + 1);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  pinned staging ring tests passed\n");
+}
+
 
 int main() {
     printf("running test-expert-cache (V2 features)...\n");
@@ -327,6 +382,8 @@ int main() {
     test_cache_node_selection();
     test_cache_capacity_admission();
     test_slot_pools_and_remapping();
+    test_pinned_staging_no_overwrite();
+
     test_slru_and_admission_policy();
     test_expert_bundles();
     test_pinned_host_buffer();

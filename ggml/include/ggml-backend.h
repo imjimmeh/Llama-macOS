@@ -388,6 +388,16 @@ extern "C" {
         size_t   map_update_bytes;
         uint64_t dma_ns;
         uint64_t dma_wait_ns;
+        // V2.3 Pinned staging: number of times a staging ring entry had to wait
+        // for a still-in-flight DMA before being reused
+        uint64_t n_staging_waits;
+
+        // V2.3 Probe: per-layer host-time breakdown when a cache intercepts a split
+        uint64_t probe_n_layers;
+        uint64_t probe_sync_us;
+        uint64_t probe_host_us;
+        uint64_t probe_upload_us;
+
     };
 
     GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size);
