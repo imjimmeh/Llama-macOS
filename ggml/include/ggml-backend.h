@@ -398,6 +398,12 @@ extern "C" {
         uint64_t probe_host_us;
         uint64_t probe_upload_us;
 
+        // Phase 5C: Async Prefetch Metrics
+        uint64_t n_prefetch_issued;
+        uint64_t n_prefetch_hits;
+        uint64_t n_prefetch_misses;
+        uint64_t n_prefetch_waits;
+
     };
 
     GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size);

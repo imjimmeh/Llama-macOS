@@ -118,6 +118,14 @@ struct ggml_expert_bundle_reg {
     const struct ggml_tensor * down = nullptr;
 };
 
+// Phase 5C: Prefetch slot structure
+struct ggml_expert_cache_prefetch_slot {
+    enum ggml_expert_cache_prefetch_state state;
+    void * ready_event;  // cudaEvent_t when CUDA available
+    const struct ggml_tensor * tensor;
+    int32_t expert_id;
+    int32_t slot_idx;
+};
 
 struct ggml_backend_expert_cache {
     ggml_backend_t backend;
@@ -165,6 +173,34 @@ struct ggml_backend_expert_cache {
     size_t registered_host_bytes = 0;
     size_t max_registered_host_bytes = 1024 * 1024 * 1024; // 1 GiB safety cap
 
+    // Phase 5A: Route Trace Collection
+    bool route_trace_enabled = false;
+    FILE * route_trace_file = nullptr;
+    std::vector<ggml_expert_cache_route_trace_entry> route_trace_buffer;
+    size_t route_trace_max_entries = 0;
+    uint64_t route_trace_token_id = 0;
+
+    // Phase 5C: Async DMA Pipeline
+    void * prefetch_stream = nullptr;  // cudaStream_t when CUDA available
+    std::vector<ggml_expert_cache_prefetch_slot> prefetch_slots;
+    
+    // Phase 5C: Heuristic Predictor (Transition Tables)
+    bool predictor_enabled = false;
+    int32_t predictor_max_layers = 0;
+    int32_t predictor_max_experts = 0;
+    // transition_table[from_layer][to_layer][expert_id] = count
+    std::vector<std::vector<std::vector<int32_t>>> transition_table;
+    // current_experts[layer] = list of expert IDs used
+    std::vector<std::vector<int32_t>> current_experts;
+    
+    // Phase 5D: Learned Predictor
+    bool hidden_state_trace_enabled = false;
+    FILE * hidden_state_trace_file = nullptr;
+    std::vector<ggml_expert_cache_hidden_state_sample> hidden_state_buffer;
+    size_t hidden_state_max_samples = 0;
+    bool learned_predictor_loaded = false;
+    void * learned_model = nullptr;  // Opaque pointer to model data
+    
     struct ggml_backend_expert_cache_stats stats;
 };
 
@@ -341,7 +377,14 @@ ggml_backend_expert_cache_t ggml_backend_expert_cache_new(
     cache->max_swaps = -1;
     cache->decode_step = 0;
     cache->free_blocks.push_back({ 0, capacity });
-    memset(&cache->stats, 0, sizeof(cache->stats));
+
+    // Phase 5C: Initialize async prefetch stream (CUDA only)
+#if defined(GGML_USE_CUDA)
+    cudaStream_t stream;
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess) {
+        cache->prefetch_stream = stream;
+    }
+#endif
 
     return cache;
 }
@@ -389,7 +432,22 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
         cudaHostUnregister((void *)range.first);
     }
     cache->registered_host_ranges.clear();
+
+    // Phase 5C: Cleanup async prefetch resources
+    if (cache->prefetch_stream) {
+        cudaStreamDestroy((cudaStream_t)cache->prefetch_stream);
+        cache->prefetch_stream = nullptr;
+    }
+    for (auto& slot : cache->prefetch_slots) {
+        if (slot.ready_event) {
+            cudaEventDestroy((cudaEvent_t)slot.ready_event);
+        }
+    }
+    cache->prefetch_slots.clear();
 #endif
+
+    // Phase 5A: Disable route tracing if enabled
+    ggml_backend_expert_cache_disable_route_trace(cache);
 
     if (cache->ctx) {
         ggml_free(cache->ctx);
@@ -549,6 +607,9 @@ void ggml_backend_expert_cache_begin_step(ggml_backend_expert_cache_t cache) {
         return;
     }
     cache->decode_step++;
+    if (cache->route_trace_enabled) {
+        cache->route_trace_token_id++;
+    }
     if (cache->period_tokens > 0 && (cache->decode_step % (uint64_t)cache->period_tokens == 0)) {
         ggml_backend_expert_cache_rebalance(cache, cache->max_swaps);
     }
@@ -1329,6 +1390,322 @@ void ggml_backend_expert_cache_prefetch(
     }
 }
 
+// Phase 5C: Async DMA Pipeline
+
+void ggml_backend_expert_cache_prefetch_async(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        const int32_t * expert_ids,
+        int32_t n_experts,
+        int32_t target_layer) {
+    if (cache == NULL || tensor == NULL || expert_ids == NULL || n_experts <= 0) {
+        return;
+    }
+    
+    // Check if async prefetch is supported
+    if (cache->prefetch_stream == nullptr) {
+        // Fall back to synchronous prefetch
+        ggml_backend_expert_cache_prefetch(cache, tensor, expert_ids, n_experts);
+        return;
+    }
+    
+    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
+    if (pool == NULL || tensor->data == NULL) {
+        return;
+    }
+    
+    const size_t expert_size = pool->stride;
+    
+    for (int32_t i = 0; i < n_experts; i++) {
+        int32_t eid = expert_ids[i];
+        if (eid < 0 || (int64_t)eid >= tensor->ne[2]) continue;
+        
+        // Skip if already resident
+        if (ggml_backend_expert_cache_find_slot(cache, tensor, eid) >= 0) {
+            continue;
+        }
+        
+        // Check if already prefetching this expert
+        bool already_prefetching = false;
+        for (const auto& slot : cache->prefetch_slots) {
+            if (slot.tensor == tensor && slot.expert_id == eid && 
+                slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
+                already_prefetching = true;
+                break;
+            }
+        }
+        if (already_prefetching) {
+            continue;
+        }
+        
+        // Allocate slot for this expert
+        int32_t slot_idx = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, eid, NULL, 0);
+        if (slot_idx < 0) {
+            continue;
+        }
+        
+        const size_t src_off = (size_t)eid * expert_size;
+        const size_t dst_off = (size_t)slot_idx * expert_size;
+        
+#if defined(GGML_USE_CUDA)
+        // Create CUDA event for this prefetch
+        cudaEvent_t event;
+        if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+            continue;
+        }
+        
+        // Get pinned buffer for staging
+        void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, tensor, slot_idx, expert_size);
+        if (pinned_buf != NULL) {
+            // Copy to pinned buffer
+            memcpy(pinned_buf, (const uint8_t *) tensor->data + src_off, expert_size);
+            
+            // Issue async copy on dedicated prefetch stream
+            cudaMemcpyAsync(
+                (uint8_t*)pool->tensor->data + dst_off,
+                pinned_buf,
+                expert_size,
+                cudaMemcpyHostToDevice,
+                (cudaStream_t)cache->prefetch_stream
+            );
+            
+            // Record event on prefetch stream
+            cudaEventRecord(event, (cudaStream_t)cache->prefetch_stream);
+            
+            ggml_backend_expert_cache_stage_commit(cache, tensor, slot_idx);
+        } else {
+            // No pinned buffer available, skip this prefetch
+            cudaEventDestroy(event);
+            continue;
+        }
+        
+        // Track this prefetch
+        ggml_expert_cache_prefetch_slot slot;
+        slot.state = GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT;
+        slot.ready_event = event;
+        slot.tensor = tensor;
+        slot.expert_id = eid;
+        slot.slot_idx = slot_idx;
+        cache->prefetch_slots.push_back(slot);
+        
+        cache->stats.n_prefetch_issued++;
+#else
+        // Non-CUDA backend: fall back to synchronous
+        void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, tensor, slot_idx, expert_size);
+        if (pinned_buf != NULL) {
+            memcpy(pinned_buf, (const uint8_t *) tensor->data + src_off, expert_size);
+            ggml_backend_tensor_set_async(
+                cache->backend,
+                pool->tensor,
+                pinned_buf,
+                dst_off,
+                expert_size);
+            ggml_backend_expert_cache_stage_commit(cache, tensor, slot_idx);
+        } else {
+            ggml_backend_tensor_set_async(
+                cache->backend,
+                pool->tensor,
+                (const uint8_t *) tensor->data + src_off,
+                dst_off,
+                expert_size);
+        }
+        cache->stats.n_speculative_prefetches++;
+#endif
+    }
+}
+
+bool ggml_backend_expert_cache_is_prefetch_ready(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id) {
+    if (cache == NULL || tensor == NULL) {
+        return false;
+    }
+    
+#if defined(GGML_USE_CUDA)
+    // Check if this expert has an in-flight prefetch
+    for (auto& slot : cache->prefetch_slots) {
+        if (slot.tensor == tensor && slot.expert_id == expert_id) {
+            if (slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
+                // Check if the event is complete
+                cudaError_t err = cudaEventQuery((cudaEvent_t)slot.ready_event);
+                if (err == cudaSuccess) {
+                    // Prefetch complete, mark as resident
+                    slot.state = GGML_EXPERT_CACHE_PREFETCH_RESIDENT;
+                    cache->stats.n_prefetch_hits++;
+                    return true;
+                } else if (err == cudaErrorNotReady) {
+                    // Still in flight
+                    return false;
+                } else {
+                    // Error occurred
+                    return false;
+                }
+            } else if (slot.state == GGML_EXPERT_CACHE_PREFETCH_RESIDENT) {
+                return true;
+            }
+        }
+    }
+#endif
+    
+    return false;
+}
+
+void ggml_backend_expert_cache_wait_prefetch(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id) {
+    if (cache == NULL || tensor == NULL) {
+        return;
+    }
+    
+#if defined(GGML_USE_CUDA)
+    // Find and wait for this prefetch
+    for (auto& slot : cache->prefetch_slots) {
+        if (slot.tensor == tensor && slot.expert_id == expert_id) {
+            if (slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
+                cudaEventSynchronize((cudaEvent_t)slot.ready_event);
+                slot.state = GGML_EXPERT_CACHE_PREFETCH_RESIDENT;
+                cache->stats.n_prefetch_waits++;
+            }
+            break;
+        }
+    }
+#endif
+}
+
+// Phase 5C: Heuristic Predictor Implementation
+
+void ggml_backend_expert_cache_enable_predictor(
+        ggml_backend_expert_cache_t cache,
+        int32_t max_layers,
+        int32_t max_experts_per_layer) {
+    if (cache == NULL || max_layers <= 0 || max_experts_per_layer <= 0) {
+        return;
+    }
+    
+    cache->predictor_enabled = true;
+    cache->predictor_max_layers = max_layers;
+    cache->predictor_max_experts = max_experts_per_layer;
+    
+    // Initialize transition table: [from_layer][to_layer][expert_id]
+    cache->transition_table.resize(max_layers);
+    for (int32_t i = 0; i < max_layers; i++) {
+        cache->transition_table[i].resize(max_layers);
+        for (int32_t j = 0; j < max_layers; j++) {
+            cache->transition_table[i][j].resize(max_experts_per_layer, 0);
+        }
+    }
+    
+    // Initialize current experts tracking
+    cache->current_experts.resize(max_layers);
+    
+    GGML_LOG_INFO("Expert cache predictor enabled: %d layers, %d experts/layer\n",
+                  max_layers, max_experts_per_layer);
+}
+
+void ggml_backend_expert_cache_disable_predictor(
+        ggml_backend_expert_cache_t cache) {
+    if (cache == NULL) {
+        return;
+    }
+    
+    cache->predictor_enabled = false;
+    cache->transition_table.clear();
+    cache->current_experts.clear();
+    
+    GGML_LOG_INFO("Expert cache predictor disabled\n");
+}
+
+void ggml_backend_expert_cache_record_prediction(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const int32_t * expert_ids,
+        int32_t n_experts) {
+    if (cache == NULL || !cache->predictor_enabled || layer < 0 || 
+        layer >= cache->predictor_max_layers || expert_ids == NULL || n_experts <= 0) {
+        return;
+    }
+    
+    // Update transition table: for each expert used in this layer,
+    // increment the transition count from previous layer's experts
+    if (layer > 0 && !cache->current_experts[layer - 1].empty()) {
+        for (int32_t prev_expert : cache->current_experts[layer - 1]) {
+            for (int32_t i = 0; i < n_experts; i++) {
+                int32_t curr_expert = expert_ids[i];
+                if (curr_expert >= 0 && curr_expert < cache->predictor_max_experts) {
+                    cache->transition_table[layer - 1][layer][curr_expert]++;
+                }
+            }
+        }
+    }
+    
+    // Update current experts for this layer
+    cache->current_experts[layer].clear();
+    for (int32_t i = 0; i < n_experts; i++) {
+        if (expert_ids[i] >= 0 && expert_ids[i] < cache->predictor_max_experts) {
+            cache->current_experts[layer].push_back(expert_ids[i]);
+        }
+    }
+}
+
+int32_t ggml_backend_expert_cache_predict_experts(
+        ggml_backend_expert_cache_t cache,
+        int32_t from_layer,
+        int32_t to_layer,
+        int32_t * out_expert_ids,
+        int32_t max_experts) {
+    if (cache == NULL || !cache->predictor_enabled || 
+        from_layer < 0 || from_layer >= cache->predictor_max_layers ||
+        to_layer < 0 || to_layer >= cache->predictor_max_layers ||
+        out_expert_ids == NULL || max_experts <= 0) {
+        return 0;
+    }
+    
+    // If we have current experts for from_layer, use transition table
+    if (!cache->current_experts[from_layer].empty()) {
+        // Collect all predicted experts with their scores
+        std::vector<std::pair<int32_t, int32_t>> expert_scores; // (expert_id, score)
+        
+        for (int32_t prev_expert : cache->current_experts[from_layer]) {
+            for (int32_t expert_id = 0; expert_id < cache->predictor_max_experts; expert_id++) {
+                int32_t score = cache->transition_table[from_layer][to_layer][expert_id];
+                if (score > 0) {
+                    // Check if expert already in list
+                    bool found = false;
+                    for (auto& p : expert_scores) {
+                        if (p.first == expert_id) {
+                            p.second += score;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        expert_scores.push_back({expert_id, score});
+                    }
+                }
+            }
+        }
+        
+        // Sort by score (descending)
+        std::sort(expert_scores.begin(), expert_scores.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        
+        // Return top experts
+        int32_t count = 0;
+        for (const auto& p : expert_scores) {
+            if (count >= max_experts) break;
+            out_expert_ids[count++] = p.first;
+        }
+        
+        return count;
+    }
+    
+    // No history available, return 0
+    return 0;
+}
+
+
 int32_t ggml_backend_expert_cache_get_tensor_layer(const struct ggml_tensor * tensor) {
     return ggml_expert_cache_get_tensor_layer(tensor);
 }
@@ -1514,4 +1891,358 @@ void ggml_backend_expert_cache_sync(ggml_backend_expert_cache_t cache) {
     }
     ggml_backend_synchronize(cache->backend);
 }
+
+// Phase 5A: Route Trace Collection
+
+void ggml_backend_expert_cache_enable_route_trace(
+        ggml_backend_expert_cache_t cache,
+        const char * output_path,
+        size_t max_entries) {
+    if (cache == NULL || output_path == NULL) {
+        return;
+    }
+    
+    if (cache->route_trace_file != nullptr) {
+        fclose(cache->route_trace_file);
+    }
+    
+    cache->route_trace_file = fopen(output_path, "wb");
+    if (cache->route_trace_file == nullptr) {
+        GGML_LOG_ERROR("Failed to open route trace file: %s\n", output_path);
+        return;
+    }
+    
+    // Write magic header
+    const uint32_t magic = 0x52545243; // "RTRC"
+    const uint32_t version = 1;
+    fwrite(&magic, sizeof(magic), 1, cache->route_trace_file);
+    fwrite(&version, sizeof(version), 1, cache->route_trace_file);
+    
+    cache->route_trace_enabled = true;
+    cache->route_trace_max_entries = max_entries > 0 ? max_entries : 1000000;
+    cache->route_trace_buffer.clear();
+    cache->route_trace_buffer.reserve(std::min(max_entries, (size_t)10000));
+    cache->route_trace_token_id = 0;
+    
+    GGML_LOG_INFO("Route trace enabled: %s (max %zu entries)\n", output_path, cache->route_trace_max_entries);
+}
+
+void ggml_backend_expert_cache_record_route_trace(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const int32_t * expert_ids,
+        int32_t n_experts) {
+    if (cache == NULL || !cache->route_trace_enabled || expert_ids == NULL || n_experts <= 0) {
+        return;
+    }
+    
+    if (cache->route_trace_buffer.size() >= cache->route_trace_max_entries) {
+        return; // buffer full
+    }
+    
+    ggml_expert_cache_route_trace_entry entry;
+    entry.token_id = cache->route_trace_token_id;
+    entry.layer = layer;
+    entry.n_experts = n_experts;
+    entry.timestamp_us = ggml_time_us();
+    
+    // Copy expert IDs (cap at 64)
+    const int32_t copy_count = std::min(n_experts, 64);
+    for (int32_t i = 0; i < copy_count; i++) {
+        entry.expert_ids[i] = expert_ids[i];
+    }
+    for (int32_t i = copy_count; i < 64; i++) {
+        entry.expert_ids[i] = -1; // padding
+    }
+    
+    cache->route_trace_buffer.push_back(entry);
+    
+    // Flush if buffer is large
+    if (cache->route_trace_buffer.size() >= 10000) {
+        ggml_backend_expert_cache_flush_route_trace(cache);
+    }
+}
+
+void ggml_backend_expert_cache_flush_route_trace(
+        ggml_backend_expert_cache_t cache) {
+    if (cache == NULL || cache->route_trace_file == nullptr || cache->route_trace_buffer.empty()) {
+        return;
+    }
+    
+    fwrite(cache->route_trace_buffer.data(),
+           sizeof(ggml_expert_cache_route_trace_entry),
+           cache->route_trace_buffer.size(),
+           cache->route_trace_file);
+    fflush(cache->route_trace_file);
+    
+    cache->route_trace_buffer.clear();
+}
+
+void ggml_backend_expert_cache_disable_route_trace(
+        ggml_backend_expert_cache_t cache) {
+    if (cache == NULL) {
+        return;
+    }
+    
+    cache->route_trace_enabled = false;
+    
+    // Flush remaining entries
+    ggml_backend_expert_cache_flush_route_trace(cache);
+    
+    if (cache->route_trace_file != nullptr) {
+        fclose(cache->route_trace_file);
+        cache->route_trace_file = nullptr;
+    }
+    
+    GGML_LOG_INFO("Route trace disabled\n");
+}
+
+// Phase 5D: Learned Predictor Implementation
+
+void ggml_backend_expert_cache_enable_hidden_state_trace(
+        ggml_backend_expert_cache_t cache,
+        const char * output_path,
+        size_t max_samples) {
+    if (cache == NULL || output_path == NULL) {
+        return;
+    }
+    
+    cache->hidden_state_trace_file = fopen(output_path, "wb");
+    if (cache->hidden_state_trace_file == NULL) {
+        GGML_LOG_ERROR("Failed to open hidden state trace file: %s\n", output_path);
+        return;
+    }
+    
+    cache->hidden_state_trace_enabled = true;
+    cache->hidden_state_max_samples = max_samples;
+    cache->hidden_state_buffer.reserve(std::min(max_samples, (size_t)10000));
+    
+    GGML_LOG_INFO("Hidden state trace enabled: %s (max %zu samples)\n", 
+                  output_path, max_samples);
+}
+
+void ggml_backend_expert_cache_disable_hidden_state_trace(
+        ggml_backend_expert_cache_t cache) {
+    if (cache == NULL) {
+        return;
+    }
+    
+    if (!cache->hidden_state_trace_enabled) {
+        return;
+    }
+    
+    // Flush buffer to file
+    if (cache->hidden_state_trace_file != NULL && !cache->hidden_state_buffer.empty()) {
+        fwrite(cache->hidden_state_buffer.data(), 
+               sizeof(ggml_expert_cache_hidden_state_sample),
+               cache->hidden_state_buffer.size(),
+               cache->hidden_state_trace_file);
+        cache->hidden_state_buffer.clear();
+    }
+    
+    if (cache->hidden_state_trace_file != NULL) {
+        fclose(cache->hidden_state_trace_file);
+        cache->hidden_state_trace_file = NULL;
+    }
+    
+    cache->hidden_state_trace_enabled = false;
+    GGML_LOG_INFO("Hidden state trace disabled\n");
+}
+
+void ggml_backend_expert_cache_record_hidden_state(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        int32_t token_id,
+        const float * hidden_state,
+        int32_t hidden_dim,
+        const int32_t * expert_ids,
+        int32_t n_experts) {
+    if (cache == NULL || !cache->hidden_state_trace_enabled || 
+        hidden_state == NULL || expert_ids == NULL) {
+        return;
+    }
+    
+    if (cache->hidden_state_buffer.size() >= cache->hidden_state_max_samples) {
+        // Buffer full, flush to file
+        if (cache->hidden_state_trace_file != NULL) {
+            fwrite(cache->hidden_state_buffer.data(),
+                   sizeof(ggml_expert_cache_hidden_state_sample),
+                   cache->hidden_state_buffer.size(),
+                   cache->hidden_state_trace_file);
+            cache->hidden_state_buffer.clear();
+        }
+    }
+    
+    ggml_expert_cache_hidden_state_sample sample;
+    sample.layer = layer;
+    sample.token_id = token_id;
+    sample.n_experts = std::min(n_experts, (int32_t)8);
+    
+    // Copy hidden state (truncate or pad to 256 dims)
+    int32_t copy_dim = std::min(hidden_dim, (int32_t)256);
+    memcpy(sample.hidden_state, hidden_state, copy_dim * sizeof(float));
+    if (copy_dim < 256) {
+        memset(sample.hidden_state + copy_dim, 0, (256 - copy_dim) * sizeof(float));
+    }
+    
+    // Copy expert IDs
+    memcpy(sample.expert_ids, expert_ids, sample.n_experts * sizeof(int32_t));
+    
+    cache->hidden_state_buffer.push_back(sample);
+}
+
+struct learned_predictor_model {
+    int32_t input_dim;
+    int32_t rank;
+    int32_t num_experts;
+    std::vector<float> down_weight;   // [rank * input_dim]
+    std::vector<float> up_weight;     // [input_dim * rank]
+    std::vector<float> output_weight; // [num_experts * input_dim]
+    std::vector<float> output_bias;   // [num_experts]
+};
+
+bool ggml_backend_expert_cache_load_learned_predictor(
+        ggml_backend_expert_cache_t cache,
+        const char * model_path) {
+    if (cache == NULL || model_path == NULL) {
+        return false;
+    }
+    
+    FILE * f = fopen(model_path, "rb");
+    if (f == NULL) {
+        GGML_LOG_ERROR("Failed to open model file: %s\n", model_path);
+        return false;
+    }
+    
+    // Read header
+    uint32_t magic, version;
+    if (fread(&magic, sizeof(uint32_t), 1, f) != 1 ||
+        fread(&version, sizeof(uint32_t), 1, f) != 1) {
+        fclose(f);
+        return false;
+    }
+    
+    if (magic != 0x4C525044 || version != 1) {
+        GGML_LOG_ERROR("Invalid model file format\n");
+        fclose(f);
+        return false;
+    }
+    
+    // Read dimensions
+    int32_t input_dim, rank, num_experts;
+    if (fread(&input_dim, sizeof(int32_t), 1, f) != 1 ||
+        fread(&rank, sizeof(int32_t), 1, f) != 1 ||
+        fread(&num_experts, sizeof(int32_t), 1, f) != 1) {
+        fclose(f);
+        return false;
+    }
+    
+    // Allocate model
+    auto * model = new learned_predictor_model();
+    model->input_dim = input_dim;
+    model->rank = rank;
+    model->num_experts = num_experts;
+    
+    // Read weights
+    model->down_weight.resize(rank * input_dim);
+    model->up_weight.resize(input_dim * rank);
+    model->output_weight.resize(num_experts * input_dim);
+    model->output_bias.resize(num_experts);
+    
+    if (fread(model->down_weight.data(), sizeof(float), rank * input_dim, f) != (size_t)(rank * input_dim) ||
+        fread(model->up_weight.data(), sizeof(float), input_dim * rank, f) != (size_t)(input_dim * rank) ||
+        fread(model->output_weight.data(), sizeof(float), num_experts * input_dim, f) != (size_t)(num_experts * input_dim) ||
+        fread(model->output_bias.data(), sizeof(float), num_experts, f) != (size_t)num_experts) {
+        GGML_LOG_ERROR("Failed to read model weights\n");
+        delete model;
+        fclose(f);
+        return false;
+    }
+    
+    fclose(f);
+    
+    // Free old model if exists
+    if (cache->learned_model != nullptr) {
+        delete static_cast<learned_predictor_model*>(cache->learned_model);
+    }
+    
+    cache->learned_model = model;
+    cache->learned_predictor_loaded = true;
+    
+    GGML_LOG_INFO("Loaded learned predictor model: input_dim=%d, rank=%d, num_experts=%d\n",
+                  input_dim, rank, num_experts);
+    
+    return true;
+}
+
+int32_t ggml_backend_expert_cache_predict_with_learned_model(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const float * hidden_state,
+        int32_t hidden_dim,
+        int32_t * out_expert_ids,
+        int32_t max_experts) {
+    if (cache == NULL || !cache->learned_predictor_loaded ||
+        hidden_state == NULL || out_expert_ids == NULL) {
+        return 0;
+    }
+    
+    auto * model = static_cast<learned_predictor_model*>(cache->learned_model);
+    
+    // Prepare input (pad or truncate to input_dim)
+    std::vector<float> input(model->input_dim, 0.0f);
+    int32_t copy_dim = std::min(hidden_dim, model->input_dim);
+    memcpy(input.data(), hidden_state, copy_dim * sizeof(float));
+    
+    // Forward pass: down_proj
+    std::vector<float> hidden(model->rank, 0.0f);
+    for (int32_t i = 0; i < model->rank; i++) {
+        float sum = 0.0f;
+        for (int32_t j = 0; j < model->input_dim; j++) {
+            sum += model->down_weight[i * model->input_dim + j] * input[j];
+        }
+        // GELU activation (approximation)
+        hidden[i] = sum * 0.5f * (1.0f + tanhf(0.7978845608f * (sum + 0.044715f * sum * sum * sum)));
+    }
+    
+    // Forward pass: up_proj
+    std::vector<float> reconstructed(model->input_dim, 0.0f);
+    for (int32_t i = 0; i < model->input_dim; i++) {
+        float sum = 0.0f;
+        for (int32_t j = 0; j < model->rank; j++) {
+            sum += model->up_weight[i * model->rank + j] * hidden[j];
+        }
+        // GELU activation
+        reconstructed[i] = sum * 0.5f * (1.0f + tanhf(0.7978845608f * (sum + 0.044715f * sum * sum * sum)));
+    }
+    
+    // Forward pass: output_proj
+    std::vector<float> logits(model->num_experts);
+    for (int32_t i = 0; i < model->num_experts; i++) {
+        float sum = model->output_bias[i];
+        for (int32_t j = 0; j < model->input_dim; j++) {
+            sum += model->output_weight[i * model->input_dim + j] * reconstructed[j];
+        }
+        logits[i] = sum;
+    }
+    
+    // Get top-k experts
+    std::vector<std::pair<float, int32_t>> expert_scores;
+    for (int32_t i = 0; i < model->num_experts; i++) {
+        expert_scores.push_back({logits[i], i});
+    }
+    
+    std::partial_sort(expert_scores.begin(),
+                      expert_scores.begin() + std::min(max_experts, (int32_t)expert_scores.size()),
+                      expert_scores.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+    
+    int32_t n_output = std::min(max_experts, (int32_t)expert_scores.size());
+    for (int32_t i = 0; i < n_output; i++) {
+        out_expert_ids[i] = expert_scores[i].second;
+    }
+    
+    return n_output;
+}
+
 

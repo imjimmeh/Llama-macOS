@@ -274,6 +274,120 @@ GGML_API bool ggml_backend_expert_cache_seed(
 GGML_API void ggml_backend_expert_cache_sync(
     ggml_backend_expert_cache_t cache);
 
+// Phase 5A: Route Trace Collection for Predictability Analysis
+struct ggml_expert_cache_route_trace_entry {
+    uint64_t token_id;
+    int32_t layer;
+    int32_t n_experts;
+    int32_t expert_ids[64];  // max 64 experts per layer (top-K routing)
+    uint64_t timestamp_us;
+};
+
+GGML_API void ggml_backend_expert_cache_enable_route_trace(
+    ggml_backend_expert_cache_t cache,
+    const char * output_path,
+    size_t max_entries);
+
+GGML_API void ggml_backend_expert_cache_record_route_trace(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const int32_t * expert_ids,
+    int32_t n_experts);
+
+GGML_API void ggml_backend_expert_cache_flush_route_trace(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_disable_route_trace(
+    ggml_backend_expert_cache_t cache);
+
+// Phase 5C: Async DMA Pipeline
+enum ggml_expert_cache_prefetch_state {
+    GGML_EXPERT_CACHE_PREFETCH_EMPTY = 0,
+    GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT = 1,
+    GGML_EXPERT_CACHE_PREFETCH_RESIDENT = 2,
+};
+
+GGML_API void ggml_backend_expert_cache_prefetch_async(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    const int32_t * expert_ids,
+    int32_t n_experts,
+    int32_t target_layer);
+
+GGML_API bool ggml_backend_expert_cache_is_prefetch_ready(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
+GGML_API void ggml_backend_expert_cache_wait_prefetch(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
+// Phase 5C: Heuristic Predictor (Transition Tables)
+GGML_API void ggml_backend_expert_cache_enable_predictor(
+    ggml_backend_expert_cache_t cache,
+    int32_t max_layers,
+    int32_t max_experts_per_layer);
+
+GGML_API void ggml_backend_expert_cache_disable_predictor(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_record_prediction(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const int32_t * expert_ids,
+    int32_t n_experts);
+
+GGML_API int32_t ggml_backend_expert_cache_predict_experts(
+    ggml_backend_expert_cache_t cache,
+    int32_t from_layer,
+    int32_t to_layer,
+    int32_t * out_expert_ids,
+    int32_t max_experts);
+
+// Phase 5D: Learned Predictor (Low-Rank Model)
+struct ggml_expert_cache_hidden_state_sample {
+    int32_t layer;
+    int32_t token_id;
+    float hidden_state[256];  // Reduced dimension hidden state
+    int32_t expert_ids[8];    // Top-8 experts for this layer
+    int32_t n_experts;
+};
+
+GGML_API void ggml_backend_expert_cache_enable_hidden_state_trace(
+    ggml_backend_expert_cache_t cache,
+    const char * output_path,
+    size_t max_samples);
+
+GGML_API void ggml_backend_expert_cache_disable_hidden_state_trace(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_record_hidden_state(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    int32_t token_id,
+    const float * hidden_state,
+    int32_t hidden_dim,
+    const int32_t * expert_ids,
+    int32_t n_experts);
+
+GGML_API bool ggml_backend_expert_cache_load_learned_predictor(
+    ggml_backend_expert_cache_t cache,
+    const char * model_path);
+
+GGML_API int32_t ggml_backend_expert_cache_predict_with_learned_model(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const float * hidden_state,
+    int32_t hidden_dim,
+    int32_t * out_expert_ids,
+    int32_t max_experts);
+
+
+
+
+
 #ifdef __cplusplus
 }
 #endif

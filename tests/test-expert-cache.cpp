@@ -374,6 +374,110 @@ static void test_pinned_staging_no_overwrite() {
 
     printf("  pinned staging ring tests passed\n");
 }
+static void test_route_trace() {
+    printf("testing route trace collection...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    const size_t cache_capacity = 64 * 1024;
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    assert(cache != nullptr);
+
+    // Enable trace to a temporary file
+    const char* trace_file = "test_route_trace.bin";
+    ggml_backend_expert_cache_enable_route_trace(cache, trace_file, 10000);
+
+    // Simulate routing decisions for multiple tokens and layers
+    // Token 0 (after first begin_step), Layer 0: experts [1, 3, 5]
+    ggml_backend_expert_cache_begin_step(cache);
+    int32_t experts_t0_l0[] = {1, 3, 5};
+    ggml_backend_expert_cache_record_route_trace(cache, 0, experts_t0_l0, 3);
+
+    // Token 0, Layer 1: experts [2, 4, 6]
+    int32_t experts_t0_l1[] = {2, 4, 6};
+    ggml_backend_expert_cache_record_route_trace(cache, 1, experts_t0_l1, 3);
+
+    // Token 1, Layer 0: experts [1, 4, 7] (different from token 0)
+    ggml_backend_expert_cache_begin_step(cache);
+    int32_t experts_t1_l0[] = {1, 4, 7};
+    ggml_backend_expert_cache_record_route_trace(cache, 0, experts_t1_l0, 3);
+
+    // Token 1, Layer 1: experts [2, 5, 8]
+    int32_t experts_t1_l1[] = {2, 5, 8};
+    ggml_backend_expert_cache_record_route_trace(cache, 1, experts_t1_l1, 3);
+
+    // Disable trace (flushes to file)
+    ggml_backend_expert_cache_disable_route_trace(cache);
+
+    // Verify trace file was created and has content
+    FILE* f = fopen(trace_file, "rb");
+    assert(f != nullptr);
+
+    // Read header
+    uint32_t magic, version;
+    assert(fread(&magic, sizeof(uint32_t), 1, f) == 1);
+    assert(magic == 0x52545243); // "RTRC"
+    assert(fread(&version, sizeof(uint32_t), 1, f) == 1);
+    assert(version == 1);
+
+    // Read entries (binary format matches ggml_expert_cache_route_trace_entry)
+    struct {
+        uint64_t token_id;
+        int32_t layer;
+        int32_t n_experts;
+        int32_t expert_ids[64];
+        uint64_t timestamp_us;
+    } entry;
+
+    // Entry 1: Token 1, Layer 0
+    assert(fread(&entry, sizeof(entry), 1, f) == 1);
+    assert(entry.token_id == 1);
+    assert(entry.layer == 0);
+    assert(entry.n_experts == 3);
+    assert(entry.expert_ids[0] == 1);
+    assert(entry.expert_ids[1] == 3);
+    assert(entry.expert_ids[2] == 5);
+
+    // Entry 2: Token 1, Layer 1
+    assert(fread(&entry, sizeof(entry), 1, f) == 1);
+    assert(entry.token_id == 1);
+    assert(entry.layer == 1);
+    assert(entry.n_experts == 3);
+    assert(entry.expert_ids[0] == 2);
+    assert(entry.expert_ids[1] == 4);
+    assert(entry.expert_ids[2] == 6);
+
+    // Entry 3: Token 2, Layer 0
+    assert(fread(&entry, sizeof(entry), 1, f) == 1);
+    assert(entry.token_id == 2);
+    assert(entry.layer == 0);
+    assert(entry.n_experts == 3);
+    assert(entry.expert_ids[0] == 1);
+    assert(entry.expert_ids[1] == 4);
+    assert(entry.expert_ids[2] == 7);
+
+    // Entry 4: Token 2, Layer 1
+    assert(fread(&entry, sizeof(entry), 1, f) == 1);
+    assert(entry.token_id == 2);
+    assert(entry.layer == 1);
+    assert(entry.n_experts == 3);
+    assert(entry.expert_ids[0] == 2);
+    assert(entry.expert_ids[1] == 5);
+    assert(entry.expert_ids[2] == 8);
+
+    // No more entries
+    assert(fread(&entry, sizeof(entry), 1, f) == 0);
+
+    fclose(f);
+
+    // Clean up
+    remove(trace_file);
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_free(backend);
+
+    printf("  route trace tests passed\n");
+}
 
 
 int main() {
@@ -387,7 +491,7 @@ int main() {
     test_slru_and_admission_policy();
     test_expert_bundles();
     test_pinned_host_buffer();
-    test_prefetch();
+    test_route_trace();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

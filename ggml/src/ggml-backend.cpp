@@ -1799,6 +1799,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
+                        // Phase 5A: Record route trace for predictability analysis
+                        if (!requested_experts.empty()) {
+                            int32_t layer = ggml_backend_expert_cache_get_tensor_layer(input);
+                            if (layer >= 0) {
+                                ggml_backend_expert_cache_record_route_trace(
+                                    cache, layer, requested_experts.data(), (int32_t)requested_experts.size());
+                            }
+                        }
+
+                        // Phase 5C: Record current experts and predict next layer
+                        if (!requested_experts.empty()) {
+                            int32_t layer = ggml_backend_expert_cache_get_tensor_layer(input);
+                            if (layer >= 0) {
+                                // Record this layer's experts for transition table
+                                ggml_backend_expert_cache_record_prediction(
+                                    cache, layer, requested_experts.data(), (int32_t)requested_experts.size());
+                                
+                                // Predict next layer's experts and issue prefetches
+                                int32_t next_layer = layer + 1;
+                                int32_t predicted_experts[16];
+                                int32_t n_predicted = ggml_backend_expert_cache_predict_experts(
+                                    cache, layer, next_layer, predicted_experts, 16);
+                                
+                                if (n_predicted > 0) {
+                                    ggml_backend_expert_cache_prefetch_async(
+                                        cache, input, predicted_experts, n_predicted, next_layer);
+                                }
+                            }
+                        }
+
                         struct ggml_tensor * slot_tensor = ggml_backend_expert_cache_get_slot_tensor(cache, input);
                         bool used_zero_copy = false;
                         const bool is_single_token_decode = (ids_tensor->ne[1] == 1);
@@ -1826,6 +1856,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     remapped_ids[i] = slot;
                                     ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
                                 } else {
+                                    // Phase 5C: Check if async prefetch is ready
+                                    if (ggml_backend_expert_cache_is_prefetch_ready(cache, input, exp_id)) {
+                                        // Prefetch completed, slot should be available
+                                        slot = ggml_backend_expert_cache_find_slot(cache, input, exp_id);
+                                        if (slot >= 0) {
+                                            remapped_ids[i] = slot;
+                                            ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
+                                            continue;
+                                        }
+                                    }
+                                    
                                     all_hit = false;
                                     slot = ggml_backend_expert_cache_alloc_slot_idx(
                                         cache, input, exp_id, pinned_keys.data(), pinned_keys.size());
