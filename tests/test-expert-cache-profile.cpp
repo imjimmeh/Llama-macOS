@@ -73,9 +73,21 @@ static void test_expert_cache_seed_and_export() {
     // Verify offset lookup
     size_t off2 = ggml_backend_expert_cache_find_offset(cache, tensor, 2);
     size_t off5 = ggml_backend_expert_cache_find_offset(cache, tensor, 5);
-    assert(off2 != SIZE_MAX);
-    assert(off5 != SIZE_MAX);
-    assert(off2 != off5);
+    GGML_ASSERT(off2 != SIZE_MAX);
+    GGML_ASSERT(off5 != SIZE_MAX);
+    GGML_ASSERT(off2 != off5);
+
+    const int32_t slot2 = ggml_backend_expert_cache_find_slot(cache, tensor, 2);
+    const int32_t slot5 = ggml_backend_expert_cache_find_slot(cache, tensor, 5);
+    GGML_ASSERT(slot2 >= 0);
+    GGML_ASSERT(slot5 >= 0);
+
+    ggml_backend_expert_cache_sync(cache);
+    struct ggml_tensor * slot_tensor = ggml_backend_expert_cache_get_slot_tensor(cache, tensor);
+    GGML_ASSERT(slot_tensor != nullptr);
+    GGML_ASSERT(memcmp((const uint8_t *)slot_tensor->data + slot2 * expert_bytes, (const uint8_t *)tensor->data + 2 * expert_bytes, expert_bytes) == 0);
+    GGML_ASSERT(memcmp((const uint8_t *)slot_tensor->data + slot5 * expert_bytes, (const uint8_t *)tensor->data + 5 * expert_bytes, expert_bytes) == 0);
+
 
     // Export entries
     struct ggml_backend_expert_cache_export_entry exported[8];

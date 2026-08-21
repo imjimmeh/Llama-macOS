@@ -47,11 +47,11 @@ In traditional caching architectures, hits in the device cache are copied via D2
 3. When requested experts are present in the slot pool, maps router IDs in `ids_tensor` (node `src[2]`) directly to slot indices (`0 .. max_slots - 1`).
 4. Replaces node `src[0]` with `slot_tensor`. The backend matrix multiplication kernel (`MUL_MAT_ID`) indexes directly into `vx + ids[i] * nb[2]`, computing the exact same result with **zero in-band memory copies**.
 
-### 2.2 Vector 2 & 6: Prefill vs. Decode Adaptive Mode Switching & Sync Elimination
+### 2.2 Vector 2 & 6: Prefill vs. Decode Adaptive Mode Switching and Router Sync Gate
 
 - **Multi-Token Prefill Bypass**: Multi-token prompt processing (`ids_tensor->ne[1] > 1`) activates dozens of distinct experts simultaneously across tokens, exceeding slot pool capacities. The cache automatically bypasses slot pool allocation during prefill, relying on high-throughput bulk contiguous miss copying. This prevents cache thrashing and preserves full prompt processing throughput (**481+ tok/s**).
 - **Single-Token Decode Activation**: Zero-copy slot pool execution is selectively activated for single-token generation (`ids_tensor->ne[1] == 1`).
-- **Router Sync Elimination**: Avoids blocking full-device synchronizations (`ggml_backend_synchronize`) when inspecting router outputs, utilizing host-resident or event-synchronized buffers.
+- **Router ID synchronization**: The scheduler currently waits for the selected-ID D2H copy before CPU cache lookup. An event-based double-buffered replacement is trace-gated and is not enabled without a deterministic ordering regression test.
 
 ### 2.3 Vector 3: High-Throughput Per-Slot Pinned Host DMA Staging
 
@@ -99,7 +99,7 @@ struct ggml_expert_cache_key {
 
 ### 3.2 Slot Pool Structure (`ggml_backend_expert_slot_pool`)
 
-Maintains 3D sub-allocated slot buffers matching projection dimensions, with per-pool GPU device mapping:
+Maintains 3D sub-allocated slot buffers matching projection dimensions. Host-side key lookup maps each `(tensor, expert_id)` to a slot.
 
 ```cpp
 struct ggml_backend_expert_slot_pool {
@@ -116,12 +116,6 @@ struct ggml_backend_expert_slot_pool {
     int32_t protected_cap = 0;
     int32_t probationary_used = 0;
     int32_t protected_used = 0;
-
-    // V2: Per-Pool GPU-Resident Slot Mapping
-    int32_t n_experts = 64;
-    std::vector<int16_t> h_expert_to_slot; // CPU shadow map
-    struct ggml_tensor * d_expert_to_slot_tensor = nullptr; // Device-resident mapping array
-    bool map_dirty = false;
 
     std::vector<ggml_backend_expert_slot> slots;
     std::unordered_map<ggml_expert_cache_key, int32_t, ggml_expert_cache_key_hash> key_to_slot;
@@ -217,9 +211,7 @@ GGML_API int32_t              ggml_backend_expert_cache_find_slot(ggml_backend_e
 GGML_API int32_t              ggml_backend_expert_cache_alloc_slot_idx(ggml_backend_expert_cache_t cache, const struct ggml_tensor * tensor, int32_t expert_id, const struct ggml_expert_cache_key * pinned_keys, size_t n_pinned);
 GGML_API void                 ggml_backend_expert_cache_record_zero_copy_hit(ggml_backend_expert_cache_t cache, const struct ggml_tensor * tensor, int32_t expert_id, size_t size);
 
-// GPU-Resident Slot Maps (V2.1)
-GGML_API void                 ggml_backend_expert_cache_flush_slot_maps(ggml_backend_expert_cache_t cache, ggml_backend_t backend);
-GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_slot_map_tensor(ggml_backend_expert_cache_t cache, const struct ggml_tensor * weight_tensor);
+// Execution telemetry
 GGML_API void                 ggml_backend_expert_cache_record_gpu_id_resolution(ggml_backend_expert_cache_t cache);
 
 // Direct Host Memory Registration (V2.2)
@@ -278,8 +270,8 @@ To avoid cold-start penalties when launching a model, the expert cache supports 
 
 ### CLI and Server Options
 
-- `--expert-cache-size <bytes>` / `-exc <megabytes>`: Size in bytes/megabytes allocated for the expert cache on accelerator backends (e.g. `-exc 256` for 256 MiB).
-- `--expert-cache-period <tokens>` / `-excp <tokens>`: Rebalance period in tokens (default: `128`). Set to `0` for on-demand SLRU.
+- `--expert-cache <size>` / `-exc <size>`: Size of accelerator memory for CPU-offloaded MoE experts. The size accepts byte or unit suffixes, such as `256M` and `1G`.
+- `--expert-cache-period <tokens>` / `-excp <tokens>`: Rebalance period in tokens (default: `64`). Set to `0` for on-demand SLRU.
 - `--expert-cache-stats`: Print runtime cache performance statistics (hit rate, avoided bandwidth).
 - `--expert-cache-profile <name>`: Profile name for saved/loaded cache files.
 - `--expert-cache-persist`: Automatically save accumulated hot-expert profile on server idle or exit.
@@ -346,5 +338,31 @@ slot print_timing: draft acceptance = 0.95238 (20 accepted / 21 generated), mean
 ```
 
 Note: model-load `LLAMA_LOG_INFO` lines are filtered at the default server verbosity (level 3). Use `-lv 4` to see the MTP dynamic-offload and promotion log lines. All rows emitted coherent output; no gibberish reproduced, and expert-cache on/off does not change target-only token IDs.
+
+## 9. MTP and Expert-Cache Performance Plan Execution (2026-08-20)
+
+### Implemented Changes
+
+- Scheduler-owned scratch vectors now reuse expert IDs, bitsets, counts, requested experts, pinned keys, remapped IDs, and miss bitsets across one `ggml_backend_sched_compute_splits()` call.
+- The unused device slot-map path was removed. Graph execution uploads explicit remapped IDs to `ids_tensor`; no graph consumes a device expert-to-slot map.
+- Profile loading resolves and validates tensors before submission, rejects invalid expert IDs, deduplicates `(tensor, expert_id)` entries by highest frequency, submits entries grouped by backend, and synchronizes once.
+
+### Single-Request MTP Measurements
+
+Model: `Qwen3.6-35B-A3B-APEX-MTP-Quality.gguf`; GTX 1080; `--fit on --fit-target 256`; `parallel = 1`; `exc = 64M`; `cram = 1024`; fixed prompt; `temperature = 0`; `top-k = 1`; `seed = 42`; 256 generated tokens.
+
+| Expert-cache period | Generation throughput | Token sequence |
+|---|---:|---|
+| 0 | 22.94 tok/s | identical SHA-256 `580b417f73e4d58b209b44e5f07ccc269900d4b0d9d5318e8866f1d6f1335fe8` |
+| 64 | 22.86 tok/s | identical |
+| 256 | 22.53 tok/s | identical |
+
+These are single samples, not a statistically significant capacity or period selection. The server did not emit nonzero expert-cache request counters for this fitted placement.
+
+`parallel = 2` is not comparable with `parallel = 1` while `--fit` is enabled: fit selected different partial-layer placements and produced a different deterministic token sequence. Use `parallel = 1` for a single active request.
+
+### Trace-Gated Work
+
+Selected-expert event overlap and same-device target-to-MTP hidden-state handoff remain unchanged. Nsight Systems was unavailable, so neither required 5 percent trace gate could be measured safely.
 
 

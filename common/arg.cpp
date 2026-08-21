@@ -2749,6 +2749,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             while (!unit.empty() && (unit.front() == ' ' || unit.front() == '\t')) unit.erase(unit.begin());
             while (!unit.empty() && (unit.back() == ' ' || unit.back() == '\t')) unit.pop_back();
             for (char & c : unit) c = toupper(c);
+            if (unit.empty() && val > 0.0 && val < 1024.0 * 1024.0) {
+                LOG_WRN("--expert-cache %s is interpreted as %zu bytes; use a unit such as %sM for MiB\n",
+                    value.c_str(), (size_t) val, value.c_str());
+            }
+
 
             if (unit.empty() || unit == "B") {
                 params.expert_cache_size = (size_t)val;

@@ -9,6 +9,77 @@
 #include <cstring>
 #include <vector>
 
+static void require(bool condition) {
+    if (!condition) {
+        fprintf(stderr, "test requirement failed\n");
+        abort();
+    }
+}
+
+
+static void test_cache_node_selection() {
+    printf("testing cached expert node selection...\n");
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 8, 2);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 2, 1);
+    ggml_tensor * matmul = ggml_mul_mat_id(ctx, experts, input, ids);
+    ggml_tensor * unrelated_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, matmul->ne[0], matmul->ne[1]);
+    ggml_tensor * unrelated = ggml_dup(ctx, unrelated_input);
+    ggml_tensor * output = ggml_add(ctx, unrelated, matmul);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+
+    require(ggml_graph_node(graph, 0) != matmul);
+    require(ggml_backend_find_mul_mat_id_node(graph, experts) == matmul);
+    require(ggml_backend_find_mul_mat_id_node(graph, input) == nullptr);
+
+    ggml_free(ctx);
+
+    printf("  cached expert node selection tests passed\n");
+}
+
+
+static void test_cache_capacity_admission() {
+    printf("testing cache capacity admission...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 256);
+    require(cache != nullptr);
+    require(ggml_backend_expert_cache_can_store(cache, 256));
+    require(!ggml_backend_expert_cache_can_store(cache, 512));
+    ggml_backend_expert_cache_record_eligible(cache);
+    ggml_backend_expert_cache_record_capacity_bypass(cache);
+    struct ggml_backend_expert_cache_stats stats;
+    ggml_backend_expert_cache_get_stats(cache, &stats);
+    require(stats.n_eligible_ops == 1);
+    require(stats.n_capacity_bypasses == 1);
+    ggml_backend_expert_cache_record_cpu_backend_bypass(cache);
+    ggml_backend_expert_cache_get_stats(cache, &stats);
+    require(stats.n_cpu_backend_bypasses == 1);
+    ggml_backend_expert_cache_record_mul_mat_id_input(cache);
+    ggml_backend_expert_cache_record_non_host_weight_bypass(cache);
+    ggml_backend_expert_cache_get_stats(cache, &stats);
+    require(stats.n_mul_mat_id_inputs == 1);
+    require(stats.n_non_host_weight_bypasses == 1);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_free(backend);
+
+    printf("  cache capacity admission tests passed\n");
+}
+
+
 static void test_slot_pools_and_remapping() {
     printf("testing slot pools and zero-copy ID remapping...\n");
 
@@ -209,8 +280,8 @@ static void test_pinned_host_buffer() {
     printf("  pinned host buffer tests passed\n");
 }
 
-static void test_transition_predictor_and_prefetch() {
-    printf("testing transition predictor and speculative prefetch...\n");
+static void test_prefetch() {
+    printf("testing explicit expert prefetch...\n");
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     assert(backend != nullptr);
@@ -235,25 +306,8 @@ static void test_transition_predictor_and_prefetch() {
     tensor->nb[2] = expert_bytes;
     memset(tensor->data, 0xAB, ggml_nbytes(tensor));
 
-    // Simulate transition pattern: {1, 2} frequently transitions to {4, 5}
-    int32_t step1_experts[2] = { 1, 2 };
-    int32_t step2_experts[2] = { 4, 5 };
-
-    for (int rep = 0; rep < 5; rep++) {
-        ggml_backend_expert_cache_record_step_experts(cache, 3, step1_experts, 2);
-        ggml_backend_expert_cache_record_step_experts(cache, 3, step2_experts, 2);
-    }
-
-    // Predict next from {1, 2}
-    int32_t predicted[4] = { -1, -1, -1, -1 };
-    int32_t n_pred = ggml_backend_expert_cache_predict_next(cache, 3, step1_experts, 2, predicted, 4);
-    assert(n_pred >= 2);
-    bool has_4 = (predicted[0] == 4 || predicted[1] == 4);
-    bool has_5 = (predicted[0] == 5 || predicted[1] == 5);
-    assert(has_4 && has_5);
-
-    // Test speculative prefetch
-    ggml_backend_expert_cache_prefetch(cache, tensor, predicted, n_pred);
+    int32_t expert_ids[2] = { 4, 5 };
+    ggml_backend_expert_cache_prefetch(cache, tensor, expert_ids, 2);
     struct ggml_backend_expert_cache_stats stats;
     ggml_backend_expert_cache_get_stats(cache, &stats);
     assert(stats.n_speculative_prefetches >= 2);
@@ -264,17 +318,19 @@ static void test_transition_predictor_and_prefetch() {
     ggml_free(ctx);
     ggml_backend_free(backend);
 
-    printf("  transition predictor and prefetch tests passed\n");
+    printf("  prefetch tests passed\n");
 }
 
 int main() {
     printf("running test-expert-cache (V2 features)...\n");
 
+    test_cache_node_selection();
+    test_cache_capacity_admission();
     test_slot_pools_and_remapping();
     test_slru_and_admission_policy();
     test_expert_bundles();
     test_pinned_host_buffer();
-    test_transition_predictor_and_prefetch();
+    test_prefetch();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

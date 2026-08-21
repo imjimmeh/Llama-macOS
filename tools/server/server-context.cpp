@@ -643,12 +643,18 @@ struct server_slot {
             ggml_backend_sched_t sched = llama_context_get_sched(ctx_tgt);
             if (sched) {
                 struct ggml_backend_expert_cache_stats ec_stats;
-                if (ggml_backend_sched_get_expert_cache_stats(sched, -1, &ec_stats) && ec_stats.n_requests > 0) {
-                    const double hit_rate = 100.0 * (double)ec_stats.n_hits / (double)ec_stats.n_requests;
-                    const double avoided_gib = (double)ec_stats.bytes_avoided / (1024.0 * 1024.0 * 1024.0);
-                    SLT_INF(*this,
-                            "expert cache = %6.2f %% hit rate (%5" PRIu64 " hits / %5" PRIu64 " reqs, %6.2f GiB PCIe saved)\n",
-                            hit_rate, ec_stats.n_hits, ec_stats.n_requests, avoided_gib);
+                if (ggml_backend_sched_get_expert_cache_stats(sched, -1, &ec_stats)) {
+                    if (ec_stats.n_requests > 0) {
+                        const double hit_rate = 100.0 * (double) ec_stats.n_hits / (double) ec_stats.n_requests;
+                        const double avoided_gib = (double) ec_stats.bytes_avoided / (1024.0 * 1024.0 * 1024.0);
+                        SLT_INF(*this,
+                                "expert cache = %6.2f %% hit rate (%5" PRIu64 " hits / %5" PRIu64 " reqs, %6.2f GiB PCIe saved, %" PRIu64 " MUL_MAT_ID inputs, %" PRIu64 " eligible ops, %" PRIu64 " capacity bypasses, %" PRIu64 " CPU backend bypasses, %" PRIu64 " non-host bypasses)\n",
+                                hit_rate, ec_stats.n_hits, ec_stats.n_requests, avoided_gib, ec_stats.n_mul_mat_id_inputs, ec_stats.n_eligible_ops, ec_stats.n_capacity_bypasses, ec_stats.n_cpu_backend_bypasses, ec_stats.n_non_host_weight_bypasses);
+                    } else {
+                        SLT_INF(*this,
+                                "expert cache = no requests (%" PRIu64 " MUL_MAT_ID inputs, %" PRIu64 " eligible ops, %" PRIu64 " capacity bypasses, %" PRIu64 " CPU backend bypasses, %" PRIu64 " non-host bypasses)\n",
+                                ec_stats.n_mul_mat_id_inputs, ec_stats.n_eligible_ops, ec_stats.n_capacity_bypasses, ec_stats.n_cpu_backend_bypasses, ec_stats.n_non_host_weight_bypasses);
+                    }
                 }
             }
         }

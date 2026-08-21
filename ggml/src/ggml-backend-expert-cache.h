@@ -32,6 +32,14 @@ enum ggml_expert_cache_segment {
 
 
 typedef struct ggml_backend_expert_cache * ggml_backend_expert_cache_t;
+GGML_API struct ggml_tensor * ggml_backend_find_mul_mat_id_node(
+    const struct ggml_cgraph * graph,
+    const struct ggml_tensor * input);
+
+GGML_API bool ggml_backend_expert_cache_can_store(
+    ggml_backend_expert_cache_t cache,
+    size_t expert_size);
+
 
 // Lifecycle
 GGML_API ggml_backend_expert_cache_t ggml_backend_expert_cache_new(
@@ -90,6 +98,18 @@ GGML_API void ggml_backend_expert_cache_record_zero_copy_hit(
 GGML_API void ggml_backend_expert_cache_record_miss(
     ggml_backend_expert_cache_t cache,
     size_t bytes_ram_to_gpu);
+GGML_API void ggml_backend_expert_cache_record_eligible(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_record_capacity_bypass(
+    ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_record_cpu_backend_bypass(
+    ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_record_mul_mat_id_input(
+    ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_record_non_host_weight_bypass(
+    ggml_backend_expert_cache_t cache);
+
 
 // Legacy flat pool & offset lookup
 GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_tensor(
@@ -160,14 +180,6 @@ GGML_API bool ggml_backend_expert_cache_is_bundle_resident(
     int32_t layer,
     int32_t expert_id);
 
-// V2.1: GPU-Resident Slot Maps
-GGML_API void ggml_backend_expert_cache_flush_slot_maps(
-    ggml_backend_expert_cache_t cache,
-    ggml_backend_t backend);
-
-GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_slot_map_tensor(
-    ggml_backend_expert_cache_t cache,
-    const struct ggml_tensor * weight_tensor);
 
 GGML_API void ggml_backend_expert_cache_record_gpu_id_resolution(
     ggml_backend_expert_cache_t cache);
@@ -193,20 +205,6 @@ GGML_API void * ggml_backend_expert_cache_get_pinned_slot_buffer(
     int32_t slot_idx,
     size_t required_size);
 
-// Phase 6: Transition Predictor & Speculative Prefetch
-GGML_API void ggml_backend_expert_cache_record_step_experts(
-    ggml_backend_expert_cache_t cache,
-    int32_t layer,
-    const int32_t * expert_ids,
-    int32_t n_experts);
-
-GGML_API int32_t ggml_backend_expert_cache_predict_next(
-    ggml_backend_expert_cache_t cache,
-    int32_t layer,
-    const int32_t * current_experts,
-    int32_t n_current,
-    int32_t * out_predicted,
-    int32_t max_predict);
 
 GGML_API int32_t ggml_backend_expert_cache_get_tensor_layer(
     const struct ggml_tensor * tensor);

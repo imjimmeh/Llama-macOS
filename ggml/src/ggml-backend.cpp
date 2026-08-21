@@ -832,6 +832,14 @@ struct ggml_backend_sched {
     size_t expert_cache_size;
     int32_t expert_cache_period;
     ggml_backend_expert_cache_t expert_caches[GGML_SCHED_MAX_BACKENDS];
+    std::vector<int32_t> expert_ids_scratch;
+    std::vector<ggml_bitset_t> expert_bitset_scratch;
+    std::vector<ggml_bitset_t> expert_miss_bitset_scratch;
+    std::vector<uint32_t> expert_counts_scratch;
+    std::vector<int32_t> requested_experts_scratch;
+    std::vector<ggml_expert_cache_key> pinned_keys_scratch;
+    std::vector<int32_t> remapped_ids_scratch;
+
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1055,6 +1063,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
         SET_CAUSE(node, "2.sup");
     }
 }
+
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
@@ -1596,6 +1605,23 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+struct ggml_tensor * ggml_backend_find_mul_mat_id_node(
+        const struct ggml_cgraph * graph,
+        const struct ggml_tensor * input) {
+    if (graph == NULL || input == NULL) {
+        return NULL;
+    }
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input) {
+            return node;
+        }
+    }
+
+    return NULL;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1607,18 +1633,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     ggml_tensor * prev_ids_tensor = nullptr;
-    std::vector<int32_t> ids;
-    std::vector<ggml_bitset_t> used_ids;
+    auto & ids               = sched->expert_ids_scratch;
+    auto & used_ids          = sched->expert_bitset_scratch;
+    auto & miss_bitset      = sched->expert_miss_bitset_scratch;
+    auto & expert_counts     = sched->expert_counts_scratch;
+    auto & requested_experts = sched->requested_experts_scratch;
+    auto & pinned_keys       = sched->pinned_keys_scratch;
+    auto & remapped_ids      = sched->remapped_ids_scratch;
+
+    ids.clear();
+    used_ids.clear();
+    miss_bitset.clear();
+    expert_counts.clear();
+    requested_experts.clear();
+    pinned_keys.clear();
+    remapped_ids.clear();
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         std::vector<std::pair<ggml_tensor *, ggml_tensor *>> restored_nodes;
-
-        if (sched->expert_caches[split_backend_id] != NULL) {
-            ggml_backend_expert_cache_flush_slot_maps(sched->expert_caches[split_backend_id], split_backend);
-        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1643,16 +1678,55 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
-                ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 &&
-                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer) && (
-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
-                    )) {
+                ggml_backend_expert_cache_t cache = sched->expert_caches[split_backend_id];
+                ggml_backend_expert_cache_t telemetry_cache = cache;
+                if (telemetry_cache == NULL) {
+                    for (int b = 0; b < sched->n_backends; ++b) {
+                        if (sched->expert_caches[b] != NULL) {
+                            telemetry_cache = sched->expert_caches[b];
+                            break;
+                        }
+                    }
+                }
 
-                    const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
-                    const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+                ggml_tensor * node = ggml_backend_find_mul_mat_id_node(&split->graph, input_cpy);
+                if (node != NULL) {
+                    ggml_backend_expert_cache_record_mul_mat_id_input(telemetry_cache);
+                    if (ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                        !ggml_backend_buffer_is_host(input->buffer)) {
+                        ggml_backend_expert_cache_record_non_host_weight_bypass(telemetry_cache);
+                    }
+                }
+
+                const bool is_eligible = node != NULL &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer);
+                const bool cache_can_store = is_eligible &&
+                    cache != NULL &&
+                    ggml_backend_expert_cache_can_store(cache, input->nb[2]);
+
+
+                if (is_eligible && cache == NULL &&
+                    ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    for (int b = 0; b < sched->n_backends; ++b) {
+                        if (sched->expert_caches[b] != NULL) {
+                            ggml_backend_expert_cache_record_cpu_backend_bypass(sched->expert_caches[b]);
+                            break;
+                        }
+                    }
+                }
+
+                if (is_eligible && cache != NULL) {
+                    ggml_backend_expert_cache_record_eligible(cache);
+                    if (!cache_can_store) {
+                        ggml_backend_expert_cache_record_capacity_bypass(cache);
+                    }
+                }
+
+                if (cache_can_store) {
+
+                    const int64_t n_expert   = input->ne[2];
+                    const size_t expert_size = input->nb[2];
 
                     ggml_backend_synchronize(input_backend);
 
@@ -1676,8 +1750,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_synchronize(ids_backend);
 
                         // find the used experts
-                        used_ids.clear();
-                        used_ids.resize(ggml_bitset_size(n_expert));
+                        used_ids.assign(ggml_bitset_size(n_expert), 0);
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
@@ -1689,10 +1762,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    ggml_backend_expert_cache_t cache = sched->expert_caches[split_backend_id];
+                    // the cache was checked before router IDs were copied from the backend
 
-                    if (cache != NULL) {
-                        std::vector<uint32_t> expert_counts(n_expert, 0);
+                    {
+                        expert_counts.assign(n_expert, 0);
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
@@ -1703,8 +1776,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         // find all requested expert IDs
-                        std::vector<int32_t> requested_experts;
-                        std::vector<ggml_expert_cache_key> pinned_keys;
+                        requested_experts.clear();
+                        pinned_keys.clear();
+                        requested_experts.reserve(n_expert);
+                        pinned_keys.reserve(n_expert);
                         for (int64_t e = 0; e < n_expert; e++) {
                             if (ggml_bitset_get(used_ids.data(), e)) {
                                 requested_experts.push_back((int32_t)e);
@@ -1724,7 +1799,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         // Vector 1 & 6: Zero-Copy Slot Pool execution during single-token decode
                         if (is_single_token_decode && slot_tensor != NULL && requested_experts.size() <= (size_t)slot_tensor->ne[2]) {
-                            std::vector<int32_t> remapped_ids(ids.size(), -1);
+                            remapped_ids.assign(ids.size(), -1);
                             bool all_slots_ready = true;
                             bool all_hit = true;
 
@@ -1800,17 +1875,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 restored_nodes.push_back({ node, input_cpy });
                                 used_zero_copy = true;
 
-                                // Vector 4: Markov transition predictor (learning phase)
-                                const int32_t current_layer = ggml_backend_expert_cache_get_tensor_layer(input);
-                                if (current_layer >= 0 && !requested_experts.empty() && input_id == 0) {
-                                    ggml_backend_expert_cache_record_step_experts(cache, current_layer, requested_experts.data(), (int32_t)requested_experts.size());
-                                }
                             }
                         }
 
                         if (!used_zero_copy) {
                             // partition into hits and misses
-                            std::vector<ggml_bitset_t> miss_bitset(ggml_bitset_size(n_expert), 0);
+                            miss_bitset.assign(ggml_bitset_size(n_expert), 0);
                             struct cache_hit_info {
                                 int32_t expert_id;
                                 size_t  cache_offset;
@@ -1947,45 +2017,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             copy_miss_range(first_id, last_id);
                         }
                         }
-                    } else {
-                        // group consecutive experts and copy them together
-                        auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                            const size_t expert_offset = first_id * expert_size;
-                            const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
-                            const size_t padding = std::min<size_t>(expert_size, 512);
-                            const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
-
-                            ggml_backend_tensor_set_async(split_backend,
-                                input_cpy,
-                                (const uint8_t *)input->data + expert_offset, expert_offset,
-                                // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                                // this is necessary for MMQ in the CUDA backend
-                                expert_size_copy + padding_end);
-                        };
-
-                        int id = 0;
-                        while (!ggml_bitset_get(used_ids.data(), id)) {
-                            id++;
-                        }
-                        int32_t first_id = id;
-                        int32_t last_id = first_id;
-
-                        for (++id; id < n_expert; ++id) {
-                            if (!ggml_bitset_get(used_ids.data(), id)) {
-                                continue;
-                            }
-
-                            if (id == last_id + 1) {
-                                last_id = id;
-                                continue;
-                            }
-
-                            copy_experts(first_id, last_id);
-
-                            first_id = id;
-                            last_id = id;
-                        }
-                        copy_experts(first_id, last_id);
                     }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
@@ -2329,11 +2360,24 @@ bool ggml_backend_sched_get_expert_cache_stats(
             out_stats->n_d2d_fallback_hits += s.n_d2d_fallback_hits;
             out_stats->n_speculative_prefetches += s.n_speculative_prefetches;
             out_stats->n_misses      += s.n_misses;
+            out_stats->n_mul_mat_id_inputs += s.n_mul_mat_id_inputs;
+            out_stats->n_non_host_weight_bypasses += s.n_non_host_weight_bypasses;
+            out_stats->n_eligible_ops += s.n_eligible_ops;
+            out_stats->n_capacity_bypasses += s.n_capacity_bypasses;
+            out_stats->n_cpu_backend_bypasses += s.n_cpu_backend_bypasses;
             out_stats->n_evictions   += s.n_evictions;
             out_stats->n_rebalances  += s.n_rebalances;
             out_stats->n_jit_swaps   += s.n_jit_swaps;
             out_stats->bytes_ram_to_gpu += s.bytes_ram_to_gpu;
             out_stats->bytes_avoided    += s.bytes_avoided;
+            out_stats->n_cpu_id_remaps += s.n_cpu_id_remaps;
+            out_stats->n_gpu_id_resolutions += s.n_gpu_id_resolutions;
+            out_stats->staging_memcpy_bytes += s.staging_memcpy_bytes;
+            out_stats->direct_pinned_dma_bytes += s.direct_pinned_dma_bytes;
+            out_stats->n_map_updates += s.n_map_updates;
+            out_stats->map_update_bytes += s.map_update_bytes;
+            out_stats->dma_ns += s.dma_ns;
+            out_stats->dma_wait_ns += s.dma_wait_ns;
             found = true;
         }
     }

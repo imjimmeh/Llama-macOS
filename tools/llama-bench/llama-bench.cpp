@@ -1497,6 +1497,51 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
 
     return instances;
 }
+static ggml_backend_expert_cache_stats get_expert_cache_stats(const llama_context * ctx) {
+    ggml_backend_expert_cache_stats stats = {};
+    ggml_backend_sched_t sched = llama_context_get_sched(ctx);
+    if (sched) {
+        ggml_backend_sched_get_expert_cache_stats(sched, -1, &stats);
+    }
+    return stats;
+}
+
+static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_backend_expert_cache_stats & after,
+                                                                   const ggml_backend_expert_cache_stats & before) {
+    ggml_backend_expert_cache_stats delta = {};
+#define EXPERT_CACHE_SUBTRACT(field)                                                  \
+    do {                                                                              \
+        GGML_ASSERT(after.field >= before.field);                                     \
+        delta.field = after.field - before.field;                                     \
+    } while (0)
+    EXPERT_CACHE_SUBTRACT(n_requests);
+    EXPERT_CACHE_SUBTRACT(n_hits);
+    EXPERT_CACHE_SUBTRACT(n_zero_copy_hits);
+    EXPERT_CACHE_SUBTRACT(n_d2d_fallback_hits);
+    EXPERT_CACHE_SUBTRACT(n_speculative_prefetches);
+    EXPERT_CACHE_SUBTRACT(n_misses);
+    EXPERT_CACHE_SUBTRACT(n_eligible_ops);
+    EXPERT_CACHE_SUBTRACT(n_mul_mat_id_inputs);
+    EXPERT_CACHE_SUBTRACT(n_capacity_bypasses);
+    EXPERT_CACHE_SUBTRACT(n_cpu_backend_bypasses);
+    EXPERT_CACHE_SUBTRACT(n_evictions);
+    EXPERT_CACHE_SUBTRACT(n_non_host_weight_bypasses);
+    EXPERT_CACHE_SUBTRACT(n_rebalances);
+    EXPERT_CACHE_SUBTRACT(n_jit_swaps);
+    EXPERT_CACHE_SUBTRACT(bytes_ram_to_gpu);
+    EXPERT_CACHE_SUBTRACT(bytes_avoided);
+    EXPERT_CACHE_SUBTRACT(n_cpu_id_remaps);
+    EXPERT_CACHE_SUBTRACT(n_gpu_id_resolutions);
+    EXPERT_CACHE_SUBTRACT(staging_memcpy_bytes);
+    EXPERT_CACHE_SUBTRACT(direct_pinned_dma_bytes);
+    EXPERT_CACHE_SUBTRACT(n_map_updates);
+    EXPERT_CACHE_SUBTRACT(map_update_bytes);
+    EXPERT_CACHE_SUBTRACT(dma_ns);
+    EXPERT_CACHE_SUBTRACT(dma_wait_ns);
+#undef EXPERT_CACHE_SUBTRACT
+    return delta;
+}
+
 
 struct test {
     static const std::string build_commit;
@@ -1532,6 +1577,7 @@ struct test {
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
     size_t                   expert_cache_size;
+    ggml_backend_expert_cache_stats expert_cache_stats = {};
     int32_t                  expert_cache_period;
     int                      n_prompt;
     int                      n_gen;
@@ -1635,7 +1681,33 @@ struct test {
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "expert_cache_size", "expert_cache_period",
             "n_prompt",       "n_gen",          "n_depth",
-            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
+            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts",
+            "expert_cache_requests",
+            "expert_cache_hits",
+            "expert_cache_zero_copy_hits",
+            "expert_cache_d2d_fallback_hits",
+            "expert_cache_speculative_prefetches",
+            "expert_cache_misses",
+            "expert_cache_mul_mat_id_inputs",
+            "expert_cache_eligible_ops",
+            "expert_cache_capacity_bypasses",
+            "expert_cache_cpu_backend_bypasses",
+            "expert_cache_evictions",
+            "expert_cache_non_host_weight_bypasses",
+            "expert_cache_rebalances",
+            "expert_cache_jit_swaps",
+            "expert_cache_bytes_ram_to_gpu",
+            "expert_cache_bytes_avoided",
+            "expert_cache_cpu_id_remaps",
+            "expert_cache_gpu_id_resolutions",
+            "expert_cache_staging_memcpy_bytes",
+            "expert_cache_direct_pinned_dma_bytes",
+            "expert_cache_map_updates",
+            "expert_cache_map_update_bytes",
+            "expert_cache_dma_ns",
+            "expert_cache_dma_wait_ns"
+
+
         };
         return fields;
     }
@@ -1659,6 +1731,32 @@ struct test {
         }
         if (field == "load_mode") {
             return STRING;
+        }
+        if (field == "expert_cache_requests" ||
+            field == "expert_cache_hits" ||
+            field == "expert_cache_zero_copy_hits" ||
+            field == "expert_cache_d2d_fallback_hits" ||
+            field == "expert_cache_speculative_prefetches" ||
+            field == "expert_cache_misses" ||
+            field == "expert_cache_eligible_ops" ||
+            field == "expert_cache_mul_mat_id_inputs" ||
+            field == "expert_cache_capacity_bypasses" ||
+            field == "expert_cache_cpu_backend_bypasses" ||
+            field == "expert_cache_evictions" ||
+            field == "expert_cache_rebalances" ||
+            field == "expert_cache_non_host_weight_bypasses" ||
+            field == "expert_cache_jit_swaps" ||
+            field == "expert_cache_bytes_ram_to_gpu" ||
+            field == "expert_cache_bytes_avoided" ||
+            field == "expert_cache_cpu_id_remaps" ||
+            field == "expert_cache_gpu_id_resolutions" ||
+            field == "expert_cache_staging_memcpy_bytes" ||
+            field == "expert_cache_direct_pinned_dma_bytes" ||
+            field == "expert_cache_map_updates" ||
+            field == "expert_cache_map_update_bytes" ||
+            field == "expert_cache_dma_ns" ||
+            field == "expert_cache_dma_wait_ns") {
+            return INT;
         }
         return STRING;
     }
@@ -1742,7 +1840,31 @@ struct test {
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
                                             std::to_string(avg_ts()),
-                                            std::to_string(stdev_ts()) };
+                                            std::to_string(stdev_ts()),
+                                            std::to_string(expert_cache_stats.n_requests),
+                                            std::to_string(expert_cache_stats.n_hits),
+                                            std::to_string(expert_cache_stats.n_zero_copy_hits),
+                                            std::to_string(expert_cache_stats.n_d2d_fallback_hits),
+                                            std::to_string(expert_cache_stats.n_speculative_prefetches),
+                                            std::to_string(expert_cache_stats.n_misses),
+                                            std::to_string(expert_cache_stats.n_mul_mat_id_inputs),
+                                            std::to_string(expert_cache_stats.n_eligible_ops),
+                                            std::to_string(expert_cache_stats.n_capacity_bypasses),
+                                            std::to_string(expert_cache_stats.n_cpu_backend_bypasses),
+                                            std::to_string(expert_cache_stats.n_evictions),
+                                            std::to_string(expert_cache_stats.n_non_host_weight_bypasses),
+                                            std::to_string(expert_cache_stats.n_rebalances),
+                                            std::to_string(expert_cache_stats.n_jit_swaps),
+                                            std::to_string(expert_cache_stats.bytes_ram_to_gpu),
+                                            std::to_string(expert_cache_stats.bytes_avoided),
+                                            std::to_string(expert_cache_stats.n_cpu_id_remaps),
+                                            std::to_string(expert_cache_stats.n_gpu_id_resolutions),
+                                            std::to_string(expert_cache_stats.staging_memcpy_bytes),
+                                            std::to_string(expert_cache_stats.direct_pinned_dma_bytes),
+                                            std::to_string(expert_cache_stats.n_map_updates),
+                                            std::to_string(expert_cache_stats.map_update_bytes),
+                                            std::to_string(expert_cache_stats.dma_ns),
+                                            std::to_string(expert_cache_stats.dma_wait_ns) };
         return values;
     }
 
@@ -2464,6 +2586,8 @@ int llama_bench(int argc, char ** argv) {
             }
         }
 
+        ggml_backend_expert_cache_stats stats_before = get_expert_cache_stats(ctx);
+
         for (int i = 0; i < params.reps; i++) {
             llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2536,6 +2660,8 @@ int llama_bench(int argc, char ** argv) {
             uint64_t t_ns = get_time_ns() - t_start;
             t.samples_ns.push_back(t_ns);
         }
+        t.expert_cache_stats = subtract_expert_cache_stats(get_expert_cache_stats(ctx), stats_before);
+
 
         if (p) {
             p->print_test(t);

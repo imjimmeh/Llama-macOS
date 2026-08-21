@@ -368,6 +368,11 @@ extern "C" {
         uint64_t n_d2d_fallback_hits;
         uint64_t n_speculative_prefetches;
         uint64_t n_misses;
+        uint64_t n_mul_mat_id_inputs;
+        uint64_t n_eligible_ops;
+        uint64_t n_capacity_bypasses;
+        uint64_t n_cpu_backend_bypasses;
+        uint64_t n_non_host_weight_bypasses;
         uint64_t n_evictions;
         uint64_t n_rebalances;
         uint64_t n_jit_swaps;

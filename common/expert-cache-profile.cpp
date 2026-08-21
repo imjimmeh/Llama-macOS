@@ -6,6 +6,7 @@
 #include <chrono>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -79,46 +80,75 @@ size_t common_expert_cache_load_profile(
     std::string profile = j.value("profile", "default");
     const auto & experts_json = j["experts"];
 
-    struct candidate {
-        std::string tensor_name;
-        int32_t     expert_id;
-        uint32_t    frequency;
-        uint64_t    hit_count;
+    struct expert_cache_seed_entry {
+        const struct ggml_tensor * tensor;
+        int32_t                    expert_id;
+        uint32_t                   frequency;
     };
-    std::vector<candidate> candidates;
-    candidates.reserve(experts_json.size());
 
+    std::vector<expert_cache_seed_entry> entries;
+    entries.reserve(experts_json.size());
+
+    size_t skipped_count = 0;
     for (const auto & item : experts_json) {
         if (!item.contains("tensor") || !item.contains("expert_id")) {
+            skipped_count++;
             continue;
         }
-        std::string tname = item["tensor"].get<std::string>();
-        int32_t eid       = item["expert_id"].get<int32_t>();
-        uint32_t freq     = item.value("frequency", (uint32_t)1);
-        uint64_t hits     = item.value("hit_count", (uint64_t)0);
 
-        candidates.push_back({ tname, eid, freq, hits });
+        const std::string tensor_name = item["tensor"].get<std::string>();
+        const int32_t expert_id = item["expert_id"].get<int32_t>();
+        const uint32_t frequency = item.value("frequency", (uint32_t) 1);
+
+        const struct ggml_tensor * tensor = llama_model_get_tensor(model, tensor_name.c_str());
+        if (tensor == nullptr || tensor->ne[2] <= 1 || expert_id < 0 || expert_id >= tensor->ne[2]) {
+            skipped_count++;
+            continue;
+        }
+
+        entries.push_back({ tensor, expert_id, frequency });
     }
 
-    std::sort(candidates.begin(), candidates.end(), [](const candidate & a, const candidate & b) {
-        if (a.frequency != b.frequency) {
-            return a.frequency > b.frequency;
+    std::sort(entries.begin(), entries.end(), [](const expert_cache_seed_entry & a, const expert_cache_seed_entry & b) {
+        if (a.tensor != b.tensor) {
+            return std::less<const struct ggml_tensor *>()(a.tensor, b.tensor);
         }
-        return a.hit_count > b.hit_count;
+        return a.expert_id < b.expert_id;
     });
 
-    size_t seeded_count = 0;
-    for (const auto & cand : candidates) {
-        const struct ggml_tensor * tensor = llama_model_get_tensor(model, cand.tensor_name.c_str());
-        if (tensor == nullptr) {
+    size_t n_entries = 0;
+    for (const auto & entry : entries) {
+        if (n_entries > 0 && entries[n_entries - 1].tensor == entry.tensor && entries[n_entries - 1].expert_id == entry.expert_id) {
+            entries[n_entries - 1].frequency = std::max(entries[n_entries - 1].frequency, entry.frequency);
             continue;
         }
+        entries[n_entries++] = entry;
+    }
+    entries.resize(n_entries);
+    std::sort(entries.begin(), entries.end(), [](const expert_cache_seed_entry & a, const expert_cache_seed_entry & b) {
+        if (a.frequency != b.frequency) {
+            return a.frequency < b.frequency;
+        }
+        if (a.tensor != b.tensor) {
+            return std::less<const struct ggml_tensor *>()(a.tensor, b.tensor);
+        }
+        return a.expert_id < b.expert_id;
+    });
 
-        if (ggml_backend_sched_expert_cache_seed(sched, -1, tensor, cand.expert_id, cand.frequency)) {
-            seeded_count++;
+
+    std::vector<bool> seeded(entries.size(), false);
+    for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); b++) {
+        for (size_t i = 0; i < entries.size(); i++) {
+            const auto & entry = entries[i];
+            seeded[i] = ggml_backend_sched_expert_cache_seed(
+                sched, b, entry.tensor, entry.expert_id, entry.frequency) || seeded[i];
         }
     }
 
+    const size_t seeded_count = std::count(seeded.begin(), seeded.end(), true);
+    if (skipped_count > 0) {
+        LOG_WRN("expert_cache: skipped %zu invalid profile entries from '%s'\n", skipped_count, file_path.c_str());
+    }
     if (seeded_count > 0) {
         ggml_backend_sched_expert_cache_sync(sched);
         LOG_INF("expert_cache: loaded profile '%s' (%zu hot experts seeded from '%s')\n",
