@@ -23,6 +23,11 @@ std::string common_expert_cache_get_file_path(
     const std::string & model_path,
     const std::string & profile_name,
     const std::string & explicit_file_path);
+// Sort seed entries for cache admission: deduplicate by (tensor_name, expert_id)
+// keeping the maximum frequency, then order highest frequency first so hot
+// experts are admitted before cache capacity fills.
+void common_expert_cache_sort_entries(std::vector<common_expert_cache_profile_entry> & entries);
+
 
 // Loads the expert cache profile JSON from disk and pre-seeds the expert cache.
 // Returns the number of experts successfully seeded into cache.

@@ -444,6 +444,26 @@ static void test_heterogeneous_expert_sizes_rebalance() {
 
     printf("  heterogeneous expert sizes tests passed\n");
 }
+static void test_profile_sort_order() {
+    printf("testing profile sort order (descending frequency)...\n");
+
+    std::vector<common_expert_cache_profile_entry> entries = {
+        { "blk.0.ffn_gate_exps.weight", 1, 5,  0 },
+        { "blk.0.ffn_gate_exps.weight", 2, 90, 0 },
+        { "blk.0.ffn_gate_exps.weight", 1, 40, 0 }, // duplicate: keep max freq
+        { "blk.1.ffn_gate_exps.weight", 3, 20, 0 },
+    };
+
+    common_expert_cache_sort_entries(entries);
+
+    assert(entries.size() == 3);
+    assert(entries[0].expert_id == 2 && entries[0].frequency == 90); // hottest first
+    assert(entries[1].expert_id == 1 && entries[1].frequency == 40); // merged duplicate
+    assert(entries[2].expert_id == 3 && entries[2].frequency == 20);
+
+    printf("  profile sort order tests passed\n");
+}
+
 
 int main() {
     printf("running test-expert-cache-profile...\n");
@@ -451,6 +471,8 @@ int main() {
     test_path_resolution();
     test_expert_cache_seed_and_export();
     test_json_profile_io();
+    test_profile_sort_order();
+
     test_batched_prefill_access_and_export();
     test_slot_boundary_integrity();
     test_multicycle_rebalance_integrity();

@@ -39,6 +39,45 @@ std::string common_expert_cache_get_file_path(
 
     return base + ".expert_cache.json";
 }
+void common_expert_cache_sort_entries(std::vector<common_expert_cache_profile_entry> & entries) {
+    // group duplicates by (tensor_name, expert_id), keep the maximum frequency
+    std::sort(entries.begin(), entries.end(), [](const common_expert_cache_profile_entry & a, const common_expert_cache_profile_entry & b) {
+        if (a.tensor_name != b.tensor_name) {
+            return a.tensor_name < b.tensor_name;
+        }
+        if (a.expert_id != b.expert_id) {
+            return a.expert_id < b.expert_id;
+        }
+        return a.frequency < b.frequency;
+    });
+
+    std::vector<common_expert_cache_profile_entry> merged;
+    merged.reserve(entries.size());
+    for (const auto & entry : entries) {
+        if (!merged.empty() &&
+            merged.back().tensor_name == entry.tensor_name &&
+            merged.back().expert_id   == entry.expert_id) {
+            merged.back().frequency = std::max(merged.back().frequency, entry.frequency);
+            merged.back().hit_count = std::max(merged.back().hit_count, entry.hit_count);
+        } else {
+            merged.push_back(entry);
+        }
+    }
+
+    // highest frequency first: hot experts are admitted before cache capacity fills
+    std::sort(merged.begin(), merged.end(), [](const common_expert_cache_profile_entry & a, const common_expert_cache_profile_entry & b) {
+        if (a.frequency != b.frequency) {
+            return a.frequency > b.frequency;
+        }
+        if (a.tensor_name != b.tensor_name) {
+            return a.tensor_name < b.tensor_name;
+        }
+        return a.expert_id < b.expert_id;
+    });
+
+    entries = std::move(merged);
+}
+
 
 size_t common_expert_cache_load_profile(
         struct llama_context * ctx,
@@ -80,13 +119,7 @@ size_t common_expert_cache_load_profile(
     std::string profile = j.value("profile", "default");
     const auto & experts_json = j["experts"];
 
-    struct expert_cache_seed_entry {
-        const struct ggml_tensor * tensor;
-        int32_t                    expert_id;
-        uint32_t                   frequency;
-    };
-
-    std::vector<expert_cache_seed_entry> entries;
+    std::vector<common_expert_cache_profile_entry> entries;
     entries.reserve(experts_json.size());
 
     size_t skipped_count = 0;
@@ -99,49 +132,27 @@ size_t common_expert_cache_load_profile(
         const std::string tensor_name = item["tensor"].get<std::string>();
         const int32_t expert_id = item["expert_id"].get<int32_t>();
         const uint32_t frequency = item.value("frequency", (uint32_t) 1);
+        const uint64_t hit_count = item.value("hit_count", (uint64_t) 0);
 
-        const struct ggml_tensor * tensor = llama_model_get_tensor(model, tensor_name.c_str());
-        if (tensor == nullptr || tensor->ne[2] <= 1 || expert_id < 0 || expert_id >= tensor->ne[2]) {
-            skipped_count++;
-            continue;
-        }
-
-        entries.push_back({ tensor, expert_id, frequency });
+        entries.push_back({ tensor_name, expert_id, frequency, hit_count });
     }
 
-    std::sort(entries.begin(), entries.end(), [](const expert_cache_seed_entry & a, const expert_cache_seed_entry & b) {
-        if (a.tensor != b.tensor) {
-            return std::less<const struct ggml_tensor *>()(a.tensor, b.tensor);
-        }
-        return a.expert_id < b.expert_id;
-    });
-
-    size_t n_entries = 0;
-    for (const auto & entry : entries) {
-        if (n_entries > 0 && entries[n_entries - 1].tensor == entry.tensor && entries[n_entries - 1].expert_id == entry.expert_id) {
-            entries[n_entries - 1].frequency = std::max(entries[n_entries - 1].frequency, entry.frequency);
-            continue;
-        }
-        entries[n_entries++] = entry;
-    }
-    entries.resize(n_entries);
-    std::sort(entries.begin(), entries.end(), [](const expert_cache_seed_entry & a, const expert_cache_seed_entry & b) {
-        if (a.frequency != b.frequency) {
-            return a.frequency < b.frequency;
-        }
-        if (a.tensor != b.tensor) {
-            return std::less<const struct ggml_tensor *>()(a.tensor, b.tensor);
-        }
-        return a.expert_id < b.expert_id;
-    });
-
+    common_expert_cache_sort_entries(entries);
 
     std::vector<bool> seeded(entries.size(), false);
     for (int b = 0; b < ggml_backend_sched_get_n_backends(sched); b++) {
         for (size_t i = 0; i < entries.size(); i++) {
             const auto & entry = entries[i];
+            const struct ggml_tensor * tensor = llama_model_get_tensor(model, entry.tensor_name.c_str());
+            if (tensor == nullptr || tensor->ne[2] <= 1 || entry.expert_id < 0 || entry.expert_id >= tensor->ne[2]) {
+                if (!seeded[i]) {
+                    skipped_count++;
+                    seeded[i] = true; // count once, not once per backend pass
+                }
+                continue;
+            }
             seeded[i] = ggml_backend_sched_expert_cache_seed(
-                sched, b, entry.tensor, entry.expert_id, entry.frequency) || seeded[i];
+                sched, b, tensor, entry.expert_id, entry.frequency) || seeded[i];
         }
     }
 
