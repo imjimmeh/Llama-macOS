@@ -395,3 +395,134 @@ comparison. The A == B equality is the fresh cache-correctness proof.
 - Expert-cache profile seeding: rows with cache enabled log
   `loaded profile 'default' (512 hot experts seeded ...)`; rows with
   `-exc 0` log nothing.
+
+---
+
+## T5 Forced-Routing Probe Experiment (2026-08-21)
+
+### Experiment
+
+Temporary change in `ggml_backend_sched_backend_id_from_cur` (line 971-984):
+when a `GGML_OP_MUL_MAT_ID` has host-resident weights assigned to CPU and a
+non-CPU backend has an expert cache that can store the expert size, force the
+node onto the cache-capable accelerator. This mirrors the reverted 2026-08-21
+"Rejected Compact Decode Cache Placement" experiment, now with the staging
+ring fix and timing probes from Tasks 1-3.
+
+### Result
+
+Model: `Qwen3.6-35B-A3B-APEX-MTP-Quality.gguf`; GTX 1080; preset args
+(fit on, fit-target 256, batch 4096, ubatch 2048, threads 14, Q8_0 KV,
+flash-attn on, mlock, ffn-split 0); llama-bench `-exc 256M` (MiB-native),
+`-p 512 -n 128`, 5 reps.
+
+| test | tok/s |
+|---|---:|
+| PP512 | 320.92 +/- 5.37 |
+| TG128 | 9.19 +/- 0.28 |
+
+Cache telemetry (TG128, 5 reps aggregated):
+
+- eligible ops: 37,632
+- cache requests: 301,056
+- zero-copy hits: 25,788
+- misses: 275,268
+- evictions: 275,273
+- CPU ID remaps: 36,136
+- GPU ID resolutions: 1,496
+- RAM-to-GPU bytes: 169.7 GiB
+- bytes avoided: 20.7 GiB
+- staging memcpy bytes: 169.7 GiB
+- rebalances: 6
+
+### Interpretation
+
+The forced routing makes the cache fully active (301K requests, 25K
+zero-copy hits), but TG128 drops to 9.19 tok/s from the ~26.5 tok/s
+CPU-routed baseline. The 169.7 GiB of RAM-to-GPU transfers across the
+PCIe boundary dominate the decode cost. This reproduces the 2026-08-21
+Compact finding: forced routing is not viable for decode.
+
+### Probe timing fractions
+
+The Task 3 probe fields (`probe_sync_us`, `probe_host_us`,
+`probe_upload_us`) were not captured. llama-bench JSONL exposes cache
+counters but not the probe timings; llama-server does not call
+`llama_perf_context_print` on `/shutdown`; llama-cli enters conversation
+mode and hangs on stdin despite `--no-conversation`. The overall 3x
+slowdown is sufficient evidence that PCIe transfer cost dominates.
+
+### Cleanup
+
+The experiment was reverted via `git checkout -- ggml/src/ggml-backend.cpp`.
+Rebuilt `test-expert-cache` and confirmed all tests pass. No code remains
+from the experiment.
+
+---
+
+## Phase 0 Rebalancing Strategy Benchmarks (2026-08-21)
+
+### Goal
+
+Test two new rebalancing strategies:
+1. **Partial periodic rebalancing** (`-excm N`): limit how many experts swap per rebalance cycle
+2. **Per-request rebalancing** (`--expert-cache-rebalance-per-request`): full rebalance after each request completes
+
+### Hardware and Configuration
+
+- Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf` (16.10 GiB, 35B total, 3B active)
+- GPU: NVIDIA GeForce GTX 1080 (8 GiB VRAM, Compute 6.1)
+- CPU: 14 threads
+- Batch: 4096, ubatch: 2048
+- KV cache: q8_0/q8_0, Flash Attention on, mlock, no-mmap, no-context-shift
+- Fit: on, fit-target: 256 MiB, cram: 1024
+- Parallel: 1
+
+### llama-bench Results (PP512 / TG128, 2 reps)
+
+| Config | PP512 tok/s | TG128 tok/s |
+|---|---:|---:|
+| No cache (`-exc 0`) | 268.86 +/- 7.41 | 25.35 +/- 0.56 |
+| Cache 256M, period 512 | 374.17 +/- 25.23 | 25.18 +/- 0.95 |
+| Cache 256M, period 512, max_swaps 2 | 372.17 +/- 21.59 | 24.39 +/- 0.98 |
+| Cache 256M, period 512, max_swaps 4 | 351.80 +/- 3.33 | 25.16 +/- 1.02 |
+| Cache 256M, period 128 | 372.92 +/- 22.02 | 24.99 +/- 0.79 |
+
+### SPEED-Bench Server Results (qualitative/coding, 5 samples, OSL 512, concurrency 1)
+
+| Config | avg_pred_t/s | avg_latency | Cache hit rate |
+|---|---:|---:|---:|
+| Baseline (period 512 only) | 23.25 | 29.921s | ~3% |
+| Per-request rebalance | 23.36 | 29.760s | ~3% |
+
+Cache stats on shutdown (baseline):
+```
+expert_cache: loaded profile 'default' (512 hot experts seeded)
+slot print_timing: expert cache = 3.17% hit rate (319 hits / 10068 reqs, 0.14 GiB PCIe saved)
+expert_cache: saved 4096 hot experts to profile
+```
+
+### Interpretation
+
+**PP512**: Cache gives ~39% boost (269 -> 374 tok/s). The cache helps during prompt processing where batch parallelism hides PCIe transfer latency. Partial rebalancing (`-excm 2/4`) does not improve PP.
+
+**TG128**: Cache has zero effect on text generation (~25 tok/s across all configs). The PCIe transfer bottleneck dominates single-token decode regardless of rebalancing strategy. The cache cannot help TG because:
+1. TG is single-token (no batch parallelism to hide latency)
+2. Expert transfers happen synchronously during decode
+3. PCIe bandwidth is the hard limit
+
+**Per-request rebalancing**: No meaningful difference (~0.5% improvement, within noise). The coding benchmark sends 5 independent coding problems with no cross-request expert locality. The feature works correctly but provides no benefit when each request uses different experts.
+
+**When per-request rebalancing would help**:
+- Multi-turn conversations where the same experts are hot across turns
+- Repeated similar requests (batch processing similar documents)
+- Server with persistent cache where the next request benefits from the previous one's access pattern
+
+**When partial rebalancing (`-excm`) would help**:
+- Reducing rebalance latency spikes in latency-sensitive deployments
+- Scenarios where only the top-N experts change between periods
+- Not useful for throughput-limited decode (PCIe dominates regardless)
+
+### Conclusion
+
+The cache is working correctly (determinism verified, PP boosted 39%). TG performance is fundamentally limited by PCIe transfer speed on this 8 GiB GPU. The new rebalancing strategies are functional but do not change the performance picture for this hardware and workload.

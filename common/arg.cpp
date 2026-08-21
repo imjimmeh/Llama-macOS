@@ -2778,6 +2778,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_PERIOD"));
     add_opt(common_arg(
+        {"-excm", "--expert-cache-max-swaps"}, "N",
+        "max experts to swap per rebalance (-1 = unlimited, default: -1)",
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_max_swaps = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_MAX_SWAPS"));
+    add_opt(common_arg(
+        {"--expert-cache-rebalance-per-request"},
+        "rebalance expert cache after each request completes (promote/demote experts based on recent access)",
+        [](common_params & params) {
+            params.expert_cache_rebalance_per_request = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_REBALANCE_PER_REQUEST"));
+    add_opt(common_arg(
         {"-excs", "--expert-cache-stats"},
         "print expert cache performance and hit-rate statistics on exit",
         [](common_params & params) {

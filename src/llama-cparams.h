@@ -66,5 +66,6 @@ struct llama_cparams {
 
     size_t  expert_cache_size   = 0;
     int32_t expert_cache_period = 64;
+    int32_t expert_cache_max_swaps = -1;
     bool    expert_cache_stats  = false;
 };

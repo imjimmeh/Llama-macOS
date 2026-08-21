@@ -831,6 +831,7 @@ struct ggml_backend_sched {
 
     size_t expert_cache_size;
     int32_t expert_cache_period;
+    int32_t expert_cache_max_swaps;
     ggml_backend_expert_cache_t expert_caches[GGML_SCHED_MAX_BACKENDS];
     std::vector<int32_t> expert_ids_scratch;
     std::vector<ggml_bitset_t> expert_bitset_scratch;
@@ -2344,6 +2345,16 @@ void ggml_backend_sched_set_expert_cache_period(ggml_backend_sched_t sched, int3
     }
 }
 
+void ggml_backend_sched_set_expert_cache_max_swaps(ggml_backend_sched_t sched, int32_t max_swaps) {
+    GGML_ASSERT(sched);
+    sched->expert_cache_max_swaps = max_swaps;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b]) {
+            ggml_backend_expert_cache_set_max_swaps(sched->expert_caches[b], max_swaps);
+        }
+    }
+}
+
 void ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
@@ -2469,6 +2480,30 @@ void ggml_backend_sched_register_expert_bundle(
     for (int b = 0; b < sched->n_backends; b++) {
         if (sched->expert_caches[b]) {
             ggml_backend_expert_cache_register_bundle(sched->expert_caches[b], layer, gate_tensor, up_tensor, down_tensor);
+        }
+    }
+}
+
+void ggml_backend_sched_expert_cache_rebalance(ggml_backend_sched_t sched) {
+    if (sched == NULL) {
+        return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b] != NULL) {
+            ggml_backend_expert_cache_rebalance(sched->expert_caches[b], -1);
+        }
+    }
+}
+
+void ggml_backend_sched_expert_cache_rebalance_partial(
+        ggml_backend_sched_t sched,
+        int max_swaps) {
+    if (sched == NULL) {
+        return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b] != NULL) {
+            ggml_backend_expert_cache_rebalance(sched->expert_caches[b], max_swaps);
         }
     }
 }

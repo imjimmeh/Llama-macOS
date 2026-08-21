@@ -132,6 +132,7 @@ struct ggml_backend_expert_cache {
 
     uint64_t clock;
     int32_t  period_tokens;
+    int32_t  max_swaps;
     uint64_t decode_step;
 
     std::vector<ggml_backend_expert_cache_free_block> free_blocks;
@@ -337,6 +338,7 @@ ggml_backend_expert_cache_t ggml_backend_expert_cache_new(
     cache->used = 0;
     cache->clock = 0;
     cache->period_tokens = 64;
+    cache->max_swaps = -1;
     cache->decode_step = 0;
     cache->free_blocks.push_back({ 0, capacity });
     memset(&cache->stats, 0, sizeof(cache->stats));
@@ -407,6 +409,15 @@ void ggml_backend_expert_cache_set_period(
     cache->period_tokens = period;
 }
 
+void ggml_backend_expert_cache_set_max_swaps(
+        ggml_backend_expert_cache_t cache,
+        int32_t max_swaps) {
+    if (cache == NULL) {
+        return;
+    }
+    cache->max_swaps = max_swaps;
+}
+
 int32_t ggml_backend_expert_cache_get_period(
         ggml_backend_expert_cache_t cache) {
     if (cache == NULL) {
@@ -414,8 +425,7 @@ int32_t ggml_backend_expert_cache_get_period(
     }
     return cache->period_tokens;
 }
-
-static void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache) {
+void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache, int max_swaps = -1) {
     if (cache == NULL || cache->access_freq.empty()) {
         return;
     }
@@ -483,6 +493,16 @@ static void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cach
         }
     }
 
+    // Limit swaps if max_swaps is specified
+    if (max_swaps >= 0) {
+        if ((int)to_evict.size() > max_swaps) {
+            to_evict.resize(max_swaps);
+        }
+        if ((int)to_load.size() > max_swaps) {
+            to_load.resize(max_swaps);
+        }
+    }
+
     if (to_evict.empty() && to_load.empty()) {
         for (auto & kv : cache->access_freq) {
             kv.second = (kv.second * 7) >> 3; // smooth 0.875 decay
@@ -530,7 +550,7 @@ void ggml_backend_expert_cache_begin_step(ggml_backend_expert_cache_t cache) {
     }
     cache->decode_step++;
     if (cache->period_tokens > 0 && (cache->decode_step % (uint64_t)cache->period_tokens == 0)) {
-        ggml_backend_expert_cache_rebalance(cache);
+        ggml_backend_expert_cache_rebalance(cache, cache->max_swaps);
     }
 }
 

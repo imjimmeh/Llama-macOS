@@ -477,6 +477,8 @@ struct common_params {
 
     size_t      expert_cache_size    = 0;     // expert cache capacity in bytes (0 = disabled)
     int32_t     expert_cache_period  = 64;    // token interval for expert cache rebalancing (0 = on-demand LRU, default = 64)
+    int32_t     expert_cache_max_swaps = -1;  // max experts to swap per rebalance (-1 = unlimited, 0 = on-demand only)
+    bool        expert_cache_rebalance_per_request = false; // rebalance cache after each request completes
     bool        expert_cache_stats   = false; // print expert cache performance stats on exit
     std::string expert_cache_profile = "";    // expert cache profile name (e.g. 'coding', 'prose')
     std::string expert_cache_file    = "";    // explicit path to expert cache JSON file

@@ -174,6 +174,15 @@ GGML_API void   ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, 
 // Set periodic rebalance interval in tokens (0 = on-demand SLRU)
 GGML_API void   ggml_backend_sched_set_expert_cache_period(ggml_backend_sched_t sched, int32_t period);
 
+// Limit the number of experts swapped per rebalance cycle (-1 = unlimited)
+GGML_API void   ggml_backend_sched_set_expert_cache_max_swaps(ggml_backend_sched_t sched, int32_t max_swaps);
+
+// Trigger immediate full rebalance (promote/demote experts based on access frequency)
+GGML_API void   ggml_backend_sched_expert_cache_rebalance(ggml_backend_sched_t sched);
+
+// Trigger partial rebalance with limited expert swaps
+GGML_API void   ggml_backend_sched_expert_cache_rebalance_partial(ggml_backend_sched_t sched, int max_swaps);
+
 // Register atomic expert bundle ({gate, up, down}) for a given layer
 GGML_API void   ggml_backend_sched_register_expert_bundle(
     ggml_backend_sched_t sched,
@@ -275,6 +284,8 @@ To avoid cold-start penalties when launching a model, the expert cache supports 
 - `--expert-cache-stats`: Print runtime cache performance statistics (hit rate, avoided bandwidth).
 - `--expert-cache-profile <name>`: Profile name for saved/loaded cache files.
 - `--expert-cache-persist`: Automatically save accumulated hot-expert profile on server idle or exit.
+- `--expert-cache-max-swaps <N>` / `-excm <N>`: Maximum number of experts to swap per rebalance cycle (default: `-1` = unlimited). Limits PCIe transfer burst size during periodic rebalancing. For example, `-excm 2` with `-excp 256` swaps at most 2 experts every 256 tokens instead of rebalancing the entire cache.
+- `--expert-cache-rebalance-per-request`: Server-only flag that triggers a full cache rebalance after each request completes. Promotes/demotes experts based on the most recent request's access pattern. Useful for multi-turn conversations or repeated similar requests where cross-request expert locality exists.
 
 ---
 

@@ -54,11 +54,19 @@ GGML_API void ggml_backend_expert_cache_set_period(
     ggml_backend_expert_cache_t cache,
     int32_t period);
 
+GGML_API void ggml_backend_expert_cache_set_max_swaps(
+    ggml_backend_expert_cache_t cache,
+    int32_t max_swaps);
+
 GGML_API int32_t ggml_backend_expert_cache_get_period(
     ggml_backend_expert_cache_t cache);
 
 GGML_API void ggml_backend_expert_cache_begin_step(
     ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_rebalance(
+    ggml_backend_expert_cache_t cache,
+    int max_swaps);
 
 // Access recording & SLRU touch
 GGML_API void ggml_backend_expert_cache_record_access(

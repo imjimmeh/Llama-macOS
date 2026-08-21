@@ -355,6 +355,7 @@ struct cmd_params {
     std::vector<uint32_t>            fit_params_min_ctx;
     std::vector<size_t>              expert_cache_size;
     std::vector<int32_t>             expert_cache_period;
+    std::vector<int32_t>             expert_cache_max_swaps;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -402,6 +403,7 @@ static const cmd_params cmd_params_defaults = {
     /* fit_params_min_ctx   */ { 0 },
     /* expert_cache_size    */ { 0 },
     /* expert_cache_period  */ { 64 },
+    /* expert_cache_max_swaps */ { -1 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -1092,6 +1094,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 for (const auto & v : p) {
                     params.expert_cache_period.push_back(std::stoi(v));
                 }
+            } else if (arg == "-excm" || arg == "--expert-cache-max-swaps") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & v : p) {
+                    params.expert_cache_max_swaps.push_back(std::stoi(v));
+                }
             } else {
                 invalid_param = true;
                 break;
@@ -1224,6 +1235,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.expert_cache_period.empty()) {
         params.expert_cache_period = cmd_params_defaults.expert_cache_period;
     }
+    if (params.expert_cache_max_swaps.empty()) {
+        params.expert_cache_max_swaps = cmd_params_defaults.expert_cache_max_swaps;
+    }
 
     return params;
 }
@@ -1259,6 +1273,7 @@ struct cmd_params_instance {
     uint32_t           fit_min_ctx;
     size_t             expert_cache_size;
     int32_t            expert_cache_period;
+    int32_t            expert_cache_max_swaps;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1337,6 +1352,7 @@ struct cmd_params_instance {
         cparams.swa_full            = false;
         cparams.expert_cache_size   = expert_cache_size * 1024 * 1024;
         cparams.expert_cache_period = expert_cache_period;
+        cparams.expert_cache_max_swaps = expert_cache_max_swaps;
         cparams.expert_cache_stats  = true;
 
         return cparams;
@@ -1353,6 +1369,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & fpc : params.fit_params_min_ctx)
     for (const auto & exc : params.expert_cache_size)
     for (const auto & excp : params.expert_cache_period)
+    for (const auto & excm : params.expert_cache_max_swaps)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & fs : params.ffn_split)
     for (const auto & ncmoe : params.n_cpu_moe)
@@ -1411,6 +1428,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_min_ctx           = */ fpc,
                 /* .expert_cache_size     = */ exc,
                 /* .expert_cache_period   = */ excp,
+                /* .expert_cache_max_swaps = */ excm,
             };
             instances.push_back(instance);
         }
@@ -1450,6 +1468,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_min_ctx           = */ fpc,
                 /* .expert_cache_size     = */ exc,
                 /* .expert_cache_period   = */ excp,
+                /* .expert_cache_max_swaps = */ excm,
             };
             instances.push_back(instance);
         }
@@ -1489,6 +1508,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_min_ctx           = */ fpc,
                 /* .expert_cache_size     = */ exc,
                 /* .expert_cache_period   = */ excp,
+                /* .expert_cache_max_swaps = */ excm,
             };
             instances.push_back(instance);
         }
@@ -1579,6 +1599,7 @@ struct test {
     size_t                   expert_cache_size;
     ggml_backend_expert_cache_stats expert_cache_stats = {};
     int32_t                  expert_cache_period;
+    int32_t                  expert_cache_max_swaps;
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
@@ -1621,6 +1642,7 @@ struct test {
         fit_min_ctx    = inst.fit_min_ctx;
         expert_cache_size   = inst.expert_cache_size;
         expert_cache_period = inst.expert_cache_period;
+        expert_cache_max_swaps = inst.expert_cache_max_swaps;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;

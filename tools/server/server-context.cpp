@@ -1284,6 +1284,13 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                if (params_base.expert_cache_rebalance_per_request && ctx_tgt) {
+                    ggml_backend_sched_t sched = llama_context_get_sched(ctx_tgt);
+                    if (sched) {
+                        ggml_backend_sched_expert_cache_rebalance(sched);
+                    }
+                }
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {

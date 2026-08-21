@@ -142,6 +142,7 @@ llama_context::llama_context(
 
     cparams.expert_cache_size   = params.expert_cache_size;
     cparams.expert_cache_period = params.expert_cache_period;
+    cparams.expert_cache_max_swaps = params.expert_cache_max_swaps;
     cparams.expert_cache_stats  = params.expert_cache_stats;
 
     cparams.ctx_other = nullptr;
@@ -613,6 +614,7 @@ void llama_context::sched_reserve() {
     if (cparams.expert_cache_size > 0) {
         ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
         ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
+        ggml_backend_sched_set_expert_cache_max_swaps(sched.get(), cparams.expert_cache_max_swaps);
         for (int il = 0; il < (int)model.layers.size(); il++) {
             // dynamically promoted MTP experts leave host memory on promotion, so the
             // cache must not register them as host-resident; static MTP stays on host
@@ -3593,6 +3595,7 @@ llama_context_params llama_context_default_params() {
         /*.ctx_other                   =*/ nullptr,
         /*.expert_cache_size           =*/ 0,
         /*.expert_cache_period         =*/ 64,
+        /*.expert_cache_max_swaps      =*/ -1,
         /*.expert_cache_stats          =*/ false,
     };
 

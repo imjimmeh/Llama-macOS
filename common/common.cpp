@@ -1747,6 +1747,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.expert_cache_size   = params.expert_cache_size;
     cparams.expert_cache_period = params.expert_cache_period;
+    cparams.expert_cache_max_swaps = params.expert_cache_max_swaps;
     cparams.expert_cache_stats  = params.expert_cache_stats;
 
     return cparams;

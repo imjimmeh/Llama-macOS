@@ -402,11 +402,16 @@ extern "C" {
 
     GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size);
     GGML_API void                 ggml_backend_sched_set_expert_cache_period(ggml_backend_sched_t sched, int32_t period);
+    GGML_API void                 ggml_backend_sched_set_expert_cache_max_swaps(ggml_backend_sched_t sched, int32_t max_swaps);
     GGML_API void                 ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched);
     GGML_API bool                 ggml_backend_sched_get_expert_cache_stats(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_stats * out_stats);
     GGML_API size_t               ggml_backend_sched_expert_cache_export_entries(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_export_entry * out_entries, size_t max_entries);
     GGML_API bool                 ggml_backend_sched_expert_cache_seed(ggml_backend_sched_t sched, int backend_idx, const struct ggml_tensor * tensor, int32_t expert_id, uint32_t frequency);
     GGML_API void                 ggml_backend_sched_register_expert_bundle(ggml_backend_sched_t sched, int32_t layer, const struct ggml_tensor * gate_tensor, const struct ggml_tensor * up_tensor, const struct ggml_tensor * down_tensor);
+    // Trigger an immediate rebalance of the expert cache (promote/demote experts based on access frequency)
+    GGML_API void                 ggml_backend_sched_expert_cache_rebalance(ggml_backend_sched_t sched);
+    // Partial rebalance: limit the number of experts swapped per call
+    GGML_API void                 ggml_backend_sched_expert_cache_rebalance_partial(ggml_backend_sched_t sched, int max_swaps);
     GGML_API void                 ggml_backend_sched_register_host_memory(ggml_backend_sched_t sched, const struct ggml_tensor * tensor);
     GGML_API void                 ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched);
 

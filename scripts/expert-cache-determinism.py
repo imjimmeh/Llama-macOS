@@ -262,12 +262,32 @@ def main() -> int:
                 json.dump(record, f, indent=2)
         return 0
     finally:
-        proc.terminate()
+        # graceful shutdown lets llama-server free contexts, which prints the
+        # expert-cache stats block when --expert-cache-stats is on
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
+            req = urllib.request.Request(
+                base_url + "/shutdown",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=5)
+            proc.wait(timeout=15)
+            with open(log_path, "rb") as rf:
+                rest = rf.read()
+                if rest:
+                    sys.stdout.buffer.write(b"\n--- server shutdown stats ---\n")
+                    sys.stdout.buffer.write(rest)
+                    sys.stdout.buffer.flush()
+        except Exception:
+            pass
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
 
 
 if __name__ == "__main__":

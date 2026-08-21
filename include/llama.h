@@ -414,6 +414,7 @@ extern "C" {
 
         size_t expert_cache_size;   // expert cache capacity in bytes (0 = disabled)
         int32_t expert_cache_period; // token interval for expert cache rebalancing (0 = on-demand LRU, default = 64)
+        int32_t expert_cache_max_swaps; // max experts to swap per rebalance (-1 = unlimited, default: -1)
         bool   expert_cache_stats;  // print expert cache performance stats on exit
     };
 
