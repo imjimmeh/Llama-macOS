@@ -865,8 +865,7 @@ struct llm_graph_fused_node {
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
-
-    virtual ~llm_graph_result() = default;
+    ~llm_graph_result();
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
@@ -932,6 +931,22 @@ public:
     ggml_routing_predictor_t routing_predictor = nullptr;
     int32_t predictor_backend_idx = 0;
     ggml_backend_sched_t sched = nullptr;
+
+    // Phase 5D: Prediction metrics
+    struct routing_predictor_metrics {
+        int64_t predictions_generated = 0;
+        int64_t predictions_used = 0;
+        int64_t predictions_too_late = 0;
+        int64_t predictions_wrong = 0;
+        int64_t experts_fully_hidden = 0;
+        int64_t experts_partially_hidden = 0;
+        int64_t experts_missed = 0;
+        int64_t bytes_wasted = 0;
+    } predictor_metrics;
+
+    // Phase 5D: Pinned host buffer for async D2H
+    float * pinned_logits_buffer = nullptr;
+    size_t pinned_logits_capacity = 0;
 private:
     // keep a copy of the previous graph parameters
     // we will use this to determine whether the graph can be reused by comparing them with the new parameters
@@ -1012,9 +1027,6 @@ struct llm_graph_context {
 
     ggml_cgraph * gf = nullptr;
     ggml_context * ctx0 = nullptr;
-    // Phase 5D: Routing predictor for expert prefetching
-    ggml_routing_predictor_t routing_predictor = nullptr;
-    int32_t predictor_backend_idx = 0;
     // Phase 5D: Eval callback for running predictor during execution
     static bool routing_predictor_callback(
         ggml_tensor * tensor,

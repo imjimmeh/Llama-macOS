@@ -68,4 +68,8 @@ struct llama_cparams {
     int32_t expert_cache_period = 64;
     int32_t expert_cache_max_swaps = -1;
     bool    expert_cache_stats  = false;
+
+    // Phase 5D: Routing predictor
+    int32_t routing_predictor_horizon = 8;
+    bool    routing_predictor_stats   = false;
 };

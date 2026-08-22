@@ -43,6 +43,11 @@ GGML_API void ggml_routing_predictor_extract_features(
     float * out_features);        // [input_dim] output features
 
 // Prediction
+// Load trained model for Variant B/C
+GGML_API bool ggml_routing_predictor_load_model(
+    ggml_routing_predictor_t predictor,
+    const char * model_path);
+
 GGML_API int32_t ggml_routing_predictor_predict(
     ggml_routing_predictor_t predictor,
     const float * features,       // [input_dim] input features

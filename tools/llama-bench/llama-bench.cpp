@@ -356,6 +356,8 @@ struct cmd_params {
     std::vector<size_t>              expert_cache_size;
     std::vector<int32_t>             expert_cache_period;
     std::vector<int32_t>             expert_cache_max_swaps;
+    std::vector<int32_t>             routing_predictor_horizon;
+    std::vector<bool>                routing_predictor_stats;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -404,6 +406,8 @@ static const cmd_params cmd_params_defaults = {
     /* expert_cache_size    */ { 0 },
     /* expert_cache_period  */ { 64 },
     /* expert_cache_max_swaps */ { -1 },
+    /* routing_predictor_horizon */ { 8 },
+    /* routing_predictor_stats  */ { false },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -434,6 +438,8 @@ static void print_usage(int /*argc*/, const char * const * argv) {
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     printf("  -exc, --expert-cache <MiB>                  size of VRAM expert cache in MiB (default: 0)\n");
     printf("  -excp, --expert-cache-period <n0,n1,...>    token interval for expert cache rebalancing (0 = on-demand LRU, default: 64)\n");
+    printf("  --routing-predictor-horizon <N>               lookahead layers for routing predictor (default: 8)\n");
+    printf("  --routing-predictor-stats                     print routing predictor performance statistics on exit\n");
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
     }
@@ -1103,6 +1109,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 for (const auto & v : p) {
                     params.expert_cache_max_swaps.push_back(std::stoi(v));
                 }
+            } else if (arg == "--routing-predictor-horizon") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & v : p) {
+                    params.routing_predictor_horizon.push_back(std::stoi(v));
+                }
+            } else if (arg == "--routing-predictor-stats") {
+                params.routing_predictor_stats.push_back(true);
             } else {
                 invalid_param = true;
                 break;
@@ -1238,6 +1255,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.expert_cache_max_swaps.empty()) {
         params.expert_cache_max_swaps = cmd_params_defaults.expert_cache_max_swaps;
     }
+    if (params.routing_predictor_horizon.empty()) {
+        params.routing_predictor_horizon = cmd_params_defaults.routing_predictor_horizon;
+    }
+    if (params.routing_predictor_stats.empty()) {
+        params.routing_predictor_stats = cmd_params_defaults.routing_predictor_stats;
+    }
 
     return params;
 }
@@ -1274,6 +1297,8 @@ struct cmd_params_instance {
     size_t             expert_cache_size;
     int32_t            expert_cache_period;
     int32_t            expert_cache_max_swaps;
+    int32_t            routing_predictor_horizon;
+    bool               routing_predictor_stats;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1353,7 +1378,8 @@ struct cmd_params_instance {
         cparams.expert_cache_size   = expert_cache_size * 1024 * 1024;
         cparams.expert_cache_period = expert_cache_period;
         cparams.expert_cache_max_swaps = expert_cache_max_swaps;
-        cparams.expert_cache_stats  = true;
+        cparams.routing_predictor_horizon = routing_predictor_horizon;
+        cparams.routing_predictor_stats   = routing_predictor_stats;
 
         return cparams;
     }
@@ -1370,6 +1396,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & exc : params.expert_cache_size)
     for (const auto & excp : params.expert_cache_period)
     for (const auto & excm : params.expert_cache_max_swaps)
+    for (const auto & rph : params.routing_predictor_horizon)
+    for (const auto & rps : params.routing_predictor_stats)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & fs : params.ffn_split)
     for (const auto & ncmoe : params.n_cpu_moe)
@@ -1429,6 +1457,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_size     = */ exc,
                 /* .expert_cache_period   = */ excp,
                 /* .expert_cache_max_swaps = */ excm,
+                /* .routing_predictor_horizon = */ rph,
+                /* .routing_predictor_stats   = */ rps,
             };
             instances.push_back(instance);
         }
@@ -1469,6 +1499,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_size     = */ exc,
                 /* .expert_cache_period   = */ excp,
                 /* .expert_cache_max_swaps = */ excm,
+                /* .routing_predictor_horizon = */ rph,
+                /* .routing_predictor_stats   = */ rps,
             };
             instances.push_back(instance);
         }
@@ -1509,6 +1541,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_size     = */ exc,
                 /* .expert_cache_period   = */ excp,
                 /* .expert_cache_max_swaps = */ excm,
+                /* .routing_predictor_horizon = */ rph,
+                /* .routing_predictor_stats   = */ rps,
             };
             instances.push_back(instance);
         }
@@ -1562,6 +1596,36 @@ static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_ba
     return delta;
 }
 
+static ggml_routing_predictor_stats get_routing_predictor_stats(const llama_context * ctx) {
+    ggml_routing_predictor_stats stats = {};
+    ggml_backend_sched_t sched = llama_context_get_sched(ctx);
+    if (sched) {
+        ggml_backend_sched_get_routing_predictor_stats(sched, &stats);
+    }
+    return stats;
+}
+
+static ggml_routing_predictor_stats subtract_routing_predictor_stats(
+    const ggml_routing_predictor_stats & after,
+    const ggml_routing_predictor_stats & before) {
+    ggml_routing_predictor_stats delta = {};
+#define ROUTING_PREDICTOR_SUBTRACT(field) \
+    do { \
+        GGML_ASSERT(after.field >= before.field); \
+        delta.field = after.field - before.field; \
+    } while (0)
+    ROUTING_PREDICTOR_SUBTRACT(predictions_generated);
+    ROUTING_PREDICTOR_SUBTRACT(predictions_used);
+    ROUTING_PREDICTOR_SUBTRACT(predictions_too_late);
+    ROUTING_PREDICTOR_SUBTRACT(predictions_wrong);
+    ROUTING_PREDICTOR_SUBTRACT(experts_fully_hidden);
+    ROUTING_PREDICTOR_SUBTRACT(experts_partially_hidden);
+    ROUTING_PREDICTOR_SUBTRACT(experts_missed);
+    ROUTING_PREDICTOR_SUBTRACT(bytes_wasted);
+#undef ROUTING_PREDICTOR_SUBTRACT
+    return delta;
+}
+
 
 struct test {
     static const std::string build_commit;
@@ -1599,7 +1663,8 @@ struct test {
     size_t                   expert_cache_size;
     ggml_backend_expert_cache_stats expert_cache_stats = {};
     int32_t                  expert_cache_period;
-    int32_t                  expert_cache_max_swaps;
+    int32_t                  routing_predictor_horizon;
+    ggml_routing_predictor_stats routing_predictor_stats = {};
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
@@ -1642,7 +1707,8 @@ struct test {
         fit_min_ctx    = inst.fit_min_ctx;
         expert_cache_size   = inst.expert_cache_size;
         expert_cache_period = inst.expert_cache_period;
-        expert_cache_max_swaps = inst.expert_cache_max_swaps;
+        routing_predictor_horizon = inst.routing_predictor_horizon;
+        routing_predictor_stats = get_routing_predictor_stats(ctx);
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
@@ -1651,7 +1717,6 @@ struct test {
         std::strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&t));
         test_time = buf;
 
-        (void) ctx;
     }
 
     uint64_t avg_ns() const { return ::avg(samples_ns); }
@@ -1727,7 +1792,16 @@ struct test {
             "expert_cache_map_updates",
             "expert_cache_map_update_bytes",
             "expert_cache_dma_ns",
-            "expert_cache_dma_wait_ns"
+            "expert_cache_dma_wait_ns",
+            "routing_predictor_horizon",
+            "routing_predictor_predictions_generated",
+            "routing_predictor_predictions_used",
+            "routing_predictor_predictions_too_late",
+            "routing_predictor_predictions_wrong",
+            "routing_predictor_experts_fully_hidden",
+            "routing_predictor_experts_partially_hidden",
+            "routing_predictor_experts_missed",
+            "routing_predictor_bytes_wasted"
 
 
         };
@@ -1777,7 +1851,16 @@ struct test {
             field == "expert_cache_map_updates" ||
             field == "expert_cache_map_update_bytes" ||
             field == "expert_cache_dma_ns" ||
-            field == "expert_cache_dma_wait_ns") {
+            field == "expert_cache_dma_wait_ns" ||
+            field == "routing_predictor_horizon" ||
+            field == "routing_predictor_predictions_generated" ||
+            field == "routing_predictor_predictions_used" ||
+            field == "routing_predictor_predictions_too_late" ||
+            field == "routing_predictor_predictions_wrong" ||
+            field == "routing_predictor_experts_fully_hidden" ||
+            field == "routing_predictor_experts_partially_hidden" ||
+            field == "routing_predictor_experts_missed" ||
+            field == "routing_predictor_bytes_wasted") {
             return INT;
         }
         return STRING;
@@ -1886,7 +1969,15 @@ struct test {
                                             std::to_string(expert_cache_stats.n_map_updates),
                                             std::to_string(expert_cache_stats.map_update_bytes),
                                             std::to_string(expert_cache_stats.dma_ns),
-                                            std::to_string(expert_cache_stats.dma_wait_ns) };
+                                            std::to_string(routing_predictor_horizon),
+                                            std::to_string(routing_predictor_stats.predictions_generated),
+                                            std::to_string(routing_predictor_stats.predictions_used),
+                                            std::to_string(routing_predictor_stats.predictions_too_late),
+                                            std::to_string(routing_predictor_stats.predictions_wrong),
+                                            std::to_string(routing_predictor_stats.experts_fully_hidden),
+                                            std::to_string(routing_predictor_stats.experts_partially_hidden),
+                                            std::to_string(routing_predictor_stats.experts_missed),
+                                            std::to_string(routing_predictor_stats.bytes_wasted) };
         return values;
     }
 
@@ -2609,7 +2700,7 @@ int llama_bench(int argc, char ** argv) {
         }
 
         ggml_backend_expert_cache_stats stats_before = get_expert_cache_stats(ctx);
-
+        ggml_routing_predictor_stats rp_stats_before = get_routing_predictor_stats(ctx);
         for (int i = 0; i < params.reps; i++) {
             llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2683,6 +2774,7 @@ int llama_bench(int argc, char ** argv) {
             t.samples_ns.push_back(t_ns);
         }
         t.expert_cache_stats = subtract_expert_cache_stats(get_expert_cache_stats(ctx), stats_before);
+        t.routing_predictor_stats = subtract_routing_predictor_stats(get_routing_predictor_stats(ctx), rp_stats_before);
 
 
         if (p) {

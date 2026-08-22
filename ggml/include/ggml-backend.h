@@ -361,7 +361,18 @@ extern "C" {
         uint64_t hit_count;
     };
 
-    struct ggml_backend_expert_cache_stats {
+    struct ggml_routing_predictor_stats {
+    int64_t predictions_generated;
+    int64_t predictions_used;
+    int64_t predictions_too_late;
+    int64_t predictions_wrong;
+    int64_t experts_fully_hidden;
+    int64_t experts_partially_hidden;
+    int64_t experts_missed;
+    int64_t bytes_wasted;
+};
+
+struct ggml_backend_expert_cache_stats {
         uint64_t n_requests;
         uint64_t n_hits;
         uint64_t n_zero_copy_hits;
@@ -414,6 +425,7 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_expert_cache_max_swaps(ggml_backend_sched_t sched, int32_t max_swaps);
     GGML_API void                 ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched);
     GGML_API bool                 ggml_backend_sched_get_expert_cache_stats(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_stats * out_stats);
+    GGML_API bool                 ggml_backend_sched_get_routing_predictor_stats(ggml_backend_sched_t sched, struct ggml_routing_predictor_stats * out_stats);
     GGML_API size_t               ggml_backend_sched_expert_cache_export_entries(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_export_entry * out_entries, size_t max_entries);
     GGML_API bool                 ggml_backend_sched_expert_cache_seed(ggml_backend_sched_t sched, int backend_idx, const struct ggml_tensor * tensor, int32_t expert_id, uint32_t frequency);
     GGML_API void                 ggml_backend_sched_register_expert_bundle(ggml_backend_sched_t sched, int32_t layer, const struct ggml_tensor * gate_tensor, const struct ggml_tensor * up_tensor, const struct ggml_tensor * down_tensor);

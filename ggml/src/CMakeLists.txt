@@ -203,7 +203,7 @@ add_library(ggml-base
             ggml-backend-expert-cache.cpp
             ggml-backend-expert-cache.h
             ggml-routing-predictor.cpp
-            ggml-routing-predictor.h
+            ../include/ggml-routing-predictor.h
             ggml-backend-meta.cpp
             ggml-opt.cpp
             ggml-threading.cpp

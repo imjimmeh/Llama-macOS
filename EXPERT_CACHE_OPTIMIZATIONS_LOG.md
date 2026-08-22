@@ -815,3 +815,145 @@ python tools/generate-synthetic-trace.py --output trace.bin --tokens 1000 --laye
 **Build status:** All phases compile cleanly. `ggml-base` builds successfully. All 16 existing tests pass.
 
 **Documentation:** Plan document at `docs/plans/2026-08-21-routing-lookahead-pipeline.md` updated with Phase 5D limitation.
+
+---
+
+## Phase 5D: Learned Routing Predictor Implementation (2026-08-22)
+
+### Objective
+
+Train a tiny external model to predict future expert routes H layers ahead, enabling async prefetch to hide PCIe DMA latency. The predictor runs upstream of the expert cache, consuming router logits at layer L to predict which experts will be needed at layer L+H.
+
+### Architectural Change (from reviewer guidance)
+
+- **Old approach:** Predictor lived inside expert cache code, blocked because cache only sees expert weight tensors in `MUL_MAT_ID` path, not hidden state
+- **New approach:** Predictor runs upstream, close to router computation. Consumes router input `x_L` during graph construction, produces predicted expert IDs for layer L+H, feeds async prefetch queue
+
+### Three Predictor Variants
+
+| Variant | Description | Training | Input |
+|---------|-------------|----------|-------|
+| **A: Stale Future Router** | `W_router[L+H] × x_L` directly | No | Router logits at L |
+| **B: Low-Rank MLP** | `x_L → rank-32 → expert logits L+H` | Yes (~147k params) | Router logits or projected hidden state |
+| **C: Future Router + Residual** | `W_router[L+H]×x_L + Δ_θ(x_L)` | Yes (residual only) | Router logits + learned correction |
+
+**Reviewer recommendation:** Start with Variant A (zero training cost), then try Variant C (strong structural prior + tiny trainable params).
+
+### Implementation Status (2026-08-22)
+
+#### Completed
+
+1. **Core API implemented** (`ggml/include/ggml-routing-predictor.h`, `ggml/src/ggml-routing-predictor.cpp`)
+   - Lifecycle: `ggml_routing_predictor_init()`, `ggml_routing_predictor_free()`
+   - Prediction: `ggml_routing_predictor_predict()`, `ggml_routing_predictor_extract_features()`
+   - Model loading: `ggml_routing_predictor_load_model()` for Variants B/C
+   - Binary format: Magic `0x4C525044` ("LRPD"), version 1, weights as raw floats
+
+2. **CLI integration complete** (`common/arg.cpp`, `tools/llama-bench/llama-bench.cpp`)
+   - `--routing-predictor-horizon <N>` (default: 8)
+   - `--routing-predictor-stats` (print stats on exit)
+   - Flags register and appear in `llama-bench --help`
+
+3. **Context params wired** (`include/llama.h`, `src/llama-cparams.h`)
+   - `routing_predictor_horizon` and `routing_predictor_stats` fields added to `llama_context_params`
+
+4. **Stats struct defined** (`ggml/include/ggml-backend.h:364-373`)
+   ```cpp
+   struct ggml_routing_predictor_stats {
+       int64_t predictions_generated;
+       int64_t predictions_used;
+       int64_t predictions_too_late;
+       int64_t predictions_wrong;
+       int64_t experts_fully_hidden;
+       int64_t experts_partially_hidden;
+       int64_t experts_missed;
+       int64_t bytes_wasted;
+   };
+   ```
+
+5. **Unit tests pass** (`tests/test-routing-predictor.cpp`)
+   - All 5 test cases: init, extract_features, predict, null handling, different dims
+
+#### Known Issues
+
+1. **Stats retrieval is a stub** (`ggml/src/ggml-backend.cpp:2410-2421`)
+   - `ggml_backend_sched_get_routing_predictor_stats()` returns false without populating stats
+   - All CSV output shows zeros for routing predictor fields
+   - **Fix needed:** Store stats in `ggml_backend_sched` or `llm_graph_result`, populate during eval callback
+
+2. **Predictor initializes per-layer** (`src/llama-graph.cpp:1501`)
+   - Currently initializes once per MoE layer per benchmark repetition (~20 times for 4 layers × 5 reps)
+   - Should initialize once per context lifetime
+   - **Fix needed:** Move to context creation, store in `llama_context` or `llm_graph_result`
+
+3. **Not wired into inference**
+   - Predictor is initialized but never called during graph execution
+   - No eval callback registered to run prediction when router logits are available
+   - **Fix needed:** Register eval callback that detects router logits tensor, calls predictor, submits predictions to scheduler
+
+4. **No trained models**
+   - Variants B/C require `.bin` model files that don't exist
+   - No training pipeline or data collection script
+   - **Fix needed:** Create data collection (router logits + future expert labels), train models, export to binary format
+
+5. **No prefetch integration**
+   - Predictor output doesn't feed into async prefetch queue
+   - **Fix needed:** Add `ggml_backend_sched_submit_prediction()` API, maintain async prefetch queue
+
+### Key Design Decisions (from reviewer)
+
+1. **Use router logits, not hidden state:** Router logits are only 128 floats and encode compressed semantic routing representation. Much cheaper than copying full hidden state (4096 dims) to CPU.
+
+2. **Target H=8, not H=1:** One 16.88 MiB expert takes ~1467 µs to transfer. At 200 µs/layer compute, need ~8 layers to hide DMA latency. H=1 predictions arrive too late to be useful.
+
+3. **Multi-label, not classification:** Qwen activates 8 experts out of 128. Target is `y ∈ {0,1}^128`, not single class. Loss: `L = L_BCE + λ L_rank`. Metric: Recall@8, Recall@12, Recall@16 (not exact-match).
+
+4. **Train on whole prompts, not tokens:** Adjacent layers/tokens are heavily correlated. Split by whole prompts/conversations to avoid data leakage.
+
+5. **Never wait for prediction:** If prediction arrives too late, drop it. Never block compute stream.
+
+### Remaining Work
+
+1. **Immediate fixes (1-2 days):**
+   - Implement stats retrieval properly
+   - Fix initialization lifetime (once per context)
+   - Wire eval callback to run prediction during graph execution
+
+2. **Variant A integration (2-3 days):**
+   - Add async prefetch queue (`ggml_backend_sched_submit_prediction()`)
+   - Benchmark with real MoE model (Qwen3.6-35B-A3B-APEX-Compact.gguf)
+   - Measure: prediction recall, prefetch hit rate, decode throughput delta
+
+3. **Training pipeline (1-2 weeks):**
+   - Data collection: instrument graph to collect router logits at layer L, record actual expert selections at layer L+H
+   - Train Variant B (Low-Rank MLP): `router_logits → rank-32 → expert_logits`
+   - Train Variant C (Future Router + Residual): freeze future router weights, train only residual
+   - Split by whole prompts, evaluate by category (coding, conversation, reasoning)
+
+4. **Advanced integration (2-4 weeks):**
+   - CUDA predictor stream (low-priority auxiliary stream, avoid synchronizing main compute)
+   - Multi-horizon prediction (shared rank-32 trunk + horizon-specific heads for H=4,6,8,10,12)
+   - Router logits as features (test: x_L, router_logits_L, top-K IDs + weights, concatenation)
+
+### Benchmark Configuration
+
+```bash
+# Baseline (no expert cache, no predictor)
+llama-bench -m <model> -p 512 -n 128 -fitt 256
+
+# Expert cache only
+llama-bench -m <model> -p 512 -n 128 -fitt 256 -exc 64 -excp 64
+
+# Expert cache + routing predictor (Variant A)
+llama-bench -m <model> -p 512 -n 128 -fitt 256 -exc 64 -excp 64 --routing-predictor-horizon 8 --routing-predictor-stats
+```
+
+**Model:** Qwen3.6-35B-A3B-APEX-Compact.gguf (35B total, 3B active, 64 experts/layer, 8 active/token)  
+**Hardware:** GTX 1080 (8 GB VRAM) + CPU (14 threads)
+
+### Documentation
+
+- Handover document: `docs/plans/2026-08-22-learned-predictor-handover.md`
+- Original plan: `docs/plans/2026-08-21-routing-lookahead-pipeline.md`
+- Fix plan: `docs/plans/2026-08-22-fix-routing-predictor-issues.md`
+- Main documentation: `EXPERT_CACHE.md` Section 10.3 (Phase 5D)

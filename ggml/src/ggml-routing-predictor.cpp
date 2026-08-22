@@ -181,6 +181,88 @@ void ggml_routing_predictor_free(ggml_routing_predictor_t predictor) {
     delete predictor;
 }
 
+bool ggml_routing_predictor_load_model(
+    ggml_routing_predictor_t predictor,
+    const char * model_path) {
+    
+    if (!predictor || !model_path) return false;
+    
+    FILE * file = fopen(model_path, "rb");
+    if (!file) return false;
+    
+    // Read magic number
+    uint32_t magic = 0;
+    if (fread(&magic, sizeof(magic), 1, file) != 1) {
+        fclose(file);
+        return false;
+    }
+    
+    // Magic: 0x4C525044 = "LRPD" (Learned Routing Predictor Data)
+    if (magic != 0x4C525044) {
+        fclose(file);
+        return false;
+    }
+    
+    // Read version
+    uint32_t version = 0;
+    if (fread(&version, sizeof(version), 1, file) != 1) {
+        fclose(file);
+        return false;
+    }
+    
+    if (version != 1) {
+        fclose(file);
+        return false;
+    }
+    
+    // Read dimensions
+    int32_t input_dim = 0, num_experts = 0, rank = 0;
+    if (fread(&input_dim, sizeof(input_dim), 1, file) != 1 ||
+        fread(&num_experts, sizeof(num_experts), 1, file) != 1 ||
+        fread(&rank, sizeof(rank), 1, file) != 1) {
+        fclose(file);
+        return false;
+    }
+    
+    // Validate dimensions match predictor
+    if (input_dim != predictor->input_dim || num_experts != predictor->num_experts || rank != predictor->rank) {
+        fclose(file);
+        return false;
+    }
+    
+    // Allocate weight buffers
+    predictor->down_weight.resize(rank * input_dim);
+    predictor->down_bias.resize(rank);
+    predictor->output_weight.resize(num_experts * rank);
+    predictor->output_bias.resize(num_experts);
+    
+    // Read weights
+    if (fread(predictor->down_weight.data(), sizeof(float), rank * input_dim, file) != (size_t)(rank * input_dim) ||
+        fread(predictor->down_bias.data(), sizeof(float), rank, file) != (size_t)rank ||
+        fread(predictor->output_weight.data(), sizeof(float), num_experts * rank, file) != (size_t)(num_experts * rank) ||
+        fread(predictor->output_bias.data(), sizeof(float), num_experts, file) != (size_t)num_experts) {
+        fclose(file);
+        return false;
+    }
+    
+    // For Variant C, read residual correction weights
+    if (predictor->type == GGML_ROUTING_PREDICTOR_FUTURE_RESIDUAL) {
+        predictor->residual_weight.resize(rank * input_dim);
+        predictor->residual_bias.resize(rank);
+        predictor->residual_output.resize(num_experts * rank);
+        
+        if (fread(predictor->residual_weight.data(), sizeof(float), rank * input_dim, file) != (size_t)(rank * input_dim) ||
+            fread(predictor->residual_bias.data(), sizeof(float), rank, file) != (size_t)rank ||
+            fread(predictor->residual_output.data(), sizeof(float), num_experts * rank, file) != (size_t)(num_experts * rank)) {
+            fclose(file);
+            return false;
+        }
+    }
+    
+    fclose(file);
+    return true;
+}
+
 void ggml_routing_predictor_extract_features(
         ggml_routing_predictor_t predictor,
         const float * router_logits,
@@ -198,6 +280,103 @@ void ggml_routing_predictor_extract_features(
     if (copy_dim < predictor->input_dim) {
         memset(out_features + copy_dim, 0, (predictor->input_dim - copy_dim) * sizeof(float));
     }
+}
+
+// Variant B/C prediction with learned weights
+static int32_t predict_learned(
+    ggml_routing_predictor_t predictor,
+    const float * features,
+    int32_t * out_expert_ids,
+    float * out_confidences,
+    int32_t max_experts) {
+    
+    if (!predictor || !features || !out_expert_ids) return 0;
+    
+    int32_t rank = predictor->rank;
+    int32_t num_experts = predictor->num_experts;
+    
+    // Check if weights are loaded
+    if (predictor->down_weight.empty() || predictor->output_weight.empty()) {
+        return 0;
+    }
+    
+    // Hidden layer: h = GELU(W_down * x + b_down)
+    std::vector<float> hidden(rank);
+    mat_vec_gelu(
+        predictor->down_weight.data(),
+        features,
+        predictor->down_bias.data(),
+        hidden.data(),
+        rank,
+        predictor->input_dim
+    );
+    
+    // Output layer: logits = W_out * h + b_out
+    std::vector<float> logits(num_experts);
+    mat_vec(
+        predictor->output_weight.data(),
+        hidden.data(),
+        predictor->output_bias.data(),
+        logits.data(),
+        num_experts,
+        rank
+    );
+    
+    // For Variant C: add residual correction
+    if (predictor->type == GGML_ROUTING_PREDICTOR_FUTURE_RESIDUAL && !predictor->residual_weight.empty()) {
+        std::vector<float> residual_hidden(rank);
+        mat_vec_gelu(
+            predictor->residual_weight.data(),
+            features,
+            predictor->residual_bias.data(),
+            residual_hidden.data(),
+            rank,
+            predictor->input_dim
+        );
+        
+        std::vector<float> residual_logits(num_experts);
+        mat_vec(
+            predictor->residual_output.data(),
+            residual_hidden.data(),
+            nullptr,
+            residual_logits.data(),
+            num_experts,
+            rank
+        );
+        
+        // Add residual to main logits
+        for (int32_t i = 0; i < num_experts; i++) {
+            logits[i] += residual_logits[i];
+        }
+    }
+    
+    // Apply softmax to get probabilities
+    float max_logit = *std::max_element(logits.begin(), logits.end());
+    float sum_exp = 0.0f;
+    for (int32_t i = 0; i < num_experts; i++) {
+        logits[i] = expf(logits[i] - max_logit);
+        sum_exp += logits[i];
+    }
+    for (int32_t i = 0; i < num_experts; i++) {
+        logits[i] /= sum_exp;
+    }
+    
+    // Get top-K experts
+    int32_t n_return = std::min(max_experts, num_experts);
+    std::vector<std::pair<float, int32_t>> expert_probs;
+    for (int32_t i = 0; i < num_experts; i++) {
+        expert_probs.push_back({logits[i], i});
+    }
+    std::sort(expert_probs.begin(), expert_probs.end(), std::greater<std::pair<float, int32_t>>());
+    
+    for (int32_t i = 0; i < n_return; i++) {
+        out_expert_ids[i] = expert_probs[i].second;
+        if (out_confidences) {
+            out_confidences[i] = expert_probs[i].first;
+        }
+    }
+    
+    return n_return;
 }
 
 int32_t ggml_routing_predictor_predict(

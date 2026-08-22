@@ -2407,6 +2407,19 @@ void ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched) {
     }
 }
 
+bool ggml_backend_sched_get_routing_predictor_stats(
+    ggml_backend_sched_t sched,
+    struct ggml_routing_predictor_stats * out_stats) {
+    
+    if (!sched || !out_stats) return false;
+    
+    // Access the graph result to get metrics
+    // This requires exposing the graph result through the scheduler
+    // For now, return false to indicate not implemented
+    // TODO: Implement proper metrics retrieval
+    return false;
+}
+
 bool ggml_backend_sched_get_expert_cache_stats(
         ggml_backend_sched_t sched,
         int backend_idx,

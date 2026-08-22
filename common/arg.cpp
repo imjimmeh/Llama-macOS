@@ -2799,6 +2799,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_STATS"));
     add_opt(common_arg(
+        {"--routing-predictor-horizon"}, "N",
+        "lookahead layers for routing predictor (default: 8)",
+        [](common_params & params, const std::string & value) {
+            params.routing_predictor_horizon = std::stoi(value);
+        }
+    ).set_env("LLAMA_ARG_ROUTING_PREDICTOR_HORIZON"));
+    add_opt(common_arg(
+        {"--routing-predictor-stats"},
+        "print routing predictor performance statistics on exit",
+        [](common_params & params) {
+            params.routing_predictor_stats = true;
+        }
+    ).set_env("LLAMA_ARG_ROUTING_PREDICTOR_STATS"));
+    add_opt(common_arg(
         {"-excr", "--expert-cache-profile"}, "NAME",
         "name of expert cache profile for persistent hot-expert caching (e.g. 'coding', 'prose')",
         [](common_params & params, const std::string & value) {

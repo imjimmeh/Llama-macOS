@@ -1289,6 +1289,24 @@ llm_graph_result::llm_graph_result(int64_t max_nodes) : max_nodes(max_nodes) {
     debug = LLAMA_GRAPH_RESULT_DEBUG ? atoi(LLAMA_GRAPH_RESULT_DEBUG) : 0;
 }
 
+llm_graph_result::~llm_graph_result() {
+    // Phase 5D: Free routing predictor to prevent memory leak
+    if (routing_predictor) {
+        ggml_routing_predictor_free(routing_predictor);
+        routing_predictor = nullptr;
+    }
+    
+    // Phase 5D: Free pinned host buffer
+    if (pinned_logits_buffer) {
+#if defined(_WIN32)
+        _aligned_free(pinned_logits_buffer);
+#else
+        free(pinned_logits_buffer);
+#endif
+        pinned_logits_buffer = nullptr;
+    }
+}
+
 int64_t llm_graph_result::get_max_nodes() const {
     return max_nodes;
 }
@@ -1476,12 +1494,21 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
         config.type = GGML_ROUTING_PREDICTOR_STALE_FUTURE;  // Start with variant A
         config.input_dim = hparams.n_expert;  // Router logits dimension
         config.num_experts = hparams.n_expert;
-        config.horizon = 8;  // Predict 8 layers ahead
+        config.horizon = cparams.routing_predictor_horizon;  // Configurable horizon
         config.rank = 32;  // Low-rank dimension for variants B/C
         config.model_path = nullptr;  // No model for variant A
         
         res->routing_predictor = ggml_routing_predictor_init(&config);
         if (res->routing_predictor) {
+            // Allocate pinned host buffer for faster D2H transfer
+            size_t logits_size = hparams.n_expert * sizeof(float);
+#if defined(_WIN32)
+            res->pinned_logits_buffer = (float*)_aligned_malloc(logits_size, 4096);
+#else
+            res->pinned_logits_buffer = (float*)aligned_alloc(4096, logits_size);
+#endif
+            res->pinned_logits_capacity = logits_size;
+            
             // Find the GPU backend index for expert cache
             res->predictor_backend_idx = 0;  // Default to first backend
             for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); i++) {
@@ -3961,21 +3988,32 @@ bool llm_graph_context::routing_predictor_callback(
         
         if (!res->routing_predictor) return false;
         
+        // Increment prediction counter
+        res->predictor_metrics.predictions_generated++;
+        
         // Only run predictor for single token decode
         if (tensor->ne[1] != 1) return false;
         
         // Extract logits data
         int32_t n_experts = tensor->ne[0];
-        std::vector<float> logits(n_experts);
+        size_t logits_bytes = n_experts * sizeof(float);
         
-        // Copy logits from device to host
-        ggml_backend_tensor_get(tensor, logits.data(), 0, n_experts * sizeof(float));
+        // Use pinned buffer for faster D2H transfer
+        float * logits_ptr = res->pinned_logits_buffer;
+        if (!logits_ptr || res->pinned_logits_capacity < logits_bytes) {
+            // Fallback to stack allocation if pinned buffer not available
+            std::vector<float> logits(n_experts);
+            logits_ptr = logits.data();
+        }
+        
+        // Copy logits from device to host (faster with pinned memory)
+        ggml_backend_tensor_get(tensor, logits_ptr, 0, logits_bytes);
         
         // Extract features
         std::vector<float> features(n_experts);
         ggml_routing_predictor_extract_features(
             res->routing_predictor,
-            logits.data(),
+            logits_ptr,
             n_experts,
             features.data()
         );
