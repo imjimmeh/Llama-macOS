@@ -1438,6 +1438,7 @@ void ggml_backend_expert_cache_prefetch_async(
         
         // Skip if already resident
         if (ggml_backend_expert_cache_find_slot(cache, tensor, eid) >= 0) {
+            cache->stats.n_already_resident++;
             continue;
         }
         
@@ -1530,6 +1531,17 @@ void ggml_backend_expert_cache_prefetch_async(
     }
 }
 
+static bool has_inflight_prefetch(ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor, int32_t expert_id);
+
+
+bool ggml_backend_expert_cache_has_inflight_prefetch(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id) {
+    return has_inflight_prefetch(cache, tensor, expert_id);
+}
+
 bool ggml_backend_expert_cache_is_prefetch_ready(
         ggml_backend_expert_cache_t cache,
         const struct ggml_tensor * tensor,
@@ -1599,6 +1611,7 @@ void ggml_backend_expert_cache_enable_predictor(
     if (cache == NULL || max_layers <= 0 || max_experts_per_layer <= 0) {
         return;
     }
+
     
     cache->predictor_enabled = true;
     cache->predictor_max_layers = max_layers;
@@ -1721,6 +1734,28 @@ int32_t ggml_backend_expert_cache_predict_experts(
     return 0;
 }
 
+
+void ggml_backend_expert_cache_record_gpu_slot_execution(ggml_backend_expert_cache_t cache) {
+    if (cache) cache->stats.n_gpu_slot_executions++;
+}
+void ggml_backend_expert_cache_record_cpu_fallback(ggml_backend_expert_cache_t cache) {
+    if (cache) cache->stats.n_cpu_fallbacks++;
+}
+void ggml_backend_expert_cache_record_used_ready(ggml_backend_expert_cache_t cache) {
+    if (cache) cache->stats.n_used_ready++;
+}
+void ggml_backend_expert_cache_record_used_in_flight(ggml_backend_expert_cache_t cache) {
+    if (cache) cache->stats.n_used_in_flight++;
+}
+void ggml_backend_expert_cache_record_used_miss(ggml_backend_expert_cache_t cache) {
+    if (cache) cache->stats.n_used_miss++;
+}
+void ggml_backend_expert_cache_record_already_resident(ggml_backend_expert_cache_t cache) {
+    if (cache) cache->stats.n_already_resident++;
+}
+void ggml_backend_expert_cache_record_in_flight_wait_us(ggml_backend_expert_cache_t cache, uint64_t us) {
+    if (cache) cache->stats.in_flight_wait_us += us;
+}
 
 int32_t ggml_backend_expert_cache_get_tensor_layer(const struct ggml_tensor * tensor) {
     return ggml_expert_cache_get_tensor_layer(tensor);
@@ -2430,7 +2465,14 @@ bool ggml_backend_expert_cache_settle_prediction(
         }
         if (!predicted) {
             s.predictions_wrong++;
-            s.bytes_wasted += (int64_t) pool_stride;
+        }
+    }
+
+    // Prefetched ids that never got used are pure PCIe waste
+    for (int i = 0; i < p.n_experts; i++) {
+        const int32_t id = p.expert_ids[i];
+        if (!actual_set.count(id)) {
+            cache->stats.wasted_prefetch_bytes += pool_stride;
         }
     }
 

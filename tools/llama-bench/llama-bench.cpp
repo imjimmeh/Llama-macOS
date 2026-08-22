@@ -1637,6 +1637,19 @@ static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_ba
     EXPERT_CACHE_SUBTRACT(map_update_bytes);
     EXPERT_CACHE_SUBTRACT(dma_ns);
     EXPERT_CACHE_SUBTRACT(dma_wait_ns);
+    EXPERT_CACHE_SUBTRACT(n_staging_waits);
+    EXPERT_CACHE_SUBTRACT(probe_n_layers);
+    EXPERT_CACHE_SUBTRACT(probe_sync_us);
+    EXPERT_CACHE_SUBTRACT(probe_host_us);
+    EXPERT_CACHE_SUBTRACT(probe_upload_us);
+    EXPERT_CACHE_SUBTRACT(n_gpu_slot_executions);
+    EXPERT_CACHE_SUBTRACT(n_cpu_fallbacks);
+    EXPERT_CACHE_SUBTRACT(n_used_ready);
+    EXPERT_CACHE_SUBTRACT(n_used_in_flight);
+    EXPERT_CACHE_SUBTRACT(n_used_miss);
+    EXPERT_CACHE_SUBTRACT(n_already_resident);
+    EXPERT_CACHE_SUBTRACT(wasted_prefetch_bytes);
+    EXPERT_CACHE_SUBTRACT(in_flight_wait_us);
 #undef EXPERT_CACHE_SUBTRACT
     return delta;
 }
@@ -1842,6 +1855,14 @@ struct test {
             "expert_cache_map_update_bytes",
             "expert_cache_dma_ns",
             "expert_cache_dma_wait_ns",
+            "expert_cache_gpu_slot_executions",
+            "expert_cache_cpu_fallbacks",
+            "expert_cache_used_ready",
+            "expert_cache_used_in_flight",
+            "expert_cache_used_miss",
+            "expert_cache_already_resident",
+            "expert_cache_wasted_prefetch_bytes",
+            "expert_cache_in_flight_wait_us",
             "routing_predictor_horizon",
             "routing_predictor_predictions_generated",
             "routing_predictor_predictions_used",
@@ -1904,6 +1925,14 @@ struct test {
             field == "expert_cache_map_update_bytes" ||
             field == "expert_cache_dma_ns" ||
             field == "expert_cache_dma_wait_ns" ||
+            field == "expert_cache_gpu_slot_executions" ||
+            field == "expert_cache_cpu_fallbacks" ||
+            field == "expert_cache_used_ready" ||
+            field == "expert_cache_used_in_flight" ||
+            field == "expert_cache_used_miss" ||
+            field == "expert_cache_already_resident" ||
+            field == "expert_cache_wasted_prefetch_bytes" ||
+            field == "expert_cache_in_flight_wait_us" ||
             field == "routing_predictor_horizon" ||
             field == "routing_predictor_predictions_generated" ||
             field == "routing_predictor_predictions_used" ||
@@ -2022,6 +2051,14 @@ struct test {
                                             std::to_string(expert_cache_stats.map_update_bytes),
                                             std::to_string(expert_cache_stats.dma_ns),
                                             std::to_string(expert_cache_stats.dma_wait_ns),
+                                            std::to_string(expert_cache_stats.n_gpu_slot_executions),
+                                            std::to_string(expert_cache_stats.n_cpu_fallbacks),
+                                            std::to_string(expert_cache_stats.n_used_ready),
+                                            std::to_string(expert_cache_stats.n_used_in_flight),
+                                            std::to_string(expert_cache_stats.n_used_miss),
+                                            std::to_string(expert_cache_stats.n_already_resident),
+                                            std::to_string(expert_cache_stats.wasted_prefetch_bytes),
+                                            std::to_string(expert_cache_stats.in_flight_wait_us),
                                             std::to_string(routing_predictor_horizon),
                                             std::to_string(routing_predictor_stats.predictions_generated),
                                             std::to_string(routing_predictor_stats.predictions_used),

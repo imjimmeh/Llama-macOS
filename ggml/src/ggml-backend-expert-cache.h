@@ -334,6 +334,23 @@ GGML_API void ggml_backend_expert_cache_wait_prefetch(
     const struct ggml_tensor * tensor,
     int32_t expert_id);
 
+// True if an async DMA is in flight for this tensor/expert
+GGML_API bool ggml_backend_expert_cache_has_inflight_prefetch(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
+// Phase 5H accessor hooks
+GGML_API void ggml_backend_expert_cache_record_gpu_slot_execution(ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_record_cpu_fallback(ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_record_used_ready(ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_record_used_in_flight(ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_record_used_miss(ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_record_already_resident(ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_record_in_flight_wait_us(ggml_backend_expert_cache_t cache, uint64_t us);
+
+
+
 // Phase 5C: Heuristic Predictor (Transition Tables)
 GGML_API void ggml_backend_expert_cache_enable_predictor(
     ggml_backend_expert_cache_t cache,

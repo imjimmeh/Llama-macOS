@@ -409,6 +409,15 @@ struct ggml_backend_expert_cache_stats {
         uint64_t probe_host_us;
         uint64_t probe_upload_us;
 
+        // Phase 5H: GPU slot execution economics
+        uint64_t n_gpu_slot_executions; // nodes swapped onto the slot tensor
+        uint64_t n_cpu_fallbacks;       // single-token decode fell back to generic path
+        uint64_t n_used_ready;          // all ids resident at node arrival
+        uint64_t n_used_in_flight;      // some id arrived while its DMA was in flight
+        uint64_t n_used_miss;           // some id absent and not in flight
+        uint64_t n_already_resident;    // prefetch skipped, id already resident
+        size_t   wasted_prefetch_bytes; // prefetched bytes never consumed
+        uint64_t in_flight_wait_us;     // time spent waiting on in-flight DMAs
         // Phase 5C: Async Prefetch Metrics
         uint64_t n_prefetch_issued;
         uint64_t n_prefetch_hits;
