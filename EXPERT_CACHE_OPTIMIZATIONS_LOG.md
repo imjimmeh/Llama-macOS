@@ -1134,3 +1134,45 @@ llama-bench -m <model> -p 512 -n 128 -fitt 256 -exc 64 -excp 64 --routing-predic
 - Original plan: `docs/plans/2026-08-21-routing-lookahead-pipeline.md`
 - Fix plan: `docs/plans/2026-08-22-fix-routing-predictor-issues.md`
 - Main documentation: `EXPERT_CACHE.md` Section 10.3 (Phase 5D)
+
+### Phase 5G: Same-Backend Route Discovery + Pre-Resident Oracle (2026-08-22)
+
+**Root cause of the 5F.5 blocker (confirmed).** During single-token decode, each expert
+`MUL_MAT_ID` weight lives on the same backend that consumes it (CPU-expert layers compute
+on CPU, GPU-expert layers on CUDA0). `graph_split` only adds cross-backend copies to
+`split->inputs`, so the copy-loop gate could never find these nodes and settle/zero-copy
+never ran for gen. Diagnostics (5F.6/5F.7, since removed) proved it:
+`split=8 backend=CPU(1) mul_mat_id=3(exp3)` with `src0='blk.N.ffn_*_exps.weight' host=1
+usage=WEIGHTS`, yet `expert_cache_mul_mat_id_inputs=0`.
+
+**Pre-resident single-layer oracle** (`tests/test-moe-latency-oracle.cpp`). One MoE FFN,
+qwen35moe shapes (n_embd=2048, n_ff=512, 256 experts, 8 used), Q4_K weights, transfers
+excluded from timing:
+
+| scenario | avg us | min us |
+|---|---|---|
+| cpu_full (today's TG path) | 264 | 237 |
+| gpu_full (256-expert tensor in VRAM) | 597 | 136 |
+| gpu_slot (8-expert slot in VRAM) | 142 | 135 |
+
+GPU cached execution beats CPU by ~1.75x; Phase 5 is viable on GTX 1080 + Ryzen 7 5700X.
+The high `gpu_full` variance suggests the full-tensor MUL_MAT_ID CUDA kernel pays an
+expert-scan cost the slot form avoids - which matches the cache's zero-copy fast-path shape.
+
+**Fix: route discovery pass** (`ggml_backend_sched_expert_route_discovery`,
+ggml/src/ggml-backend.cpp). After a split computes, scan `split->graph.nodes` for
+`MUL_MAT_ID` whose `src[0]` is an op-NONE host WEIGHTS tensor with >=2 experts. For each,
+read ids, record route trace + prediction, prefetch predicted next-layer experts, settle
+the pending prediction. Read-only: no node mutation, execution path unchanged.
+
+**A/B regression isolation.** Ungated discovery regressed PP32 63.8 -> 42.8 t/s: the
+synchronous per-layer ids D2H read stalls the CUDA stream during prefill. Gating discovery
+to decode (`ids ne[1] == 1`) restored PP to the 60-64 t/s band while keeping gen scoring.
+
+**Final verification** (-ngl 20, -exc 256 -excp 64, low-rank-mlp predictor):
+
+- PP row: 60-64 t/s band, `requests=4239`, `predictions_used=0` (expected: predictor runs decode only)
+- Gen row: `predictions_generated=4`, `predictions_used=4`, `speculative_prefetches=18`
+
+**Cleanup done this phase:** removed `[add_pred]` debug fprintf, Phase 5F.6/5F.7 diagnostic
+blocks, A/B env flag, and temp diag_*.txt files.

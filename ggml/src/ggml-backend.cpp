@@ -1677,6 +1677,66 @@ struct ggml_tensor * ggml_backend_find_mul_mat_id_node(
     return graph->nodes[match_idx];
 }
 
+// Score and settle expert routes for a MUL_MAT_ID whose weight stayed on its own
+// backend (host WEIGHTS). Such nodes never enter split->inputs, so the copy-loop
+// gate cannot see them. Read-only: records traces, prefetches predictions,
+// settles pending predictions. No node mutation.
+static void ggml_backend_sched_expert_route_discovery(
+        ggml_backend_expert_cache_t cache,
+        struct ggml_tensor * w,
+        struct ggml_tensor * ids_t,
+        std::vector<int32_t> & ids_scratch,
+        std::vector<int32_t> & req_scratch) {
+    if (cache == NULL || w == NULL || ids_t == NULL) {
+        return;
+    }
+
+    const int32_t layer = ggml_backend_expert_cache_get_tensor_layer(w);
+    if (layer < 0) {
+        return;
+    }
+
+    const int64_t n_expert = w->ne[2];
+
+    ids_scratch.resize(ggml_nbytes(ids_t) / sizeof(int32_t));
+    ggml_backend_tensor_get(ids_t, ids_scratch.data(), 0, ggml_nbytes(ids_t));
+
+    std::vector<ggml_bitset_t> seen(ggml_bitset_size(n_expert), 0);
+    req_scratch.clear();
+    for (int64_t i1 = 0; i1 < ids_t->ne[1]; i1++) {
+        for (int64_t i0 = 0; i0 < ids_t->ne[0]; i0++) {
+            int32_t id = ids_scratch[i1 * ids_t->nb[1]/sizeof(int32_t) + i0 * ids_t->nb[0]/sizeof(int32_t)];
+            if (id >= 0 && id < n_expert && !ggml_bitset_get(seen.data(), id)) {
+                ggml_bitset_set(seen.data(), id);
+                req_scratch.push_back(id);
+            }
+        }
+    }
+    if (req_scratch.empty()) {
+        return;
+    }
+
+    ggml_backend_expert_cache_record_route_trace(
+        cache, layer, req_scratch.data(), (int32_t)req_scratch.size());
+    ggml_backend_expert_cache_record_prediction(
+        cache, layer, req_scratch.data(), (int32_t)req_scratch.size());
+
+    int32_t predicted_experts[16];
+    int32_t n_predicted = ggml_backend_expert_cache_predict_experts(
+        cache, layer, layer + 1, predicted_experts, 16);
+    if (n_predicted > 0) {
+        ggml_backend_expert_cache_prefetch_async(
+            cache, w, predicted_experts, n_predicted, layer + 1);
+    }
+
+    if (ggml_backend_expert_cache_pending_prediction_count(cache) > 0) {
+        const size_t pool_stride_bytes = (size_t)(ggml_nbytes(w) / w->ne[2]);
+        ggml_backend_expert_cache_settle_prediction(
+            cache, layer, req_scratch.data(), (int32_t)req_scratch.size(),
+            pool_stride_bytes);
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2196,6 +2256,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // route discovery for same-backend expert weights: they never enter
+        // split->inputs, so score and settle them here instead
+        ggml_backend_expert_cache_t telemetry_cache = sched->expert_caches[split_backend_id];
+        if (telemetry_cache == NULL) {
+            for (int b = 0; b < sched->n_backends; ++b) {
+                if (sched->expert_caches[b] != NULL) {
+                    telemetry_cache = sched->expert_caches[b];
+                    break;
+                }
+            }
+        }
+        if (telemetry_cache != NULL) {
+            for (int i = 0; i < split->graph.n_nodes; ++i) {
+                struct ggml_tensor * nd = split->graph.nodes[i];
+                if (nd == NULL || nd->op != GGML_OP_MUL_MAT_ID) continue;
+                struct ggml_tensor * w = nd->src[0];
+                if (w == NULL || w->op != GGML_OP_NONE || w->ne[2] < 2) continue;
+                if (!ggml_backend_buffer_is_host(w->buffer)) continue;
+                // decode-only: batched prefill keeps its own sparse-transfer path,
+                // and a sync ids read here would stall the CUDA stream
+                struct ggml_tensor * ids_t = nd->src[2];
+                if (ids_t == NULL || ids_t->ne[1] != 1) continue;
+                ggml_backend_sched_expert_route_discovery(telemetry_cache,
+                    w, ids_t, ids, requested_experts);
+            }
+        }
+
         // restore any modified node src[0] pointers for graph idempotency
         for (auto & rn : restored_nodes) {
             rn.first->src[0] = rn.second;
@@ -2694,12 +2781,6 @@ void ggml_backend_sched_add_predictions_generated(
         int32_t n) {
     if (sched == NULL || backend_idx < 0 || backend_idx >= sched->n_backends) {
         return;
-    }
-    static int s_dbg_pred = -1;
-    if (s_dbg_pred < 5 || getenv("GGML_PREDICTOR_DEBUG")) {
-        fprintf(stderr, "[add_pred] backend_idx=%d cache=%p n=%d sched_nback=%d\n",
-            backend_idx, (void*)sched->expert_caches[backend_idx], n, sched->n_backends);
-        if (s_dbg_pred >= 0) ++s_dbg_pred;
     }
     if (sched->expert_caches[backend_idx]) {
         ggml_backend_expert_cache_add_predictions_generated(sched->expert_caches[backend_idx], n);

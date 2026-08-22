@@ -655,6 +655,25 @@ Note: both `ggml_routing_predictor_load_model` (public) and the cache-level `ggm
 
 5. **Predictor is still constructed per-cache-instance, not per-context.** Cosmetic. Move to `llama_context` member only if it shows up in a flame graph.
 
+**Status (2026-08-22, Phase 5G):**
+
+1. **`predictions_used > 0` CONFIRMED.** Root cause of the 5F blocker was structural:
+   during single-token decode the expert weights are consumed by a split on their own
+   backend, so they never enter `split->inputs` and the copy-loop gate could never see
+   them. Fixed by a read-only route-discovery pass in `ggml_backend_sched_compute_splits`
+   that scans `split->graph.nodes` for `MUL_MAT_ID` with host WEIGHTS `src[0]`, then
+   records route traces, prefetches predicted experts and settles pending predictions
+   (`ggml_backend_sched_expert_route_discovery`). Decode-only (`ids ne[1] == 1`); the
+   batched prefill sparse-transfer path is untouched.
+
+2. **Pre-resident oracle experiment (tests/test-moe-latency-oracle.cpp).** Single MoE FFN,
+   real qwen35moe shapes, Q4_K weights, transfers excluded. CPU 264 us avg vs GPU slot
+   (8-expert device-resident tensor) 142 us avg. GPU cached execution beats CPU by ~1.75x
+   on GTX 1080 + Ryzen 7 5700X; Phase 5 remains viable on this hardware.
+
+3. Bench gen row: `predictions_generated=4`, `predictions_used=4`,
+   `expert_cache_speculative_prefetches=18`. PP unchanged (`requests=4239`, ~60-64 t/s band).
+
 #### Phase 5E: Pipeline End-to-End Validation (2026-08-22)
 
 **Objective:** Confirm the trace -> features -> model -> load -> run loop actually works on real hardware.
