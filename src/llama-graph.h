@@ -929,20 +929,14 @@ public:
 
     // Phase 5D: Routing predictor for expert prefetching
     ggml_routing_predictor_t routing_predictor = nullptr;
+    int32_t predictor_horizon = 0;
+    int32_t predictor_depth   = 0;
     int32_t predictor_backend_idx = 0;
     ggml_backend_sched_t sched = nullptr;
 
-    // Phase 5D: Prediction metrics
-    struct routing_predictor_metrics {
-        int64_t predictions_generated = 0;
-        int64_t predictions_used = 0;
-        int64_t predictions_too_late = 0;
-        int64_t predictions_wrong = 0;
-        int64_t experts_fully_hidden = 0;
-        int64_t experts_partially_hidden = 0;
-        int64_t experts_missed = 0;
-        int64_t bytes_wasted = 0;
-    } predictor_metrics;
+    // Phase 5D: user eval callback we replaced; chained at the end
+    ggml_backend_sched_eval_callback prev_cb = nullptr;
+    void * prev_cb_user_data = nullptr;
 
     // Phase 5D: Pinned host buffer for async D2H
     float * pinned_logits_buffer = nullptr;

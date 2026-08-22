@@ -358,6 +358,8 @@ struct cmd_params {
     std::vector<int32_t>             expert_cache_max_swaps;
     std::vector<int32_t>             routing_predictor_horizon;
     std::vector<bool>                routing_predictor_stats;
+    std::vector<std::string>         routing_predictor_model;
+    std::vector<int32_t>             routing_predictor_variant;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -408,6 +410,8 @@ static const cmd_params cmd_params_defaults = {
     /* expert_cache_max_swaps */ { -1 },
     /* routing_predictor_horizon */ { 8 },
     /* routing_predictor_stats  */ { false },
+    /* routing_predictor_model  */ { "" },
+    /* routing_predictor_variant */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -440,6 +444,8 @@ static void print_usage(int /*argc*/, const char * const * argv) {
     printf("  -excp, --expert-cache-period <n0,n1,...>    token interval for expert cache rebalancing (0 = on-demand LRU, default: 64)\n");
     printf("  --routing-predictor-horizon <N>               lookahead layers for routing predictor (default: 8)\n");
     printf("  --routing-predictor-stats                     print routing predictor performance statistics on exit\n");
+    printf("  --routing-predictor-model <path>              path to trained LRPD model (enables low-rank-mlp variant)\n");
+    printf("  --routing-predictor-variant <name>            routing predictor variant: stale-future|low-rank-mlp|future-residual (default: stale-future)\n");
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
     }
@@ -1120,6 +1126,27 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
             } else if (arg == "--routing-predictor-stats") {
                 params.routing_predictor_stats.push_back(true);
+            } else if (arg == "--routing-predictor-model") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & v : p) {
+                    params.routing_predictor_model.push_back(v);
+                }
+            } else if (arg == "--routing-predictor-variant") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & v : p) {
+                    if (v == "stale-future") params.routing_predictor_variant.push_back(0);
+                    else if (v == "low-rank-mlp") params.routing_predictor_variant.push_back(1);
+                    else if (v == "future-residual") params.routing_predictor_variant.push_back(2);
+                    else throw std::invalid_argument("invalid routing predictor variant");
+                }
             } else {
                 invalid_param = true;
                 break;
@@ -1261,6 +1288,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.routing_predictor_stats.empty()) {
         params.routing_predictor_stats = cmd_params_defaults.routing_predictor_stats;
     }
+    if (params.routing_predictor_model.empty()) {
+        params.routing_predictor_model = cmd_params_defaults.routing_predictor_model;
+    }
+    if (params.routing_predictor_variant.empty()) {
+        params.routing_predictor_variant = cmd_params_defaults.routing_predictor_variant;
+    }
 
     return params;
 }
@@ -1299,6 +1332,8 @@ struct cmd_params_instance {
     int32_t            expert_cache_max_swaps;
     int32_t            routing_predictor_horizon;
     bool               routing_predictor_stats;
+    std::string        routing_predictor_model;
+    int32_t            routing_predictor_variant;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1380,6 +1415,8 @@ struct cmd_params_instance {
         cparams.expert_cache_max_swaps = expert_cache_max_swaps;
         cparams.routing_predictor_horizon = routing_predictor_horizon;
         cparams.routing_predictor_stats   = routing_predictor_stats;
+        cparams.routing_predictor_model   = routing_predictor_model.empty() ? nullptr : routing_predictor_model.c_str();
+        cparams.routing_predictor_variant = routing_predictor_variant;
 
         return cparams;
     }
@@ -1398,6 +1435,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & excm : params.expert_cache_max_swaps)
     for (const auto & rph : params.routing_predictor_horizon)
     for (const auto & rps : params.routing_predictor_stats)
+    for (const auto & rpm : params.routing_predictor_model)
+    for (const auto & rpv : params.routing_predictor_variant)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & fs : params.ffn_split)
     for (const auto & ncmoe : params.n_cpu_moe)
@@ -1459,6 +1498,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_max_swaps = */ excm,
                 /* .routing_predictor_horizon = */ rph,
                 /* .routing_predictor_stats   = */ rps,
+                /* .routing_predictor_model   = */ rpm,
+                /* .routing_predictor_variant = */ rpv,
             };
             instances.push_back(instance);
         }
@@ -1501,6 +1542,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_max_swaps = */ excm,
                 /* .routing_predictor_horizon = */ rph,
                 /* .routing_predictor_stats   = */ rps,
+                /* .routing_predictor_model   = */ rpm,
+                /* .routing_predictor_variant = */ rpv,
             };
             instances.push_back(instance);
         }
@@ -1543,6 +1586,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_max_swaps = */ excm,
                 /* .routing_predictor_horizon = */ rph,
                 /* .routing_predictor_stats   = */ rps,
+                /* .routing_predictor_model   = */ rpm,
+                /* .routing_predictor_variant = */ rpv,
             };
             instances.push_back(instance);
         }
@@ -1665,6 +1710,8 @@ struct test {
     int32_t                  expert_cache_period;
     int32_t                  routing_predictor_horizon;
     ggml_routing_predictor_stats routing_predictor_stats = {};
+    std::string              routing_predictor_model;
+    int32_t                  routing_predictor_variant;
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
@@ -1708,6 +1755,8 @@ struct test {
         expert_cache_size   = inst.expert_cache_size;
         expert_cache_period = inst.expert_cache_period;
         routing_predictor_horizon = inst.routing_predictor_horizon;
+        routing_predictor_model   = inst.routing_predictor_model;
+        routing_predictor_variant = inst.routing_predictor_variant;
         routing_predictor_stats = get_routing_predictor_stats(ctx);
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
@@ -1801,7 +1850,9 @@ struct test {
             "routing_predictor_experts_fully_hidden",
             "routing_predictor_experts_partially_hidden",
             "routing_predictor_experts_missed",
-            "routing_predictor_bytes_wasted"
+            "routing_predictor_bytes_wasted",
+            "routing_predictor_model",
+            "routing_predictor_variant",
 
 
         };
@@ -1815,7 +1866,8 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "expert_cache_size" || field == "expert_cache_period" || field == "flash_attn") {
+            field == "expert_cache_size" || field == "expert_cache_period" || field == "flash_attn" ||
+            field == "routing_predictor_variant") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1825,7 +1877,7 @@ struct test {
         if (field == "avg_ts" || field == "stddev_ts" || field == "ffn_split") {
             return FLOAT;
         }
-        if (field == "load_mode") {
+        if (field == "load_mode" || field == "routing_predictor_model") {
             return STRING;
         }
         if (field == "expert_cache_requests" ||
@@ -1977,7 +2029,9 @@ struct test {
                                             std::to_string(routing_predictor_stats.experts_fully_hidden),
                                             std::to_string(routing_predictor_stats.experts_partially_hidden),
                                             std::to_string(routing_predictor_stats.experts_missed),
-                                            std::to_string(routing_predictor_stats.bytes_wasted) };
+                                            std::to_string(routing_predictor_stats.bytes_wasted),
+                                            routing_predictor_model,
+                                            std::to_string(routing_predictor_variant) };
         return values;
     }
 

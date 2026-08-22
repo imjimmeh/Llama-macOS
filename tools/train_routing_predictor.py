@@ -1,260 +1,173 @@
 #!/usr/bin/env python3
 """
-Phase 5D: Train low-rank routing predictor model
+Train a low-rank MLP routing predictor (variant B) and emit an LRPD binary
+that the C++ loader (ggml-routing-predictor.cpp load_model) reads.
 
-This script trains a lightweight predictor that learns to predict expert routing
-decisions from hidden states. The model uses a low-rank architecture to minimize
-computational overhead during inference.
+Input:  training_data.bin produced by collect_router_features.py
+        header: magic "RPDS"(0x52504453), version(2), int32 num_experts, int32 horizon
+        row:    int32 layer, int32 token_id,
+                float32[num_experts] router_logits,
+                int8[num_experts]   future_mask (1 at future-selected ids)
 
-Architecture:
-- Input: hidden_state (256 dims)
-- Low-rank projection: 256 -> 32 -> 256
-- Output: expert_logits (num_experts)
-- Loss: cross-entropy on top-k experts
+Output: model.bin in LRPD format
+        header: magic "LRPD"(0x4C525044), version(2),
+                int32 input_dim, int32 rank, int32 num_experts
+        body:   float32 down_weight[rank*input_dim],
+                float32 down_bias[rank],
+                float32 output_weight[num_experts*rank],
+                float32 output_bias[num_experts]
+
+Model: x -> GELU(W_down x + b_down) -> W_out h + b_out -> logits
+       top-k of softmax(logits) predicts the experts at layer L+horizon.
 
 Usage:
-    python train_routing_predictor.py <trace_file> --output model.bin
+    python train_routing_predictor.py training_data.bin --output model.bin --rank 32 --epochs 200
 """
 
 import argparse
 import struct
 import numpy as np
-import sys
-from pathlib import Path
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import Dataset, DataLoader
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    print("Warning: PyTorch not available, cannot train model")
+RPDS_MAGIC = 0x52504453  # "RPDS"
+LRPD_MAGIC = 0x4C525044  # "LRPD"
+LRPD_VERSION = 2
 
 
-# Sample structure (must match C++ definition)
-SAMPLE_FORMAT = '<ii256f8fi'  # layer, token_id, hidden_state[256], expert_ids[8], n_experts
-SAMPLE_SIZE = struct.calcsize(SAMPLE_FORMAT)
+def load_training_data(path):
+    with open(path, 'rb') as f:
+        magic, version = struct.unpack('<II', f.read(8))
+        assert magic == RPDS_MAGIC, f"bad magic {magic:#x}"
+        assert version == 2, f"unsupported version {version}"
+        num_experts, horizon = struct.unpack('<ii', f.read(8))
+        row_size = 8 + num_experts * 4 + num_experts  # layer+token, floats, int8 mask
+        rest = f.read()
+    n_rows = len(rest) // row_size
+    X = np.zeros((n_rows, num_experts), dtype=np.float32)
+    Y = np.zeros((n_rows, num_experts), dtype=np.float32)
+    for i in range(n_rows):
+        off = i * row_size
+        # layer, token_id (skip)
+        logits = np.frombuffer(rest, dtype=np.float32, count=num_experts, offset=off + 8)
+        mask = np.frombuffer(rest, dtype=np.int8, count=num_experts, offset=off + 8 + num_experts * 4)
+        X[i] = logits
+        Y[i] = mask.astype(np.float32)
+    return X, Y, num_experts, horizon
 
 
-class RoutingDataset(Dataset):
-    """Dataset for routing prediction training"""
-    
-    def __init__(self, trace_file):
-        self.samples = []
-        self._load_trace(trace_file)
-    
-    def _load_trace(self, trace_file):
-        """Load binary trace file"""
-        with open(trace_file, 'rb') as f:
-            while True:
-                data = f.read(SAMPLE_SIZE)
-                if len(data) < SAMPLE_SIZE:
-                    break
-                
-                fields = struct.unpack(SAMPLE_FORMAT, data)
-                layer = fields[0]
-                token_id = fields[1]
-                hidden_state = np.array(fields[2:258], dtype=np.float32)
-                expert_ids = np.array(fields[258:266], dtype=np.int64)
-                n_experts = fields[266]
-                
-                # Only use samples with valid experts
-                if n_experts > 0:
-                    self.samples.append({
-                        'layer': layer,
-                        'token_id': token_id,
-                        'hidden_state': hidden_state,
-                        'expert_ids': expert_ids[:n_experts]
-                    })
-        
-        print(f"Loaded {len(self.samples)} samples")
-    
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        return {
-            'hidden_state': torch.tensor(sample['hidden_state'], dtype=torch.float32),
-            'expert_ids': torch.tensor(sample['expert_ids'], dtype=torch.long)
-        }
+def gelu(x):
+    return 0.5 * x * (1.0 + np.tanh(0.7978845608 * (x + 0.044715 * x ** 3)))
 
 
-class LowRankPredictor(nn.Module):
-    """
-    Low-rank routing predictor
-    
-    Architecture:
-    - Input projection: 256 -> rank
-    - Output projection: rank -> 256
-    - Final layer: 256 -> num_experts
-    """
-    
-    def __init__(self, input_dim=256, rank=32, num_experts=128):
-        super().__init__()
-        self.input_dim = input_dim
-        self.rank = rank
-        self.num_experts = num_experts
-        
-        # Low-rank bottleneck
-        self.down_proj = nn.Linear(input_dim, rank, bias=False)
-        self.up_proj = nn.Linear(rank, input_dim, bias=False)
-        
-        # Output projection
-        self.output_proj = nn.Linear(input_dim, num_experts)
-        
-        # Activation
-        self.act = nn.GELU()
-    
-    def forward(self, hidden_state):
-        """
-        Args:
-            hidden_state: [batch, input_dim]
-        
-        Returns:
-            logits: [batch, num_experts]
-        """
-        # Low-rank bottleneck
-        x = self.down_proj(hidden_state)
-        x = self.act(x)
-        x = self.up_proj(x)
-        x = self.act(x)
-        
-        # Output logits
-        logits = self.output_proj(x)
-        return logits
+def softmax(x, axis=-1):
+    x = x - x.max(axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)
 
 
-def train_model(dataset, num_experts=128, epochs=10, batch_size=256, lr=1e-3, rank=32):
-    """Train the predictor model"""
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Training on device: {device}")
-    
-    # Create model
-    model = LowRankPredictor(input_dim=256, rank=rank, num_experts=num_experts).to(device)
-    
-    # Create data loader
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    
-    # Optimizer and loss
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss()
-    
-    # Training loop
-    model.train()
-    for epoch in range(epochs):
+def train(X, Y, rank, epochs, lr, seed=0):
+    rng = np.random.default_rng(seed)
+    n, input_dim = X.shape
+    num_experts = Y.shape[1]
+
+    # Init: small random
+    Wd = (rng.standard_normal((rank, input_dim)) * 0.02).astype(np.float32)
+    bd = np.zeros(rank, dtype=np.float32)
+    Wo = (rng.standard_normal((num_experts, rank)) * 0.02).astype(np.float32)
+    bo = np.zeros(num_experts, dtype=np.float32)
+
+    # Targets: distribution putting mass on future-selected experts
+    # If a row has k positives, target prob = 1/k on each; else uniform.
+    pos = Y.sum(axis=1, keepdims=True)
+    pos = np.where(pos > 0, pos, 1.0)
+    T = Y / pos
+    # Rows with no positives: uniform target (keeps gradient bounded)
+    none_mask = (Y.sum(axis=1) == 0).astype(np.float32)[:, None]
+    T = T * (1 - none_mask) + (1.0 / num_experts) * none_mask
+
+    batch = min(256, n)
+    for ep in range(epochs):
+        perm = rng.permutation(n)
         total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-        
-        for batch in loader:
-            hidden_states = batch['hidden_state'].to(device)
-            expert_ids = batch['expert_ids'].to(device)
-            
-            # Forward pass
-            logits = model(hidden_states)
-            
-            # Compute loss on top-1 expert (simplified)
-            # In practice, you might want to use top-k or weighted loss
-            target = expert_ids[:, 0]  # Use first expert as target
-            loss = criterion(logits, target)
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            # Metrics
-            total_loss += loss.item() * hidden_states.size(0)
-            preds = logits.argmax(dim=1)
-            total_correct += (preds == target).sum().item()
-            total_samples += hidden_states.size(0)
-        
-        avg_loss = total_loss / total_samples
-        accuracy = total_correct / total_samples
-        print(f"Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f}, accuracy={accuracy:.4f}")
-    
-    return model
+        for start in range(0, n, batch):
+            idx = perm[start:start + batch]
+            xb = X[idx]
+            tb = T[idx]
+
+            h = gelu(xb @ Wd.T + bd)               # [b, rank]
+            logits = h @ Wo.T + bo                 # [b, num_experts]
+            p = softmax(logits, axis=1)            # [b, num_experts]
+
+            # cross-entropy loss against target distribution
+            loss = -np.sum(tb * np.log(p + 1e-9)) / len(idx)
+            total_loss += loss * len(idx)
+
+            # gradient
+            glogits = (p - tb) / len(idx)          # [b, num_experts]
+            gWo = glogits.T @ h                    # [num_experts, rank]
+            gbo = glogits.sum(axis=0)              # [num_experts]
+            gh = glogits @ Wo                      # [b, rank]
+            gpre = gh * (1.0 - np.tanh(0.7978845608 * (xb @ Wd.T + bd + 0.044715 * (xb @ Wd.T + bd) ** 3)) ** 2)
+            gWd = gpre.T @ xb                      # [rank, input_dim]
+            gbd = gpre.sum(axis=0)                 # [rank]
+
+            Wo -= lr * gWo
+            bo -= lr * gbo
+            Wd -= lr * gWd
+            bd -= lr * gbd
+
+        if (ep + 1) % max(1, epochs // 10) == 0 or ep == 0:
+            k = min(8, num_experts)
+            topk = np.argpartition(-logits, k - 1, axis=1)[:, :k]
+            hits = 0.0
+            for i in range(n):
+                if Y[i].sum() == 0:
+                    continue
+                hits += len(set(topk[i].tolist()) & set(np.where(Y[i] > 0)[0].tolist())) / min(k, int(Y[i].sum()))
+            denom = max(1, int((Y.sum(axis=1) > 0).sum()))
+            print(f"  epoch {ep+1:4d}  loss={total_loss/n:.4f}  recall@8={hits/denom:.3f}")
+
+    return Wd, bd, Wo, bo
 
 
-def save_model(model, output_path):
-    """Save model in binary format for C++ loading"""
-    
-    # Extract weights
-    down_weight = model.down_proj.weight.detach().cpu().numpy()  # [rank, input_dim]
-    up_weight = model.up_proj.weight.detach().cpu().numpy()      # [input_dim, rank]
-    output_weight = model.output_proj.weight.detach().cpu().numpy()  # [num_experts, input_dim]
-    output_bias = model.output_proj.bias.detach().cpu().numpy()  # [num_experts]
-    
-    # Write binary format
-    with open(output_path, 'wb') as f:
-        # Header
-        magic = 0x4C525044  # "LRPD" (Low-Rank Predictor)
-        version = 1
-        f.write(struct.pack('<II', magic, version))
-        
-        # Dimensions
-        input_dim = model.input_dim
-        rank = model.rank
-        num_experts = model.num_experts
-        f.write(struct.pack('<III', input_dim, rank, num_experts))
-        
-        # Weights (row-major)
-        f.write(down_weight.astype(np.float32).tobytes())
-        f.write(up_weight.astype(np.float32).tobytes())
-        f.write(output_weight.astype(np.float32).tobytes())
-        f.write(output_bias.astype(np.float32).tobytes())
-    
-    print(f"Model saved to {output_path}")
-    print(f"  Input dim: {input_dim}")
-    print(f"  Rank: {rank}")
-    print(f"  Num experts: {num_experts}")
-    print(f"  Total parameters: {down_weight.size + up_weight.size + output_weight.size + output_bias.size}")
+def save_model(path, Wd, bd, Wo, bo, num_experts, rank):
+    input_dim = Wd.shape[1]
+    with open(path, 'wb') as f:
+        f.write(struct.pack('<II', LRPD_MAGIC, LRPD_VERSION))
+        f.write(struct.pack('<iii', input_dim, rank, num_experts))
+        # down_weight [rank, input_dim] row-major = Wd
+        f.write(Wd.astype(np.float32).tobytes())
+        f.write(bd.astype(np.float32).tobytes())
+        # output_weight [num_experts, rank] row-major = Wo
+        f.write(Wo.astype(np.float32).tobytes())
+        f.write(bo.astype(np.float32).tobytes())
+    print(f"Saved LRPD model to {path}")
+    print(f"  input_dim={input_dim} rank={rank} num_experts={num_experts}")
 
 
 def main():
-    if not HAS_TORCH:
-        print("Error: PyTorch is required for training")
-        sys.exit(1)
-    
-    parser = argparse.ArgumentParser(description='Train low-rank routing predictor')
-    parser.add_argument('trace_file', help='Path to hidden state trace file')
-    parser.add_argument('--output', '-o', default='predictor.bin', help='Output model path')
-    parser.add_argument('--num-experts', type=int, default=128, help='Number of experts')
-    parser.add_argument('--epochs', type=int, default=10, help='Training epochs')
-    parser.add_argument('--batch-size', type=int, default=256, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--rank', type=int, default=32, help='Low-rank dimension')
-    args = parser.parse_args()
-    
-    # Load dataset
-    print(f"Loading dataset from {args.trace_file}...")
-    dataset = RoutingDataset(args.trace_file)
-    
-    if len(dataset) == 0:
-        print("Error: No samples in dataset")
-        sys.exit(1)
-    
-    # Train model
-    print(f"\nTraining model...")
-    model = train_model(
-        dataset,
-        num_experts=args.num_experts,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        rank=args.rank
-    )
-    
-    # Save model
-    print(f"\nSaving model...")
-    save_model(model, args.output)
-    
-    print("\nTraining complete!")
+    ap = argparse.ArgumentParser(description="Train low-rank MLP routing predictor")
+    ap.add_argument("input", help="training_data.bin from collect_router_features.py")
+    ap.add_argument("--output", default="model.bin", help="output LRPD model path")
+    ap.add_argument("--rank", type=int, default=32, help="low-rank trunk dimension")
+    ap.add_argument("--epochs", type=int, default=200, help="training epochs")
+    ap.add_argument("--lr", type=float, default=1e-2, help="learning rate")
+    args = ap.parse_args()
+
+    print(f"Loading training data from {args.input}")
+    X, Y, num_experts, horizon = load_training_data(args.input)
+    print(f"  {X.shape[0]} samples, num_experts={num_experts}, horizon={horizon}")
+
+    if X.shape[0] == 0:
+        print("No training samples; aborting")
+        return 1
+
+    print(f"Training (rank={args.rank}, epochs={args.epochs}, lr={args.lr})")
+    Wd, bd, Wo, bo = train(X, Y, args.rank, args.epochs, args.lr)
+
+    save_model(args.output, Wd, bd, Wo, bo, num_experts, args.rank)
+    print("Done")
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1491,14 +1491,26 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     // Phase 5D: Initialize routing predictor if expert cache is enabled
     if (cparams.expert_cache_size > 0 && hparams.n_expert > 0) {
         ggml_routing_predictor_config config = {};
-        config.type = GGML_ROUTING_PREDICTOR_STALE_FUTURE;  // Start with variant A
+        const bool have_model = !cparams.routing_predictor_model.empty();
+        // model path implies low-rank MLP even if the variant flag was left at default
+        config.type = (ggml_routing_predictor_type) (have_model && cparams.routing_predictor_variant == 0
+            ? GGML_ROUTING_PREDICTOR_LOW_RANK_MLP : cparams.routing_predictor_variant);
         config.input_dim = hparams.n_expert;  // Router logits dimension
         config.num_experts = hparams.n_expert;
         config.horizon = cparams.routing_predictor_horizon;  // Configurable horizon
         config.rank = 32;  // Low-rank dimension for variants B/C
-        config.model_path = nullptr;  // No model for variant A
-        
+        config.model_path = have_model ? cparams.routing_predictor_model.c_str() : nullptr;
+
         res->routing_predictor = ggml_routing_predictor_init(&config);
+        if (!res->routing_predictor) {
+            // fall back to variant A rather than crashing a benchmark run
+            LLAMA_LOG_WARN("%s: routing predictor init failed, falling back to stale-future\n", __func__);
+            config.model_path = nullptr;
+            res->routing_predictor = ggml_routing_predictor_init(&config);
+        }
+        res->predictor_horizon = config.horizon;
+        res->predictor_depth   = std::min<int>(config.num_experts, hparams.n_expert_used * 2);
+        res->predictor_depth   = std::min<int>(res->predictor_depth, 32);
         if (res->routing_predictor) {
             // Allocate pinned host buffer for faster D2H transfer
             size_t logits_size = hparams.n_expert * sizeof(float);
@@ -3979,81 +3991,105 @@ bool llm_graph_context::routing_predictor_callback(
     ggml_tensor * tensor,
     bool ask,
     void * user_data) {
-    
-    if (!tensor || !user_data || ask) return false;
-    
-    // Check if this is a router logits tensor
-    if (tensor->name && strstr(tensor->name, "ffn_moe_logits")) {
-        llm_graph_result * res = static_cast<llm_graph_result*>(user_data);
-        
-        if (!res->routing_predictor) return false;
-        
-        // Increment prediction counter
-        res->predictor_metrics.predictions_generated++;
-        
-        // Only run predictor for single token decode
-        if (tensor->ne[1] != 1) return false;
-        
-        // Extract logits data
-        int32_t n_experts = tensor->ne[0];
-        size_t logits_bytes = n_experts * sizeof(float);
-        
-        // Use pinned buffer for faster D2H transfer
-        float * logits_ptr = res->pinned_logits_buffer;
-        if (!logits_ptr || res->pinned_logits_capacity < logits_bytes) {
-            // Fallback to stack allocation if pinned buffer not available
-            std::vector<float> logits(n_experts);
-            logits_ptr = logits.data();
+
+    llm_graph_result * res = static_cast<llm_graph_result*>(user_data);
+
+     const bool is_moe_logits = tensor && tensor->name && strstr(tensor->name, "ffn_moe_logits");
+
+    if (ask) {
+        // Scheduler asks whether we want to observe this node. Ourselves we
+        // only care about ffn_moe_logits; otherwise defer to the chained
+        // user callback so its nodes still get observed.
+        if (is_moe_logits) {
+            return true;
         }
-        
-        // Copy logits from device to host (faster with pinned memory)
-        ggml_backend_tensor_get(tensor, logits_ptr, 0, logits_bytes);
-        
-        // Extract features
-        std::vector<float> features(n_experts);
-        ggml_routing_predictor_extract_features(
-            res->routing_predictor,
-            logits_ptr,
-            n_experts,
-            features.data()
-        );
-        
-        // Run prediction
-        int32_t predicted_ids[16];
-        float confidences[16];
-        int32_t n_predicted = ggml_routing_predictor_predict(
-            res->routing_predictor,
-            features.data(),
-            predicted_ids,
-            confidences,
-            16
-        );
-        
-        // Submit predictions to expert cache for prefetching
-        if (n_predicted > 0) {
-            // Extract layer number from tensor name (e.g., "blk.5.ffn_moe_logits" -> layer 5)
-            int32_t current_layer = -1;
-            if (tensor->name) {
-                const char * blk_pos = strstr(tensor->name, "blk.");
-                if (blk_pos) {
-                    current_layer = atoi(blk_pos + 4);
-                }
-            }
-            
-            if (current_layer >= 0) {
-                int32_t target_layer = current_layer + 8;  // Predict 8 layers ahead
-                
-                ggml_backend_sched_submit_prediction(
-                    res->sched,
-                    res->predictor_backend_idx,
-                    target_layer,
-                    predicted_ids,
-                    n_predicted,
-                    confidences
-                );
-            }
+        if (res && res->prev_cb) {
+            return res->prev_cb(tensor, true, res->prev_cb_user_data);
+        }
+        return false;
+    }
+
+    // ask == false: observation pass. Returning false cancels the split's
+    // remaining compute, so never return false here.
+    if (!res || !tensor || !res->routing_predictor || !is_moe_logits) {
+        if (res && res->prev_cb) {
+            return res->prev_cb(tensor, false, res->prev_cb_user_data);
+        }
+        return true;
+    }
+
+
+    // Only run predictor for single-token decode (ne[1] == 1)
+    if (tensor->ne[1] != 1) {
+        return true;
+    }
+
+    const int32_t n_experts = tensor->ne[0];
+    const size_t  logits_bytes = (size_t)n_experts * sizeof(float);
+
+    // Hoist fallback buffer so logits_ptr stays alive through tensor_get
+    std::vector<float> logits_fallback;
+    const float * logits_ptr = nullptr;
+    if (res->pinned_logits_buffer && res->pinned_logits_capacity >= logits_bytes) {
+        logits_ptr = res->pinned_logits_buffer;
+    } else {
+        logits_fallback.resize(n_experts);
+        logits_ptr = logits_fallback.data();
+    }
+
+    ggml_backend_tensor_get(tensor, (void *)logits_ptr, 0, logits_bytes);
+
+    std::vector<float> features(n_experts);
+    ggml_routing_predictor_extract_features(
+        res->routing_predictor,
+        logits_ptr,
+        n_experts,
+        features.data()
+    );
+
+    // Stage logits so the expert-cache route trace (v2) can attach them
+    // to this layer's next trace entry
+    {
+        const char * blk_pos = strstr(tensor->name, "blk.");
+        if (blk_pos) {
+            const int32_t layer = atoi(blk_pos + 4);
+            ggml_backend_sched_record_router_logits(res->sched,
+                    res->predictor_backend_idx, layer, logits_ptr, n_experts);
         }
     }
-    
-    return false;
+
+    int32_t predicted_ids[32];
+    float   confidences[32];
+    const int32_t n_predicted = ggml_routing_predictor_predict(
+        res->routing_predictor,
+        features.data(),
+        predicted_ids,
+        confidences,
+        res->predictor_depth
+    );
+
+    if (n_predicted > 0) {
+        ggml_backend_sched_add_predictions_generated(res->sched, res->predictor_backend_idx, 1);
+
+
+        int32_t current_layer = -1;
+        const char * blk_pos = strstr(tensor->name, "blk.");
+        if (blk_pos) {
+            current_layer = atoi(blk_pos + 4);
+        }
+
+        if (current_layer >= 0) {
+            const int32_t target_layer = current_layer + res->predictor_horizon;
+            ggml_backend_sched_submit_prediction(
+                res->sched,
+                res->predictor_backend_idx,
+                target_layer,
+                predicted_ids,
+                n_predicted,
+                confidences
+            );
+        }
+    }
+
+    return true;
 }

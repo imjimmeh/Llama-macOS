@@ -1749,6 +1749,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.expert_cache_period = params.expert_cache_period;
     cparams.expert_cache_max_swaps = params.expert_cache_max_swaps;
     cparams.expert_cache_stats  = params.expert_cache_stats;
+    cparams.routing_predictor_horizon = params.routing_predictor_horizon;
+    cparams.routing_predictor_model   = params.routing_predictor_model.empty() ? nullptr : params.routing_predictor_model.c_str();
+    cparams.routing_predictor_variant = params.routing_predictor_variant;
+    cparams.routing_predictor_stats   = params.routing_predictor_stats;
 
     return cparams;
 }

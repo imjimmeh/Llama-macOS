@@ -1606,6 +1606,17 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Phase 5D: The expert cache uses sched->hv_tensor_copies for per-backend copies, so a
+// MUL_MAT_ID's src[0] in the split graph points to the ORIGINAL weight tensor (when
+// the weight is already on the split's backend, no copy is created and the graph
+// keeps the original pointer). The find function below must therefore match by
+// tensor identity (via ggml_hash_find_or_insert), not by raw pointer.
+//
+// To avoid requiring access to the sched hash table from outside, we accept a small
+// false-negative rate here and match by NAME + LAYER. This is correct for the MoE
+// expert weights we care about: each weight tensor is uniquely named
+// "blk.N.ffn_{gate,up,down}_exps.weight", and the split's input tensors are CPU
+// copies of OTHER tensors (norms, embeddings, intermediate states).
 struct ggml_tensor * ggml_backend_find_mul_mat_id_node(
         const struct ggml_cgraph * graph,
         const struct ggml_tensor * input) {
@@ -1613,14 +1624,57 @@ struct ggml_tensor * ggml_backend_find_mul_mat_id_node(
         return NULL;
     }
 
-    for (int i = 0; i < graph->n_nodes; ++i) {
+    static int dbg_find = 0;
+    int match_idx = -1;
+
+    // First, exact pointer match (works when src[0] was rewritten to the copy).
+    for (int i = 0; i < graph->n_nodes && match_idx < 0; ++i) {
         struct ggml_tensor * node = graph->nodes[i];
         if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input) {
-            return node;
+            match_idx = i;
+            break;
         }
     }
 
-    return NULL;
+    // Fallback: match by base name. The copy tensor's name looks like
+    // "<backend>#<base_name>#<copy_id>". Strip the prefix/suffix and compare.
+    if (match_idx < 0 && input->name && input->name[0] != '\0') {
+        const char * base = input->name;
+        // Strip leading "<backend>#"
+        const char * hash_pos = strchr(base, '#');
+        if (hash_pos != NULL) {
+            base = hash_pos + 1;
+            // Strip trailing "#<digits>"
+            const char * last_hash = strrchr(base, '#');
+            if (last_hash != NULL) {
+                bool all_digits = true;
+                for (const char * p = last_hash + 1; *p; ++p) {
+                    if (*p < '0' || *p > '9') { all_digits = false; break; }
+                }
+                if (all_digits) {
+                    char stripped[256];
+                    size_t len = (size_t)(last_hash - base);
+                    if (len < sizeof(stripped)) {
+                        memcpy(stripped, base, len);
+                        stripped[len] = '\0';
+                        base = stripped;
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < graph->n_nodes && match_idx < 0; ++i) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT_ID &&
+                node->src[0] && node->src[0]->name &&
+                strcmp(node->src[0]->name, base) == 0) {
+                match_idx = i;
+                break;
+            }
+        }
+    }
+
+    if (match_idx < 0) return NULL;
+    return graph->nodes[match_idx];
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
@@ -1805,13 +1859,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             if (layer >= 0) {
                                 ggml_backend_expert_cache_record_route_trace(
                                     cache, layer, requested_experts.data(), (int32_t)requested_experts.size());
-                            }
-                        }
-
-                        // Phase 5C: Record current experts and predict next layer
-                        if (!requested_experts.empty()) {
-                            int32_t layer = ggml_backend_expert_cache_get_tensor_layer(input);
-                            if (layer >= 0) {
                                 // Record this layer's experts for transition table
                                 ggml_backend_expert_cache_record_prediction(
                                     cache, layer, requested_experts.data(), (int32_t)requested_experts.size());
@@ -1826,6 +1873,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     ggml_backend_expert_cache_prefetch_async(
                                         cache, input, predicted_experts, n_predicted, next_layer);
                                 }
+                            }
+                        }
+
+                        // Phase 5D: settle any pending prediction for this layer
+                        if (!requested_experts.empty()) {
+                            int32_t layer = ggml_backend_expert_cache_get_tensor_layer(input);
+                            if (layer >= 0 &&
+                                ggml_backend_expert_cache_pending_prediction_count(cache) > 0) {
+                                const size_t pool_stride_bytes =
+                                    (size_t)(ggml_nbytes(input) / input->ne[2]);
+                                ggml_backend_expert_cache_settle_prediction(cache, layer,
+                                        requested_experts.data(), (int32_t)requested_experts.size(),
+                                        pool_stride_bytes);
                             }
                         }
 
@@ -2372,6 +2432,11 @@ void ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size
             if (sched->expert_caches[b] && sched->expert_cache_period > 0) {
                 ggml_backend_expert_cache_set_period(sched->expert_caches[b], sched->expert_cache_period);
             }
+            // Route trace v2 opt-in via environment variable
+            const char * trace_path = getenv("GGML_EXPERT_ROUTE_TRACE");
+            if (sched->expert_caches[b] && trace_path && trace_path[0]) {
+                ggml_backend_expert_cache_enable_route_trace(sched->expert_caches[b], trace_path, 0);
+            }
         }
     }
 }
@@ -2395,7 +2460,6 @@ void ggml_backend_sched_set_expert_cache_max_swaps(ggml_backend_sched_t sched, i
         }
     }
 }
-
 void ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
@@ -2410,14 +2474,27 @@ void ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched) {
 bool ggml_backend_sched_get_routing_predictor_stats(
     ggml_backend_sched_t sched,
     struct ggml_routing_predictor_stats * out_stats) {
-    
-    if (!sched || !out_stats) return false;
-    
-    // Access the graph result to get metrics
-    // This requires exposing the graph result through the scheduler
-    // For now, return false to indicate not implemented
-    // TODO: Implement proper metrics retrieval
-    return false;
+    if (sched == NULL || out_stats == NULL) {
+        return false;
+    }
+    memset(out_stats, 0, sizeof(*out_stats));
+    bool found = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        struct ggml_routing_predictor_stats s;
+        if (sched->expert_caches[b] &&
+            ggml_backend_expert_cache_get_routing_predictor_stats(sched->expert_caches[b], &s)) {
+            out_stats->predictions_generated     += s.predictions_generated;
+            out_stats->predictions_used          += s.predictions_used;
+            out_stats->predictions_too_late      += s.predictions_too_late;
+            out_stats->predictions_wrong         += s.predictions_wrong;
+            out_stats->experts_fully_hidden      += s.experts_fully_hidden;
+            out_stats->experts_partially_hidden  += s.experts_partially_hidden;
+            out_stats->experts_missed            += s.experts_missed;
+            out_stats->bytes_wasted              += s.bytes_wasted;
+            found = true;
+        }
+    }
+    return found;
 }
 
 bool ggml_backend_sched_get_expert_cache_stats(
@@ -2603,6 +2680,32 @@ void ggml_backend_sched_submit_prediction(
             expert_ids,
             n_experts,
             confidences);
+    }
+}
+
+void ggml_backend_sched_add_predictions_generated(
+        ggml_backend_sched_t sched,
+        int backend_idx,
+        int32_t n) {
+    if (sched == NULL || backend_idx < 0 || backend_idx >= sched->n_backends) {
+        return;
+    }
+    if (sched->expert_caches[backend_idx]) {
+        ggml_backend_expert_cache_add_predictions_generated(sched->expert_caches[backend_idx], n);
+    }
+}
+
+void ggml_backend_sched_record_router_logits(
+        ggml_backend_sched_t sched,
+        int backend_idx,
+        int32_t layer,
+        const float * logits,
+        int32_t n_logits) {
+    if (sched == NULL || backend_idx < 0 || backend_idx >= sched->n_backends) {
+        return;
+    }
+    if (sched->expert_caches[backend_idx]) {
+        ggml_backend_expert_cache_record_router_logits(sched->expert_caches[backend_idx], layer, logits, n_logits);
     }
 }
 

@@ -1,3 +1,7 @@
+#include <errno.h>
+#include <cstdio>
+static FILE * g_route_trace_file = nullptr;
+
 #include "ggml-backend-expert-cache.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
@@ -13,7 +17,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <map>
 #include <vector>
+#include <set>
 
 #define GGML_EXPERT_CACHE_ALIGN 512
 #define GGML_EXPERT_CACHE_PAD(x) (((x) + GGML_EXPERT_CACHE_ALIGN - 1) & ~(GGML_EXPERT_CACHE_ALIGN - 1))
@@ -177,6 +183,10 @@ struct ggml_backend_expert_cache {
     bool route_trace_enabled = false;
     FILE * route_trace_file = nullptr;
     std::vector<ggml_expert_cache_route_trace_entry> route_trace_buffer;
+    std::vector<float> route_trace_logits_buffer; // interleaved n_logits + blobs
+    std::vector<float> route_trace_staged_logits; // last logits per staging
+    int32_t route_trace_staged_layer = -1;
+    int32_t route_trace_staged_n = 0;
     size_t route_trace_max_entries = 0;
     uint64_t route_trace_token_id = 0;
 
@@ -201,7 +211,12 @@ struct ggml_backend_expert_cache {
     bool learned_predictor_loaded = false;
     void * learned_model = nullptr;  // Opaque pointer to model data
     
+    // Phase 5D: Pending predictions (one per target layer; latest replaces)
+    std::map<int32_t, ggml_expert_cache_pending_prediction> pending_predictions;
+    int32_t executed_layer_cursor = -1;
+
     struct ggml_backend_expert_cache_stats stats;
+
 };
 
 static int ggml_expert_cache_get_tensor_layer(const struct ggml_tensor * tensor) {
@@ -610,6 +625,7 @@ void ggml_backend_expert_cache_begin_step(ggml_backend_expert_cache_t cache) {
     if (cache->route_trace_enabled) {
         cache->route_trace_token_id++;
     }
+    cache->executed_layer_cursor = -1;
     if (cache->period_tokens > 0 && (cache->decode_step % (uint64_t)cache->period_tokens == 0)) {
         ggml_backend_expert_cache_rebalance(cache, cache->max_swaps);
     }
@@ -1893,7 +1909,6 @@ void ggml_backend_expert_cache_sync(ggml_backend_expert_cache_t cache) {
 }
 
 // Phase 5A: Route Trace Collection
-
 void ggml_backend_expert_cache_enable_route_trace(
         ggml_backend_expert_cache_t cache,
         const char * output_path,
@@ -1901,30 +1916,49 @@ void ggml_backend_expert_cache_enable_route_trace(
     if (cache == NULL || output_path == NULL) {
         return;
     }
-    
-    if (cache->route_trace_file != nullptr) {
-        fclose(cache->route_trace_file);
+    // Process-wide guard: ggml_backend_sched_set_expert_cache is invoked once per
+    // backend and re-invoked per slot load. Only the first call should open the
+    // file and set the shared FILE*; later calls just mark this cache as enabled
+    // so record_route_trace writes through the same handle.
+    if (g_route_trace_file == nullptr) {
+        cache->route_trace_file = fopen(output_path, "wb");
+        g_route_trace_file = cache->route_trace_file;
+        if (cache->route_trace_file == nullptr) {
+            GGML_LOG_ERROR("Failed to open route trace file: %s\n", output_path);
+            return;
+        }
+        const uint32_t magic = 0x52545243;
+        const uint32_t version = 2;
+        fwrite(&magic, sizeof(magic), 1, cache->route_trace_file);
+        fwrite(&version, sizeof(version), 1, cache->route_trace_file);
+        fflush(cache->route_trace_file);
+    } else {
+        // Reuse the file handle opened by the first caller.
+        cache->route_trace_file = g_route_trace_file;
     }
-    
-    cache->route_trace_file = fopen(output_path, "wb");
-    if (cache->route_trace_file == nullptr) {
-        GGML_LOG_ERROR("Failed to open route trace file: %s\n", output_path);
-        return;
-    }
-    
-    // Write magic header
-    const uint32_t magic = 0x52545243; // "RTRC"
-    const uint32_t version = 1;
-    fwrite(&magic, sizeof(magic), 1, cache->route_trace_file);
-    fwrite(&version, sizeof(version), 1, cache->route_trace_file);
-    
+
     cache->route_trace_enabled = true;
     cache->route_trace_max_entries = max_entries > 0 ? max_entries : 1000000;
-    cache->route_trace_buffer.clear();
-    cache->route_trace_buffer.reserve(std::min(max_entries, (size_t)10000));
+    // Do NOT clear route_trace_buffer here: it's per-cache and accumulates entries
+    // from record_route_trace between flushes. Clearing on every slot init would
+    // drop all entries before they can be flushed.
     cache->route_trace_token_id = 0;
-    
+
     GGML_LOG_INFO("Route trace enabled: %s (max %zu entries)\n", output_path, cache->route_trace_max_entries);
+}
+
+void ggml_backend_expert_cache_record_router_logits(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const float * logits,
+        int32_t n_logits) {
+    if (cache == NULL || !cache->route_trace_enabled || logits == NULL || n_logits <= 0) {
+        return;
+    }
+
+    cache->route_trace_staged_layer = layer;
+    cache->route_trace_staged_n = n_logits;
+    cache->route_trace_staged_logits.assign(logits, logits + n_logits);
 }
 
 void ggml_backend_expert_cache_record_route_trace(
@@ -1935,17 +1969,13 @@ void ggml_backend_expert_cache_record_route_trace(
     if (cache == NULL || !cache->route_trace_enabled || expert_ids == NULL || n_experts <= 0) {
         return;
     }
-    
-    if (cache->route_trace_buffer.size() >= cache->route_trace_max_entries) {
-        return; // buffer full
-    }
-    
+
     ggml_expert_cache_route_trace_entry entry;
     entry.token_id = cache->route_trace_token_id;
     entry.layer = layer;
     entry.n_experts = n_experts;
     entry.timestamp_us = ggml_time_us();
-    
+
     // Copy expert IDs (cap at 64)
     const int32_t copy_count = std::min(n_experts, 64);
     for (int32_t i = 0; i < copy_count; i++) {
@@ -1954,13 +1984,27 @@ void ggml_backend_expert_cache_record_route_trace(
     for (int32_t i = copy_count; i < 64; i++) {
         entry.expert_ids[i] = -1; // padding
     }
-    
+
     cache->route_trace_buffer.push_back(entry);
-    
-    // Flush if buffer is large
-    if (cache->route_trace_buffer.size() >= 10000) {
-        ggml_backend_expert_cache_flush_route_trace(cache);
+
+    // v2: variable-length logits blob follows each fixed-size entry.
+    const bool have_logits = cache->route_trace_staged_layer == layer &&
+                             cache->route_trace_staged_n > 0 &&
+                             !cache->route_trace_staged_logits.empty();
+    if (have_logits) {
+        const int32_t n = cache->route_trace_staged_n;
+        cache->route_trace_logits_buffer.push_back(n);
+        cache->route_trace_logits_buffer.insert(cache->route_trace_logits_buffer.end(),
+                cache->route_trace_staged_logits.begin(), cache->route_trace_staged_logits.begin() + n);
+        cache->route_trace_staged_layer = -1;
+        cache->route_trace_staged_n = 0;
+    } else {
+        cache->route_trace_logits_buffer.push_back(0);
     }
+
+    // Flush every entry: SIGTERM on Windows kills without running destructors,
+    // so the buffer must be drained immediately to survive abrupt shutdown.
+    ggml_backend_expert_cache_flush_route_trace(cache);
 }
 
 void ggml_backend_expert_cache_flush_route_trace(
@@ -1968,32 +2012,49 @@ void ggml_backend_expert_cache_flush_route_trace(
     if (cache == NULL || cache->route_trace_file == nullptr || cache->route_trace_buffer.empty()) {
         return;
     }
-    
-    fwrite(cache->route_trace_buffer.data(),
-           sizeof(ggml_expert_cache_route_trace_entry),
-           cache->route_trace_buffer.size(),
-           cache->route_trace_file);
+
+    // Write each entry directly. FILE* is shared across caches and was opened
+    // in "wb" mode by the first caller; after writing the 8-byte header the
+    // file position is past the header, so subsequent writes append naturally.
+    size_t logits_pos = 0;
+    for (const auto & e : cache->route_trace_buffer) {
+        GGML_ASSERT(logits_pos < cache->route_trace_logits_buffer.size());
+        const int32_t n_logits = cache->route_trace_logits_buffer[logits_pos++];
+        fwrite(&e, sizeof(e), 1, cache->route_trace_file);
+        fwrite(&n_logits, sizeof(n_logits), 1, cache->route_trace_file);
+        if (n_logits > 0) {
+            fwrite(cache->route_trace_logits_buffer.data() + logits_pos,
+                   sizeof(float), n_logits, cache->route_trace_file);
+            logits_pos += n_logits;
+        }
+    }
     fflush(cache->route_trace_file);
-    
+
     cache->route_trace_buffer.clear();
+    cache->route_trace_logits_buffer.clear();
 }
+
+
 
 void ggml_backend_expert_cache_disable_route_trace(
         ggml_backend_expert_cache_t cache) {
     if (cache == NULL) {
         return;
     }
-    
+
     cache->route_trace_enabled = false;
-    
+
     // Flush remaining entries
     ggml_backend_expert_cache_flush_route_trace(cache);
-    
-    if (cache->route_trace_file != nullptr) {
+
+    // Only close the file if it's not the process-wide shared handle.
+    // Multiple caches share the same FILE* via g_route_trace_file; closing it
+    // from one cache's disable leaves siblings with dangling pointers.
+    if (cache->route_trace_file != nullptr && cache->route_trace_file != g_route_trace_file) {
         fclose(cache->route_trace_file);
-        cache->route_trace_file = nullptr;
     }
-    
+    cache->route_trace_file = nullptr;
+
     GGML_LOG_INFO("Route trace disabled\n");
 }
 
@@ -2122,8 +2183,8 @@ bool ggml_backend_expert_cache_load_learned_predictor(
         return false;
     }
     
-    if (magic != 0x4C525044 || version != 1) {
-        GGML_LOG_ERROR("Invalid model file format\n");
+    if (magic != 0x4C525044 || (version != 1 && version != 2)) {
+        GGML_LOG_ERROR("Invalid model file format (magic=%#x version=%u)\n", magic, version);
         fclose(f);
         return false;
     }
@@ -2279,11 +2340,145 @@ void ggml_backend_expert_cache_submit_prediction(
         fprintf(stderr, "\n");
     }
 
-    // TODO: Integrate with async prefetch queue
-    // For now, predictions are logged but not used for prefetching
-    // Full integration requires:
-    // 1. Queue predictions by target_layer
-    // 2. When execution approaches target_layer, issue async prefetch
-    // 3. Use confidences to prioritize high-confidence predictions
+    // Queue the prediction for settle accounting; latest submission for a
+    // layer replaces the previous one.
+    auto & e = cache->pending_predictions[target_layer];
+    e.target_layer = target_layer;
+    e.n_experts = std::min(n_experts, (int32_t)64);
+    memcpy(e.expert_ids, expert_ids, e.n_experts * sizeof(int32_t));
+
+    // Prefetch the predicted experts' weights immediately (D2)
+    auto bit = cache->bundle_registrations.find(target_layer);
+    if (bit != cache->bundle_registrations.end()) {
+        if (bit->second.gate) ggml_backend_expert_cache_prefetch_async(cache, bit->second.gate, e.expert_ids, e.n_experts, target_layer);
+        if (bit->second.up)   ggml_backend_expert_cache_prefetch_async(cache, bit->second.up,   e.expert_ids, e.n_experts, target_layer);
+        if (bit->second.down) ggml_backend_expert_cache_prefetch_async(cache, bit->second.down, e.expert_ids, e.n_experts, target_layer);
+    }
+
+}
+
+static bool has_inflight_prefetch(ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor, int32_t expert_id) {
+    for (const auto & slot : cache->prefetch_slots) {
+        if (slot.tensor == tensor && slot.expert_id == expert_id &&
+            slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ggml_backend_expert_cache_settle_prediction(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const int32_t * actual_ids,
+        int32_t n_actual,
+        size_t pool_stride) {
+    if (!cache || !actual_ids || n_actual <= 0) {
+        return false;
+    }
+    auto it = cache->pending_predictions.find(layer);
+    if (it == cache->pending_predictions.end()) {
+        return false;
+    }
+
+    auto & s = cache->stats.routing_predictor;
+    if (layer <= cache->executed_layer_cursor) {
+        s.predictions_too_late++;
+    }
+    cache->executed_layer_cursor = layer;
+
+    const auto & p = it->second;
+    s.predictions_used++;
+
+    std::set<int32_t> actual_set(actual_ids, actual_ids + n_actual);
+
+    // Classify predicted experts that were actually used
+    auto bit = cache->bundle_registrations.find(layer);
+    for (int i = 0; i < p.n_experts; i++) {
+        const int32_t id = p.expert_ids[i];
+        if (!actual_set.count(id)) {
+            continue;
+        }
+        bool resident = false;
+        bool inflight = false;
+        if (bit != cache->bundle_registrations.end()) {
+            const struct ggml_tensor * tensors[3] = { bit->second.gate, bit->second.up, bit->second.down };
+            for (int t = 0; t < 3 && !resident; t++) {
+                if (!tensors[t]) continue;
+                if (ggml_backend_expert_cache_find_slot(cache, tensors[t], id) >= 0) {
+                    resident = true;
+                } else if (has_inflight_prefetch(cache, tensors[t], id)) {
+                    inflight = true;
+                }
+            }
+        }
+        if (resident) {
+            s.experts_fully_hidden++;
+        } else if (inflight) {
+            s.experts_partially_hidden++;
+        } else {
+            s.experts_missed++;
+        }
+    }
+
+    // Experts the layer wanted but we did not predict
+    for (int32_t id : actual_set) {
+        bool predicted = false;
+        for (int i = 0; i < p.n_experts; i++) {
+            predicted |= p.expert_ids[i] == id;
+        }
+        if (!predicted) {
+            s.predictions_wrong++;
+            s.bytes_wasted += (int64_t) pool_stride;
+        }
+    }
+
+    cache->pending_predictions.erase(it);
+    return true;
+}
+
+int32_t ggml_backend_expert_cache_pending_prediction_count(
+        ggml_backend_expert_cache_t cache) {
+    if (!cache) {
+        return 0;
+    }
+    return (int32_t) cache->pending_predictions.size();
+}
+
+int32_t ggml_backend_expert_cache_get_pending_prediction(
+        ggml_backend_expert_cache_t cache,
+        int32_t target_layer,
+        int32_t * out_ids,
+        int32_t max_ids) {
+    if (!cache || !out_ids || max_ids <= 0) {
+        return 0;
+    }
+    auto it = cache->pending_predictions.find(target_layer);
+    if (it == cache->pending_predictions.end()) {
+        return 0;
+    }
+    const int32_t n = std::min(it->second.n_experts, max_ids);
+    memcpy(out_ids, it->second.expert_ids, n * sizeof(int32_t));
+    return n;
+}
+
+bool ggml_backend_expert_cache_get_routing_predictor_stats(
+        ggml_backend_expert_cache_t cache,
+        struct ggml_routing_predictor_stats * out_stats) {
+    if (!cache || !out_stats) {
+        return false;
+    }
+    *out_stats = cache->stats.routing_predictor;
+    return true;
+}
+
+void ggml_backend_expert_cache_add_predictions_generated(
+        ggml_backend_expert_cache_t cache,
+        int32_t n) {
+    if (!cache || n <= 0) {
+        return;
+    }
+    cache->stats.routing_predictor.predictions_generated += n;
 }
 

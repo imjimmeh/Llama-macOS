@@ -415,4 +415,79 @@ For Variant C, additional residual weights follow the same pattern.
 
 ---
 
+## 12. Benchmark and Determinism Validation
+
+### Build verification
+
+All targets compile clean with MSVC Release:
+
+```
+cmake --build build --target test-routing-predictor test-expert-cache llama-bench --config Release
+```
+
+### Test results
+
+- `test-routing-predictor.exe`: all 6 tests pass (including LRPD v2 round-trip)
+- `test-expert-cache.exe`: all tests pass (route trace v2, prediction queue,
+  settle accounting, submit triggers prefetch, stats getter, route trace v2
+  logits)
+
+### CLI flags (llama-bench)
+
+```
+--routing-predictor-horizon <N>               lookahead layers for routing predictor (default: 8)
+--routing-predictor-stats                     print routing predictor performance statistics on exit
+--routing-predictor-model <path>              path to trained LRPD model (enables low-rank-mlp variant)
+--routing-predictor-variant <name>            routing predictor variant: stale-future|low-rank-mlp|future-residual (default: stale-future)
+```
+
+### Determinism matrix
+
+Row F added to `scripts/expert-cache-determinism-matrix.py`:
+
+| Row | Description | Expert cache | Extra args |
+-----|-------------|-------------|------------|
+| A | baseline (no expert cache) | off | |
+| B | expert cache on | 64M | |
+| E | expert cache on + MTP draft | 64M | --spec-type draft-mtp --spec-draft-n-max 2 --mtp-dynamic-offload |
+| F | expert cache on + routing predictor | 64M | --routing-predictor-horizon 8 --routing-predictor-stats |
+
+All four rows must produce the same SHA-256 for determinism to hold.
+
+### Live benchmark status: BLOCKED
+
+The target model `models/Qwen3.6-35B-A3B-APEX-Compact.gguf` is not present
+locally. The live benchmark and determinism run are blocked until the model
+file is available. When ready, run:
+
+```sh
+python scripts/expert-cache-determinism-matrix.py
+./build/bin/Release/llama-bench.exe -m models/Qwen3.6-35B-A3B-APEX-Compact.gguf \
+    --routing-predictor-horizon 8 --routing-predictor-stats \
+    -exc 64M -excp 64 -p 512 -n 128
+```
+
+### LRPD v2 binary format (trainer output)
+
+The trainer (`tools/train_routing_predictor.py`) writes LRPD v2 to match the
+init-time `load_model` in `ggml-routing-predictor.cpp`:
+
+```
+Magic: 0x4C525044 ("LRPD")
+Version: 2 (uint32)
+Input dim: 256 (int32)
+Rank: 32 (int32)
+Num experts: 256 (int32)
+down_weight: [rank * input_dim] floats
+down_bias: [rank] floats
+output_weight: [num_experts * rank] floats
+output_bias: [num_experts] floats
+```
+
+Note: version 2 dim order is {input_dim, rank, num_experts}, while the public
+`ggml_routing_predictor_load_model` reads version 1 with dim order
+{input_dim, num_experts, rank}. The init path (used by Variant B/C) reads v2.
+
+---
+
 **End of handover document**

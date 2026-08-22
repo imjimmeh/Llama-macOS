@@ -417,6 +417,8 @@ struct ggml_backend_expert_cache_stats {
 
         // Phase 5D: Learned Predictor Metrics
         uint64_t n_predictions_submitted;
+        struct ggml_routing_predictor_stats routing_predictor;
+
 
     };
 
@@ -437,6 +439,10 @@ struct ggml_backend_expert_cache_stats {
     GGML_API void                 ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched);
     // Submit predicted expert IDs for a future layer to trigger async prefetch
     GGML_API void                 ggml_backend_sched_submit_prediction(ggml_backend_sched_t sched, int backend_idx, int32_t target_layer, const int32_t * expert_ids, int32_t n_experts, const float * confidences);
+    // Forward a decode-only predictions_generated count from the graph callback
+    GGML_API void ggml_backend_sched_add_predictions_generated(ggml_backend_sched_t sched, int backend_idx, int32_t n);
+    // Stage router logits for route trace v2 (forwarded to the expert cache)
+    GGML_API void ggml_backend_sched_record_router_logits(ggml_backend_sched_t sched, int backend_idx, int32_t layer, const float * logits, int32_t n_logits);
 
     //
     // Meta backend

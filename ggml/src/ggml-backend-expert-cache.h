@@ -275,6 +275,7 @@ GGML_API void ggml_backend_expert_cache_sync(
     ggml_backend_expert_cache_t cache);
 
 // Phase 5A: Route Trace Collection for Predictability Analysis
+// v1: fixed-size entry without logits; v2 appends a variable-length logits blob
 struct ggml_expert_cache_route_trace_entry {
     uint64_t token_id;
     int32_t layer;
@@ -288,6 +289,8 @@ GGML_API void ggml_backend_expert_cache_enable_route_trace(
     const char * output_path,
     size_t max_entries);
 
+// logits may be staged via record_router_logits; entries without staging
+// get an empty blob that v2 readers skip
 GGML_API void ggml_backend_expert_cache_record_route_trace(
     ggml_backend_expert_cache_t cache,
     int32_t layer,
@@ -296,6 +299,13 @@ GGML_API void ggml_backend_expert_cache_record_route_trace(
 
 GGML_API void ggml_backend_expert_cache_flush_route_trace(
     ggml_backend_expert_cache_t cache);
+
+// Stage router logits for a layer; attached to that layer's next trace entry
+GGML_API void ggml_backend_expert_cache_record_router_logits(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const float * logits,
+    int32_t n_logits);
 
 GGML_API void ggml_backend_expert_cache_disable_route_trace(
     ggml_backend_expert_cache_t cache);
@@ -392,6 +402,44 @@ GGML_API void ggml_backend_expert_cache_submit_prediction(
     const int32_t * expert_ids,
     int32_t n_experts,
     const float * confidences);
+
+// Phase 5D: Pending prediction entry (one per target layer; latest replaces)
+struct ggml_expert_cache_pending_prediction {
+    int32_t target_layer = -1;
+    int32_t n_experts    = 0;
+    int32_t expert_ids[64];
+};
+
+// Settle a pending prediction against the experts a layer actually requested.
+// Returns true if a pending entry existed for this layer.
+GGML_API bool ggml_backend_expert_cache_settle_prediction(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const int32_t * actual_ids,
+    int32_t n_actual,
+    size_t pool_stride);
+
+// Number of pending prediction entries (distinct target layers).
+GGML_API int32_t ggml_backend_expert_cache_pending_prediction_count(
+    ggml_backend_expert_cache_t cache);
+
+// Copy the pending prediction for target_layer into out_ids (max max_ids).
+// Returns n_experts stored, or 0 if none pending.
+GGML_API int32_t ggml_backend_expert_cache_get_pending_prediction(
+    ggml_backend_expert_cache_t cache,
+    int32_t target_layer,
+    int32_t * out_ids,
+    int32_t max_ids);
+
+// Routing predictor stats (single source of truth lives in the cache).
+GGML_API bool ggml_backend_expert_cache_get_routing_predictor_stats(
+    ggml_backend_expert_cache_t cache,
+    struct ggml_routing_predictor_stats * out_stats);
+
+// Accumulate decode-only predictions_generated count from the graph callback.
+GGML_API void ggml_backend_expert_cache_add_predictions_generated(
+    ggml_backend_expert_cache_t cache,
+    int32_t n);
 
 
 

@@ -2806,6 +2806,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_ROUTING_PREDICTOR_HORIZON"));
     add_opt(common_arg(
+        {"--routing-predictor-model"}, "PATH",
+        "path to trained LRPD routing predictor model (enables variant B)",
+        [](common_params & params, const std::string & value) {
+            params.routing_predictor_model = value;
+        }
+    ).set_env("LLAMA_ARG_ROUTING_PREDICTOR_MODEL"));
+    add_opt(common_arg(
+        {"--routing-predictor-variant"}, "{stale-future|low-rank-mlp|future-residual}",
+        "routing predictor variant to use (default: stale-future)",
+        [](common_params & params, const std::string & value) {
+            if (value == "stale-future") {
+                params.routing_predictor_variant = 0;
+            } else if (value == "low-rank-mlp") {
+                params.routing_predictor_variant = 1;
+            } else if (value == "future-residual") {
+                params.routing_predictor_variant = 2;
+            } else {
+                throw std::invalid_argument("invalid routing predictor variant");
+            }
+        }
+    ).set_env("LLAMA_ARG_ROUTING_PREDICTOR_VARIANT"));
+    add_opt(common_arg(
         {"--routing-predictor-stats"},
         "print routing predictor performance statistics on exit",
         [](common_params & params) {

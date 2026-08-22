@@ -210,16 +210,19 @@ bool ggml_routing_predictor_load_model(
         return false;
     }
     
-    if (version != 1) {
+    // Accept trainer versions (1 and 2). Magic and dimension order are the
+    // authoritative contract; version differences only reflect tool updates.
+    if (version != 1 && version != 2) {
         fclose(file);
         return false;
     }
     
-    // Read dimensions
+    // Read dimensions. Header order matches trainer output:
+    // LRPD magic, version(2), int32 input_dim, int32 rank, int32 num_experts.
     int32_t input_dim = 0, num_experts = 0, rank = 0;
     if (fread(&input_dim, sizeof(input_dim), 1, file) != 1 ||
-        fread(&num_experts, sizeof(num_experts), 1, file) != 1 ||
-        fread(&rank, sizeof(rank), 1, file) != 1) {
+        fread(&rank, sizeof(rank), 1, file) != 1 ||
+        fread(&num_experts, sizeof(num_experts), 1, file) != 1) {
         fclose(file);
         return false;
     }

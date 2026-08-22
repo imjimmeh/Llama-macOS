@@ -1,0 +1,6 @@
+# Runtime artifacts for the routing predictor harness.
+# Keep *.py harnesses; ignore all generated data and logs.
+*.bin
+*.log
+*.bat
+*.sh

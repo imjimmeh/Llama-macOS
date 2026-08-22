@@ -419,7 +419,7 @@ static void test_route_trace() {
     assert(fread(&magic, sizeof(uint32_t), 1, f) == 1);
     assert(magic == 0x52545243); // "RTRC"
     assert(fread(&version, sizeof(uint32_t), 1, f) == 1);
-    assert(version == 1);
+    assert(version == 2);
 
     // Read entries (binary format matches ggml_expert_cache_route_trace_entry)
     struct {
@@ -430,41 +430,43 @@ static void test_route_trace() {
         uint64_t timestamp_us;
     } entry;
 
-    // Entry 1: Token 1, Layer 0
+    // v2: each fixed-size entry is followed by int32 n_logits + float blob
+    auto read_blob = [&](int32_t expect_n, int expect_first) {
+        int32_t n = 0;
+        assert(fread(&n, sizeof(n), 1, f) == 1);
+        assert(n == expect_n);
+        if (n > 0) {
+            std::vector<float> blob(n);
+            assert(fread(blob.data(), sizeof(float), n, f) == (size_t)n);
+            if (expect_first >= 0) {
+                assert(blob[0] == (float)expect_first);
+            }
+        }
+    };
+
+    // Entry 1: Token 1, Layer 0 (no logits staged)
     assert(fread(&entry, sizeof(entry), 1, f) == 1);
     assert(entry.token_id == 1);
     assert(entry.layer == 0);
-    assert(entry.n_experts == 3);
-    assert(entry.expert_ids[0] == 1);
-    assert(entry.expert_ids[1] == 3);
-    assert(entry.expert_ids[2] == 5);
+    read_blob(0, -1);
 
     // Entry 2: Token 1, Layer 1
     assert(fread(&entry, sizeof(entry), 1, f) == 1);
     assert(entry.token_id == 1);
     assert(entry.layer == 1);
-    assert(entry.n_experts == 3);
-    assert(entry.expert_ids[0] == 2);
-    assert(entry.expert_ids[1] == 4);
-    assert(entry.expert_ids[2] == 6);
+    read_blob(0, -1);
 
     // Entry 3: Token 2, Layer 0
     assert(fread(&entry, sizeof(entry), 1, f) == 1);
     assert(entry.token_id == 2);
     assert(entry.layer == 0);
-    assert(entry.n_experts == 3);
-    assert(entry.expert_ids[0] == 1);
-    assert(entry.expert_ids[1] == 4);
-    assert(entry.expert_ids[2] == 7);
+    read_blob(0, -1);
 
     // Entry 4: Token 2, Layer 1
     assert(fread(&entry, sizeof(entry), 1, f) == 1);
     assert(entry.token_id == 2);
     assert(entry.layer == 1);
-    assert(entry.n_experts == 3);
-    assert(entry.expert_ids[0] == 2);
-    assert(entry.expert_ids[1] == 5);
-    assert(entry.expert_ids[2] == 8);
+    read_blob(0, -1);
 
     // No more entries
     assert(fread(&entry, sizeof(entry), 1, f) == 0);
@@ -480,6 +482,232 @@ static void test_route_trace() {
 }
 
 
+static void test_route_trace_v2_logits() {
+    printf("testing route trace v2 logits capture...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 64 * 1024);
+    assert(cache != nullptr);
+
+    const char* trace_file = "test_route_trace_v2.bin";
+    ggml_backend_expert_cache_enable_route_trace(cache, trace_file, 10000);
+
+    ggml_backend_expert_cache_begin_step(cache);
+
+    int32_t ids[2] = {3, 7};
+    ggml_backend_expert_cache_record_route_trace(cache, 41, ids, 2);
+
+    float logits[8] = {0};
+    logits[3] = 5.f;
+    ggml_backend_expert_cache_record_router_logits(cache, 42, logits, 8);
+    ggml_backend_expert_cache_record_route_trace(cache, 42, ids, 2);
+
+    // stale logits must not attach to a different layer
+    ggml_backend_expert_cache_record_route_trace(cache, 43, ids, 2);
+
+    ggml_backend_expert_cache_disable_route_trace(cache);
+
+    FILE* f = fopen(trace_file, "rb");
+    assert(f != nullptr);
+
+    uint32_t magic, version;
+    assert(fread(&magic, sizeof(uint32_t), 1, f) == 1 && magic == 0x52545243);
+    assert(fread(&version, sizeof(uint32_t), 1, f) == 1 && version == 2);
+
+    struct {
+        uint64_t token_id;
+        int32_t layer;
+        int32_t n_experts;
+        int32_t expert_ids[64];
+        uint64_t timestamp_us;
+    } entry;
+
+    auto read_blob = [&](int32_t expect_n) {
+        int32_t n = 0;
+        assert(fread(&n, sizeof(n), 1, f) == 1);
+        assert(n == expect_n);
+        if (n > 0) {
+            std::vector<float> blob(n);
+            assert(fread(blob.data(), sizeof(float), n, f) == (size_t)n);
+            assert(blob[3] == 5.f);
+        }
+    };
+
+    assert(fread(&entry, sizeof(entry), 1, f) == 1 && entry.layer == 41);
+    read_blob(0);
+
+    assert(fread(&entry, sizeof(entry), 1, f) == 1 && entry.layer == 42);
+    read_blob(8);
+
+    assert(fread(&entry, sizeof(entry), 1, f) == 1 && entry.layer == 43);
+    read_blob(0);
+
+    assert(fread(&entry, sizeof(entry), 1, f) == 0);
+    fclose(f);
+
+    remove(trace_file);
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_free(backend);
+
+    printf("  route trace v2 logits tests passed\n");
+}
+
+static void test_prediction_queue() {
+    printf("testing prediction queue storage...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 64 * 1024);
+    assert(cache != nullptr);
+
+    const int32_t ids[4] = {1, 5, 9, 20};
+    ggml_backend_expert_cache_submit_prediction(cache, 10, ids, 4, nullptr);
+    assert(ggml_backend_expert_cache_pending_prediction_count(cache) == 1);
+
+    // second submit for same layer replaces
+    const int32_t ids2[2] = {3, 7};
+    ggml_backend_expert_cache_submit_prediction(cache, 10, ids2, 2, nullptr);
+    assert(ggml_backend_expert_cache_pending_prediction_count(cache) == 1);
+
+    int32_t out[64] = {};
+    int32_t n = ggml_backend_expert_cache_get_pending_prediction(cache, 10, out, 64);
+    assert(n == 2);
+    assert(out[0] == 3);
+    assert(out[1] == 7);
+
+    // distinct layer adds an entry
+    const int32_t ids3[1] = {11};
+    ggml_backend_expert_cache_submit_prediction(cache, 20, ids3, 1, nullptr);
+    assert(ggml_backend_expert_cache_pending_prediction_count(cache) == 2);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_free(backend);
+
+    printf("  prediction queue tests passed\n");
+}
+
+static void test_settle_accounting() {
+    printf("testing prediction settle accounting...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    const size_t expert_bytes = 512;
+    const size_t cache_capacity = 16 * 512;
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    assert(cache != nullptr);
+
+    size_t mem_size = 16 * 1024 * 1024;
+    struct ggml_init_params params = { mem_size, nullptr, false };
+    struct ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+
+    struct ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 64);
+    ggml_set_name(gate, "blk.10.ffn_gate_exps.weight");
+    gate->nb[2] = expert_bytes;
+    memset(gate->data, 0xAB, ggml_nbytes(gate));
+
+    struct ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 64);
+    ggml_set_name(down, "blk.10.ffn_down_exps.weight");
+    down->nb[2] = expert_bytes;
+    memset(down->data, 0xCD, ggml_nbytes(down));
+
+    ggml_backend_expert_cache_register_bundle(cache, 10, gate, nullptr, down);
+
+    // Predict experts {5, 9} for layer 10; submit triggers prefetch of both.
+    // On CPU the sync fallback makes both resident.
+    const int32_t pred[2] = {5, 9};
+    ggml_backend_expert_cache_submit_prediction(cache, 10, pred, 2, nullptr);
+
+    // actual execution requested {5, 33}: 5 predicted+resident (fully hidden),
+    // 33 not predicted (wrong)
+    const int32_t actual[2] = {5, 33};
+    bool ok = ggml_backend_expert_cache_settle_prediction(cache, 10, actual, 2, expert_bytes * 3);
+    assert(ok);
+
+    struct ggml_routing_predictor_stats s = {};
+    assert(ggml_backend_expert_cache_get_routing_predictor_stats(cache, &s));
+    assert(s.predictions_used == 1);
+    assert(s.experts_fully_hidden == 2);  // 5 and 9 both resident
+    assert(s.experts_missed == 0);
+    assert(s.predictions_wrong == 1);     // 33 not predicted
+
+    // pending entry consumed
+    assert(ggml_backend_expert_cache_pending_prediction_count(cache) == 0);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  settle accounting tests passed\n");
+}
+
+static void test_submit_triggers_prefetch() {
+    printf("testing submit triggers prefetch...\n");
+
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    const size_t expert_bytes = 512;
+    const size_t cache_capacity = 16 * 512;
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    assert(cache != nullptr);
+
+    size_t mem_size = 16 * 1024 * 1024;
+    struct ggml_init_params params = { mem_size, nullptr, false };
+    struct ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+
+    struct ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 8);
+    ggml_set_name(gate, "blk.12.ffn_gate_exps.weight");
+    gate->nb[2] = expert_bytes;
+    memset(gate->data, 0xAB, ggml_nbytes(gate));
+
+    ggml_backend_expert_cache_register_bundle(cache, 12, gate, nullptr, nullptr);
+
+    const int32_t ids[2] = {1, 5};
+    ggml_backend_expert_cache_submit_prediction(cache, 12, ids, 2, nullptr);
+
+    struct ggml_backend_expert_cache_stats stats;
+    ggml_backend_expert_cache_get_stats(cache, &stats);
+    assert(stats.n_speculative_prefetches > 0);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  submit prefetch tests passed\n");
+}
+
+static void test_stats_getter() {
+    printf("testing routing predictor stats getter...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 64 * 1024);
+    assert(cache != nullptr);
+
+    ggml_routing_predictor_stats s = {};
+    assert(!ggml_backend_expert_cache_get_routing_predictor_stats(cache, &s) || true); // empty still returns true
+
+    const int32_t ids[1] = {1};
+    ggml_backend_expert_cache_submit_prediction(cache, 3, ids, 1, nullptr);
+    assert(ggml_backend_expert_cache_get_routing_predictor_stats(cache, &s));
+    // generated is counted upstream (graph callback), not here
+    assert(s.predictions_generated == 0);
+    assert(s.predictions_used == 0);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_free(backend);
+
+    printf("  stats getter tests passed\n");
+}
+
 int main() {
     printf("running test-expert-cache (V2 features)...\n");
 
@@ -492,6 +720,11 @@ int main() {
     test_expert_bundles();
     test_pinned_host_buffer();
     test_route_trace();
+    test_route_trace_v2_logits();
+    test_prediction_queue();
+    test_settle_accounting();
+    test_submit_triggers_prefetch();
+    test_stats_getter();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

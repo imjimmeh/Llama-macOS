@@ -144,6 +144,13 @@ llama_context::llama_context(
     cparams.expert_cache_period = params.expert_cache_period;
     cparams.expert_cache_max_swaps = params.expert_cache_max_swaps;
     cparams.expert_cache_stats  = params.expert_cache_stats;
+    cparams.routing_predictor_horizon = params.routing_predictor_horizon;
+    cparams.routing_predictor_stats   = params.routing_predictor_stats;
+    if (params.routing_predictor_model) {
+        cparams.routing_predictor_model = params.routing_predictor_model;
+    }
+    cparams.routing_predictor_variant = params.routing_predictor_variant;
+
 
     cparams.ctx_other = nullptr;
 
@@ -1400,8 +1407,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // Phase 5D: Store sched pointer for callback access
         res->sched = sched.get();
-        // Phase 5D: Register routing predictor callback if enabled
+        // Phase 5D: Register routing predictor callback if enabled, chaining
+        // any user eval callback instead of clobbering it
         if (res->routing_predictor) {
+            res->prev_cb           = cparams.cb_eval;
+            res->prev_cb_user_data = cparams.cb_eval_user_data;
             ggml_backend_sched_set_eval_callback(
                 sched.get(),
                 llm_graph_context::routing_predictor_callback,

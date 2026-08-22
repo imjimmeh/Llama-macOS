@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #define LLAMA_MAX_SEQ 256
@@ -71,5 +72,7 @@ struct llama_cparams {
 
     // Phase 5D: Routing predictor
     int32_t routing_predictor_horizon = 8;
+    std::string routing_predictor_model;
+    int32_t routing_predictor_variant = 0;
     bool    routing_predictor_stats   = false;
 };

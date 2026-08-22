@@ -13,8 +13,9 @@
 #   A  baseline, no expert cache            -exc 0
 #   B  expert cache on                     -exc 64M -excp 64
 #   E  expert cache on + MTP draft         -exc 64M -excp 64 + MTP flags
+#   F  expert cache on + routing predictor -exc 64M -excp 64 + routing-predictor flags
 #
-# All three must produce the same SHA-256 for determinism to hold. The runner
+# All four must produce the same SHA-256 for determinism to hold. The runner
 # prints a comparison table and exits nonzero if any row fails or if any hash
 # differs from the reference.
 #
@@ -60,6 +61,13 @@ ROWS = [
             "--spec-type draft-mtp --spec-draft-n-max 2 "
             "--mtp-dynamic-offload"
         ),
+    },
+    {
+        "name": "F",
+        "desc": "expert cache on + routing predictor",
+        "exc": "64M",
+        "excp": 64,
+        "extra": "--routing-predictor-horizon 8 --routing-predictor-stats",
     },
 ]
 
