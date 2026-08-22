@@ -404,6 +404,9 @@ extern "C" {
         uint64_t n_prefetch_misses;
         uint64_t n_prefetch_waits;
 
+        // Phase 5D: Learned Predictor Metrics
+        uint64_t n_predictions_submitted;
+
     };
 
     GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size);
@@ -420,6 +423,8 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_expert_cache_rebalance_partial(ggml_backend_sched_t sched, int max_swaps);
     GGML_API void                 ggml_backend_sched_register_host_memory(ggml_backend_sched_t sched, const struct ggml_tensor * tensor);
     GGML_API void                 ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched);
+    // Submit predicted expert IDs for a future layer to trigger async prefetch
+    GGML_API void                 ggml_backend_sched_submit_prediction(ggml_backend_sched_t sched, int backend_idx, int32_t target_layer, const int32_t * expert_ids, int32_t n_experts, const float * confidences);
 
     //
     // Meta backend

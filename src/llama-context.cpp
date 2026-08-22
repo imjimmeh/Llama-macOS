@@ -1398,6 +1398,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         gf = model.build_graph(gparams);
 
+        // Phase 5D: Store sched pointer for callback access
+        res->sched = sched.get();
+        // Phase 5D: Register routing predictor callback if enabled
+        if (res->routing_predictor) {
+            ggml_backend_sched_set_eval_callback(
+                sched.get(),
+                llm_graph_context::routing_predictor_callback,
+                res
+            );
+        }
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {

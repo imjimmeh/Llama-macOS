@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "ggml-routing-predictor.h"
 
 #include <cstdint>
 #include <vector>
@@ -927,6 +928,10 @@ public:
 
     int64_t max_nodes;
 
+    // Phase 5D: Routing predictor for expert prefetching
+    ggml_routing_predictor_t routing_predictor = nullptr;
+    int32_t predictor_backend_idx = 0;
+    ggml_backend_sched_t sched = nullptr;
 private:
     // keep a copy of the previous graph parameters
     // we will use this to determine whether the graph can be reused by comparing them with the new parameters
@@ -1005,9 +1010,16 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
+    ggml_cgraph * gf = nullptr;
     ggml_context * ctx0 = nullptr;
-    ggml_cgraph  * gf   = nullptr;
-
+    // Phase 5D: Routing predictor for expert prefetching
+    ggml_routing_predictor_t routing_predictor = nullptr;
+    int32_t predictor_backend_idx = 0;
+    // Phase 5D: Eval callback for running predictor during execution
+    static bool routing_predictor_callback(
+        ggml_tensor * tensor,
+        bool ask,
+        void * user_data);
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

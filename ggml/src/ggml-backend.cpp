@@ -2573,6 +2573,26 @@ void ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched) {
     }
 }
 
+void ggml_backend_sched_submit_prediction(
+        ggml_backend_sched_t sched,
+        int backend_idx,
+        int32_t target_layer,
+        const int32_t * expert_ids,
+        int32_t n_experts,
+        const float * confidences) {
+    if (sched == NULL || backend_idx < 0 || backend_idx >= sched->n_backends) {
+        return;
+    }
+    if (sched->expert_caches[backend_idx]) {
+        ggml_backend_expert_cache_submit_prediction(
+            sched->expert_caches[backend_idx],
+            target_layer,
+            expert_ids,
+            n_experts,
+            confidences);
+    }
+}
+
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);

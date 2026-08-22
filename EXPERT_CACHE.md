@@ -534,15 +534,24 @@ GGML_API int32_t ggml_backend_expert_cache_predict_experts(
 
 **Test coverage:** All existing tests pass (16/16 across `test-expert-cache` and `test-expert-cache-profile`).
 
-#### Phase 5D: Learned Low-Rank Routing Predictor ⚠️ Partial
+#### Phase 5D: Learned Low-Rank Routing Predictor ⚠️ Partial (Legacy Implementation)
 
 **Objective:** Train tiny external model to predict future expert routes.
 
-**Status:** Implementation complete but **not integrated** into execution path.
+**Status:** Initial implementation complete but **architecturally blocked**. A revised approach has been designed that moves the predictor upstream to the router-input tensor location.
+
+**📋 Revised Architecture Plan:** See [`docs/plans/2026-08-21-learned-predictor-revised-architecture.md`](docs/plans/2026-08-21-learned-predictor-revised-architecture.md) for the updated implementation strategy.
+
+**Key Architectural Change:** The revised plan moves prediction from inside the cache (blocked) to alongside the router computation (upstream), using router logits as features instead of hidden state. This unblocks integration and enables testing three predictor variants:
+- **Variant A:** Stale future router (zero training cost)
+- **Variant B:** Low-rank MLP with router logits input
+- **Variant C:** Future-router + learned residual (recommended)
+
+**Legacy Implementation (superseded by revised plan):**
 
 **Limitation:** The learned predictor requires hidden state data from the forward pass, but the `mul_mat_id` execution path only has access to the expert weights tensor (`input`), not the hidden state that feeds the router. Integration would require passing hidden state through the scheduler/graph execution infrastructure, which is a deeper architectural change.
 
-**Deliverables:**
+**Existing Deliverables:**
 
 1. **Hidden-state trace collection**
    - API: `ggml_backend_expert_cache_enable_hidden_state_trace()`, `disable_hidden_state_trace()`, `record_hidden_state()`
@@ -563,7 +572,7 @@ GGML_API int32_t ggml_backend_expert_cache_predict_experts(
 
 4. **API declarations** (`ggml-backend-expert-cache.h`):
    ```cpp
-   // Phase 5D: Learned Predictor (Low-Rank Model)
+   // Phase 5D: Learned Predictor (Low-Rank Model) - LEGACY
    struct ggml_expert_cache_hidden_state_sample {
        int32_t layer;
        int32_t token_id;
@@ -604,7 +613,7 @@ GGML_API int32_t ggml_backend_expert_cache_predict_experts(
 
 **Cache struct additions** (`ggml-backend-expert-cache.cpp`):
 ```cpp
-// Phase 5D: Learned Predictor
+// Phase 5D: Learned Predictor - LEGACY
 bool hidden_state_trace_enabled = false;
 FILE * hidden_state_trace_file = nullptr;
 std::vector<ggml_expert_cache_hidden_state_sample> hidden_state_buffer;
@@ -613,7 +622,7 @@ bool learned_predictor_loaded = false;
 void * learned_model = nullptr;  // Opaque pointer to learned_predictor_model
 ```
 
-**Path forward:** Test heuristic predictor (Phase 5C) first. If it shows meaningful speedup, the learned predictor can be integrated later with additional infrastructure changes to pass hidden state through the execution graph.
+**Next Steps:** Begin implementation of revised architecture per the plan document. Phase 5D.1 (locate router-input tensor) is the immediate next task.
 
 ### 10.3 Synthetic Trace Generator
 

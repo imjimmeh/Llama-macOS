@@ -384,6 +384,15 @@ GGML_API int32_t ggml_backend_expert_cache_predict_with_learned_model(
     int32_t * out_expert_ids,
     int32_t max_experts);
 
+// Phase 5D: Prediction Submission (Revised Architecture)
+// Submit predicted expert IDs for a future layer to trigger async prefetch
+GGML_API void ggml_backend_expert_cache_submit_prediction(
+    ggml_backend_expert_cache_t cache,
+    int32_t target_layer,
+    const int32_t * expert_ids,
+    int32_t n_experts,
+    const float * confidences);
+
 
 
 

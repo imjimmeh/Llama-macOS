@@ -1470,6 +1470,31 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
+    // Phase 5D: Initialize routing predictor if expert cache is enabled
+    if (cparams.expert_cache_size > 0 && hparams.n_expert > 0) {
+        ggml_routing_predictor_config config = {};
+        config.type = GGML_ROUTING_PREDICTOR_STALE_FUTURE;  // Start with variant A
+        config.input_dim = hparams.n_expert;  // Router logits dimension
+        config.num_experts = hparams.n_expert;
+        config.horizon = 8;  // Predict 8 layers ahead
+        config.rank = 32;  // Low-rank dimension for variants B/C
+        config.model_path = nullptr;  // No model for variant A
+        
+        res->routing_predictor = ggml_routing_predictor_init(&config);
+        if (res->routing_predictor) {
+            // Find the GPU backend index for expert cache
+            res->predictor_backend_idx = 0;  // Default to first backend
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); i++) {
+                ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+                if (strcmp(ggml_backend_name(backend), "cuda") == 0 ||
+                    strcmp(ggml_backend_name(backend), "vulkan") == 0 ||
+                    strcmp(ggml_backend_name(backend), "metal") == 0) {
+                    res->predictor_backend_idx = i;
+                    break;
+                }
+            }
+        }
+    }
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
@@ -3920,4 +3945,77 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
 
     return relative_bucket;
+}
+
+// Phase 5D: Routing predictor eval callback
+bool llm_graph_context::routing_predictor_callback(
+    ggml_tensor * tensor,
+    bool ask,
+    void * user_data) {
+    
+    if (!tensor || !user_data || ask) return false;
+    
+    // Check if this is a router logits tensor
+    if (tensor->name && strstr(tensor->name, "ffn_moe_logits")) {
+        llm_graph_result * res = static_cast<llm_graph_result*>(user_data);
+        
+        if (!res->routing_predictor) return false;
+        
+        // Only run predictor for single token decode
+        if (tensor->ne[1] != 1) return false;
+        
+        // Extract logits data
+        int32_t n_experts = tensor->ne[0];
+        std::vector<float> logits(n_experts);
+        
+        // Copy logits from device to host
+        ggml_backend_tensor_get(tensor, logits.data(), 0, n_experts * sizeof(float));
+        
+        // Extract features
+        std::vector<float> features(n_experts);
+        ggml_routing_predictor_extract_features(
+            res->routing_predictor,
+            logits.data(),
+            n_experts,
+            features.data()
+        );
+        
+        // Run prediction
+        int32_t predicted_ids[16];
+        float confidences[16];
+        int32_t n_predicted = ggml_routing_predictor_predict(
+            res->routing_predictor,
+            features.data(),
+            predicted_ids,
+            confidences,
+            16
+        );
+        
+        // Submit predictions to expert cache for prefetching
+        if (n_predicted > 0) {
+            // Extract layer number from tensor name (e.g., "blk.5.ffn_moe_logits" -> layer 5)
+            int32_t current_layer = -1;
+            if (tensor->name) {
+                const char * blk_pos = strstr(tensor->name, "blk.");
+                if (blk_pos) {
+                    current_layer = atoi(blk_pos + 4);
+                }
+            }
+            
+            if (current_layer >= 0) {
+                int32_t target_layer = current_layer + 8;  // Predict 8 layers ahead
+                
+                ggml_backend_sched_submit_prediction(
+                    res->sched,
+                    res->predictor_backend_idx,
+                    target_layer,
+                    predicted_ids,
+                    n_predicted,
+                    confidences
+                );
+            }
+        }
+    }
+    
+    return false;
 }

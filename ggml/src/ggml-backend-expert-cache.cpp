@@ -2245,4 +2245,45 @@ int32_t ggml_backend_expert_cache_predict_with_learned_model(
     return n_output;
 }
 
+// Phase 5D: Prediction Submission (Revised Architecture)
+// Submit predicted expert IDs for a future layer to trigger async prefetch
+
+void ggml_backend_expert_cache_submit_prediction(
+        ggml_backend_expert_cache_t cache,
+        int32_t target_layer,
+        const int32_t * expert_ids,
+        int32_t n_experts,
+        const float * confidences) {
+    if (!cache || !expert_ids || n_experts <= 0) {
+        return;
+    }
+
+    // Track metrics
+    cache->stats.n_predictions_submitted++;
+
+    // Log prediction (debug level)
+    if (getenv("GGML_PREDICTOR_DEBUG")) {
+        fprintf(stderr, "[predictor] Layer %d: %d experts predicted: ", target_layer, n_experts);
+        for (int32_t i = 0; i < n_experts && i < 8; i++) {
+            fprintf(stderr, "%d", expert_ids[i]);
+            if (confidences) {
+                fprintf(stderr, "(%.2f)", confidences[i]);
+            }
+            if (i < n_experts - 1 && i < 7) {
+                fprintf(stderr, ", ");
+            }
+        }
+        if (n_experts > 8) {
+            fprintf(stderr, ", ...");
+        }
+        fprintf(stderr, "\n");
+    }
+
+    // TODO: Integrate with async prefetch queue
+    // For now, predictions are logged but not used for prefetching
+    // Full integration requires:
+    // 1. Queue predictions by target_layer
+    // 2. When execution approaches target_layer, issue async prefetch
+    // 3. Use confidences to prioritize high-confidence predictions
+}
 
