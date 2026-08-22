@@ -2673,13 +2673,18 @@ void ggml_backend_sched_submit_prediction(
     if (sched == NULL || backend_idx < 0 || backend_idx >= sched->n_backends) {
         return;
     }
-    if (sched->expert_caches[backend_idx]) {
-        ggml_backend_expert_cache_submit_prediction(
-            sched->expert_caches[backend_idx],
-            target_layer,
-            expert_ids,
-            n_experts,
-            confidences);
+    // Forward to every expert cache so the pending prediction lives wherever
+    // settle later runs (settle uses expert_caches[split_backend_id] for the
+    // MoE weight tensor's backend, which is not necessarily backend_idx).
+    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+        if (sched->expert_caches[b]) {
+            ggml_backend_expert_cache_submit_prediction(
+                sched->expert_caches[b],
+                target_layer,
+                expert_ids,
+                n_experts,
+                confidences);
+        }
     }
 }
 
@@ -2689,6 +2694,12 @@ void ggml_backend_sched_add_predictions_generated(
         int32_t n) {
     if (sched == NULL || backend_idx < 0 || backend_idx >= sched->n_backends) {
         return;
+    }
+    static int s_dbg_pred = -1;
+    if (s_dbg_pred < 5 || getenv("GGML_PREDICTOR_DEBUG")) {
+        fprintf(stderr, "[add_pred] backend_idx=%d cache=%p n=%d sched_nback=%d\n",
+            backend_idx, (void*)sched->expert_caches[backend_idx], n, sched->n_backends);
+        if (s_dbg_pred >= 0) ++s_dbg_pred;
     }
     if (sched->expert_caches[backend_idx]) {
         ggml_backend_expert_cache_add_predictions_generated(sched->expert_caches[backend_idx], n);

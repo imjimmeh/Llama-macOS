@@ -643,17 +643,17 @@ output_bias[num_experts] floats
 ```
 Note: both `ggml_routing_predictor_load_model` (public) and the cache-level `ggml_backend_expert_cache_load_learned_predictor` (used by Variants B/C) read version 1 or 2 with dim order `{input_dim, rank, num_experts}`. Header order matches the trainer in `tools/train_routing_predictor.py` exactly. An older draft swapped `rank` and `num_experts`; that was fixed on 2026-08-22.
 
-**Status (2026-08-22):**
+**Status (2026-08-22, end of Phase 5F):**
 
-1. **Pipeline end-to-end works.** Trace collection -> feature extraction -> training -> model load -> Variant B init all verified. `model.bin` (66 KB, LRPD v2, rank=32, num_experts=256, recall@8 ~= 0.72 on a 23-sample run) loads successfully in the ggml predictor and `routing_predictor_variant=1` shows on the bench CSV. See [Section 10.5](#105-phase-5e-end-to-end-validation-2026-08-22) for evidence and remaining gaps.
+1. **`predictions_generated > 0` CONFIRMED.** Bench gen row shows 4 generated predictions (with the cb layer-extraction fix and host-buffer guard). The CSV column-alignment bug that previously made this look like 0 is also fixed (`dma_wait_ns` was the missing column; see Phase 5F.1 in `EXPERT_CACHE_OPTIMIZATIONS_LOG.md`).
 
-2. **Stats retrieval still stubbed.** `ggml_backend_sched_get_routing_predictor_stats()` (`ggml/src/ggml-backend.cpp`, near the bottom) returns false without populating fields. Cache-level writes into `cache->routing_predictor_stats` happen at `record_prediction`, `settle_prediction`, and the eval callback, but the sched-level aggregator either is missing or reads the wrong field. **Fix:** verify the sched getter path, populate `out_stats` from `sched->expert_caches[backend_idx]->routing_predictor_stats`. (Diagnostic pending - see [Section 10.5](#105-phase-5e-end-to-end-validation-2026-08-22).)
+2. **`predictions_used > 0` BLOCKED.** Not a wiring bug - the cache's compute-side gate at `ggml-backend.cpp:1756-1781` is unreachable during single-token gen for this model/config. The cb submits predictions correctly (verified via stderr `[predictor] Layer 8: 16 experts predicted: ...` lines), but `find_mul_mat_id_node` returns NULL for every gen input_cpy (`expert_cache_mul_mat_id_inputs=0`, `expert_cache_eligible_ops=0`). PP engages the cache fine (`expert_cache_requests=4239`); gen does not. See Phase 5F.5 in the optimization log for hypotheses and the "NOT yet tried" list.
 
-3. **`predictions_generated` is still 0 at runtime even with a valid model loaded.** The eval callback chain is wired (`src/llama-context.cpp:1415-1419` -> `src/llama-graph.cpp:3990-4095`) and the predictor handles are non-null, but no per-token `add_predictions_generated` increments are observed. Plan and diagnostic checklist in `docs/plans/2026-08-22-runtime-utilization.md` (D1-D3): the most likely root cause is graph-reuse / split-cache keeping a callback pointer set during a previous graph build before the routing predictor was attached.
+3. **`expert_cache_capacity_bypasses` and other CSV columns now correctly aligned** thanks to the `dma_wait_ns` fix. Any future field added to `ggml_backend_expert_cache_stats` or `ggml_routing_predictor_stats` must update append to BOTH `get_fields()` and `get_values()` in `tools/llama-bench/llama-bench.cpp`.
 
-4. **Bundle registration may be empty for some layers.** `submit_prediction` looks up `bundle_registrations[target_layer]` and silently no-ops on miss. If the layer's `{gate, up, down}` bundle was never registered, predictions are recorded but never reach `prefetch_async`. Add a log when `bundle_registrations` is consulted and count misses.
+4. **Bundle registration is no longer suspected of being empty for some layers.** With submit-all forwarding (`ggml/src/ggml-backend.cpp:2676-2688`) every expert cache receives the prediction, so missing a single cache's bundle registration is no longer a failure mode. The 5F.5 cache-not-engaging-for-gen blocker is the remaining structural issue.
 
-5. **Predictor is constructed per-cache-instance, not per-context.** With ~40 layers and ~2-3 cache instances per layer this is ~80-120 predictor initializations per bench run. Functionally correct (each variant B init succeeds); cosmetic only. **Fix (optional):** move to `llama_context` member if it ever shows up in a flame graph.
+5. **Predictor is still constructed per-cache-instance, not per-context.** Cosmetic. Move to `llama_context` member only if it shows up in a flame graph.
 
 #### Phase 5E: Pipeline End-to-End Validation (2026-08-22)
 
@@ -706,8 +706,53 @@ Relevant CSV tail: `routing_predictor_model=tools/training_data/model.bin, routi
 
 **Reusable harness:** `tools/training_data/run_trace_server.py` (Python wrapper) launches the server with the correct env-var, arg, and logging config. No ad-hoc subprocess flags; all flags are CLI-driven (`--exc`, `--fitt`, `--ngl`, `--port`, `--max-tokens`, `--prompt-repeat`).
 
-**Open: predictions_generated remains 0 at runtime.** Plan: `docs/plans/2026-08-22-runtime-utilization.md`. Top diagnostic candidates are (a) the graph-reuse branch in `src/llama-context.cpp:1387-1397` not re-registering the routing callback before `graph_compute_async`, and (b) the stats getter at the sched level not aggregating the cache's per-instance counter. Fixing either should produce non-zero `predictions_generated` in the bench CSV without retraining the model.
-5. **Predictor is constructed per-cache-instance, not per-context.** With ~40 layers and ~2-3 cache instances per layer this is ~80-120 predictor initializations per bench run. Functionally correct (each variant B init succeeds); cosmetic only. **Fix (optional):** move to `llama_context` member if it ever shows up in a flame graph.
+#### Phase 5F: Runtime Utilization Debug Session (2026-08-22, continued)
+
+**Goal:** `predictions_generated > 0` AND `predictions_used > 0` during real bench inference with the learned LRPD v2 predictor (`tools/training_data/model.bin`, input_dim=256, rank=32, num_experts=256). Plan: `docs/plans/2026-08-22-runtime-utilization.md`. Followed by Phase R3 baseline-vs-predictor bench matrix.
+
+**Result:** `predictions_generated > 0` achieved. `predictions_used > 0` blocked by a structural cache-not-engaging-during-gen issue (5F.5).
+
+**Five root causes found and resolved in order:**
+
+1. **5F.1 - CSV column misalignment.** `tools/llama-bench/llama-bench.cpp` `test::get_fields()` had 78 entries, `test::get_values()` had 77. The missing column was `expert_cache_stats.dma_wait_ns`. `csv_printer::print_test` joined them positionally so every value shifted left by one; the true `predictions_generated` value was being written under the `routing_predictor_horizon` header. Fixed by adding `std::to_string(expert_cache_stats.dma_wait_ns)` to `get_values()` between `dma_ns` (line 2023) and `routing_predictor_horizon` (line 2025). Future fields must update BOTH lists.
+
+2. **5F.2 - Layer extraction in cb parsed the wrong tensor-name shape.** The cb runs on `ffn_moe_logits-N` (runtime name built by `ggml_format_name(cur, "%s-%d", name, il)` at `src/llama-context.cpp:2568`; cb registered at `src/llama-graph.cpp:2164`). The cb used `strstr(tensor->name, "blk.")` which never matched. Fixed by parsing the trailing `-N` suffix as a fallback. Applied at both the `record_router_logits` site (~4086) and the `submit_prediction` site (~4118) in `src/llama-graph.cpp`. Cache-side parser `ggml_expert_cache_get_tensor_layer` (`ggml/src/ggml-backend-expert-cache.cpp:222-231`) uses `sscanf(name, "blk.%d.")` and works on weight tensors, so only the cb side was broken.
+
+3. **5F.3 - CUDA prefetch memcpy crash when submitting for GPU-resident target layer.** `ggml_backend_expert_cache_submit_prediction` -> `prefetch_async` (line 1477) does `memcpy(pinned_buf, (const uint8_t *) tensor->data + src_off, expert_size)`. For CUDA-resident weight tensors, `tensor->data` is a device pointer -> CPU memcpy from a device pointer crashes (Windows exit code 5 = access violation). The heuristic predictor path that calls `prefetch_async` from `ggml-backend.cpp:1873` is gated by `ggml_backend_buffer_is_host(input->buffer)` at line 1758, so it never hits this bug. My cb bypassed that gate. Fixed by adding a host-buffer guard at the top of the cb (`src/llama-graph.cpp:4099-4108`): `if (!host_buffer) return true;`. For `-ngl 20 split_mode=layer` this means only CPU-layer logits (20-39) submit, with targets 28-39 (all CPU-resident, prefetch safe).
+
+4. **5F.4 - Submit routed to one cache but settle reads another.** `ggml_backend_sched_submit_prediction` forwarded to a single `expert_caches[backend_idx]` (the GPU cache, since `predictor_backend_idx` is the first GPU backend). But settle at `ggml/src/ggml-backend.cpp:1886` reads `expert_caches[split_backend_id]` (the CPU cache for CPU-resident MoE layers). Each cache has its own `pending_predictions` map. Pending and settle lived in different maps -> used=0. Fixed by making submit-all forward to every non-NULL expert cache (`ggml/src/ggml-backend.cpp:2676-2688`). Trade-off: duplicate prefetches across caches (16 experts x 3 bundle tensors per submit), bounded by the host-buffer guard preventing CUDA-target submissions.
+
+5. **5F.5 - Cache never engages during single-token gen (CURRENT BLOCKER).** Symptom: gen row shows `predictions_generated=4>0` (good!) but `predictions_used=0`, `expert_cache_requests=0`, `expert_cache_misses=0`, `expert_cache_eligible_ops=0`, `expert_cache_mul_mat_id_inputs=0`, `expert_cache_speculative_prefetches=15`. PP engages the cache normally (`expert_cache_requests=4239` for `-p 32`); gen does not. Root cause: `find_mul_mat_id_node` (`ggml-backend.cpp:1747`) returns NULL for every gen input_cpy, so the cache engagement gate at `ggml-backend.cpp:1756-1758` is never satisfied. The 15 speculative prefetches all come from the cb's submit path (5 submits x 3 bundle tensors), not from the compute-side heuristic predictor. `predictions_used` cannot increment until settle fires, and settle only fires inside `if (cache_can_store)` which requires the same gate. Hypotheses to test (none attempted yet): (a) gen graph omits MUL_MAT_ID entirely (qwen35moe may use MUL_MAT for single tokens), (b) per-backend copy pointer/name matching fails for qwen35moe weights, (c) `split_backend_id` differs for gen and PP, (d) buffer usage flag differs for gen copies. See `EXPERT_CACHE_OPTIMIZATIONS_LOG.md` Phase 5F.5 for the full checklist and the diagnostic instrumentation recipe.
+
+**Other fixes landed this session (not root causes but improvements):**
+- GPU backend detection at `src/llama-graph.cpp:1524-1534` switched from `strcmp(backend_name, "cuda")` (can never match "CUDA0") to `ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU`. Kept - strictly more correct.
+- Fixed latent prev_cb chain cancel bug at `src/llama-graph.cpp:4045-4049` (dormant but breaks user cb_eval chains returning false).
+
+**Diagnostic instrumentation added then removed:** 6 fprintf blocks ([cb], [predict], [predictor-init], [add_pred], [P4CacheWriteConfirm], init self-test). All removed after their hypothesis was confirmed. Re-enable by re-adding the corresponding `fprintf(stderr, ...)` lines; the cb filter (`is_moe_logits`), predict call, and add_predictions_generated/submit_prediction wiring are still present in `src/llama-graph.cpp`.
+
+**Subagent fan-out that worked well (~10 min for 4 hypotheses):** P1SchedCacheMismatch (REJECTED), P2BenchCtxLifecycle (REJECTED), P3StatsResetPath (REJECTED), P4CacheWriteConfirm (CONFIRMED - counter went 1->200, proving the CSV misalignment was the real blocker).
+
+**Files modified this session (uncommitted, `feat/expert-cache-only`):**
+- `tools/llama-bench/llama-bench.cpp:2024` - added `dma_wait_ns` to `get_values()` (5F.1, the CSV fix).
+- `src/llama-graph.cpp:3990-4138` - cb layer-extraction fix + host-buffer guard + diagnostic prints (removed).
+- `src/llama-graph.cpp:1492-1557` - init self-test (removed).
+- `ggml/src/ggml-backend.cpp:2666-2689` - `ggml_backend_sched_submit_prediction` now forwards to every expert cache (5F.4).
+- `ggml/src/ggml-backend.cpp:2693-2698` - [add_pred] debug removed.
+- `ggml/src/ggml-backend-expert-cache.cpp:2483` - [P4CacheWriteConfirm] debug removed.
+
+**Verified bench command:**
+```
+build/bin/Release/llama-bench.exe -m "C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf" \
+    -p 32 -n 4 -fitt 256 -exc 256 -excp 64 -ngl 20 \
+    --routing-predictor-model tools/training_data/model.bin \
+    --routing-predictor-variant low-rank-mlp --routing-predictor-stats \
+    -r 1 -o csv
+```
+Post-fix gen row: `n_prompt=0, n_gen=4, routing_predictor_horizon=8, predictions_generated=4, predictions_used=0, expert_cache_speculative_prefetches=15, expert_cache_requests=0`. `predictions_generated > 0` is CONFIRMED.
+
+**Phase 5F bottom line:** five bugs found and four fixed; one structural blocker remains (5F.5). The cb->predict->submit->prefetch chain is end-to-end functional and produces real predictions; only the cache's compute-side gate is unreachable during gen.
+
+**Open: `predictions_used > 0` blocked at the cache compute gate (not a wiring bug).** Plan and full diagnosis: `docs/plans/2026-08-22-runtime-utilization.md`, `EXPERT_CACHE_OPTIMIZATIONS_LOG.md` Phase 5F.5, and `EXPERT_CACHE.md` Phase 5F. In one line: `find_mul_mat_id_node` returns NULL for every single-token gen input_cpy, so the cache engagement gate (`ggml-backend.cpp:1756`) is unreachable during gen, so `settle_prediction` never fires, so `predictions_used` cannot increment. PP engages the cache normally (`expert_cache_requests=4239`). The cb submit path works (4 predictions per gen session) but their settles never run. Hypotheses to test: (a) gen graph topology omits MUL_MAT_ID (uses MUL_MAT for single-token decode), (b) per-backend copy pointer/name matching fails for qwen35moe, (c) split_backend_id selects a backend without an expert_caches entry for gen, (d) buffer usage flag differs for gen copies.
 
 **Key Design Decisions (from reviewer):**
 
@@ -723,26 +768,33 @@ Relevant CSV tail: `routing_predictor_model=tools/training_data/model.bin, routi
 
 **Remaining Work:**
 
-1. **Immediate fixes (1-2 days):**
-   - Implement stats retrieval properly
-   - Fix initialization lifetime (once per context)
-   - Wire eval callback to run prediction during graph execution
+1. **Immediate (current blocker, Phase 5F.5):** make the expert cache engage during single-token gen so `predictions_used > 0` and decode tok/s speedup become possible.
+   - Verify gen graph node distribution: is MUL_MAT_ID present in the gen split's graph, or does qwen35moe switch to MUL_MAT for single tokens?
+   - Confirm per-backend copy pointer/name matching works for qwen35moe MoE weights during gen.
+   - Check `split_backend_id` and `expert_caches[split_backend_id] != NULL` for the gen compute path.
+   - Test with `-ngl 0` (all CPU) and with `-n 32` (batched decode) to isolate GPU/CPU vs single-token-decode causes.
+   - See `EXPERT_CACHE_OPTIMIZATIONS_LOG.md` Phase 5F.5 for the full "NOT yet tried" checklist.
 
-2. **Variant A integration (2-3 days):**
-   - Add async prefetch queue (`ggml_backend_sched_submit_prediction()`)
-   - Benchmark with real MoE model (Qwen3.6-35B-A3B-APEX-Compact.gguf)
-   - Measure: prediction recall, prefetch hit rate, decode throughput delta
+2. **Cleanup:**
+   - Remove the 6 diagnostic fprintf blocks already-stripped from this session (DONE 2026-08-22) - if they reappear in a regression, the corresponding hypotheses are worth re-checking.
+   - Run Phase R3 bench matrix (baseline vs predictor at H=4 and H=8) once `predictions_used > 0` is achieved, to measure actual decode tok/s speedup.
 
-3. **Training pipeline (1-2 weeks):**
-   - Data collection: instrument graph to collect router logits at layer L, record actual expert selections at layer L+H
-   - Train Variant B (Low-Rank MLP): `router_logits → rank-32 → expert_logits`
-   - Train Variant C (Future Router + Residual): freeze future router weights, train only residual
-   - Split by whole prompts, evaluate by category (coding, conversation, reasoning)
+3. **Variant A integration (2-3 days):** replace the heuristic predictor (currently Variants A and learned coexist) with the learned LRPD v2 as the primary source for `prefetch_async`. The learned predictor's submit path is wired but never feeds the compute-side cache because of the gen-engagement blocker.
 
-4. **Advanced integration (2-4 weeks):**
-   - CUDA predictor stream (low-priority auxiliary stream, avoid synchronizing main compute)
-   - Multi-horizon prediction (shared rank-32 trunk + horizon-specific heads for H=4,6,8,10,12)
-   - Router logits as features (test: x_L, router_logits_L, top-K IDs + weights, concatenation)
+4. **Training pipeline (1-2 weeks):**
+   - 23 training samples is one run; expand to `--max-tokens 200 --prompt-repeat 50` for a larger trace, retrain at `--rank 64 --epochs 500`.
+   - Variant C (Future Router + Residual) is unimplemented.
+   - Split by whole prompts, evaluate by category (coding, conversation, reasoning).
+
+5. **Advanced integration (2-4 weeks):**
+   - CUDA predictor stream (low-priority auxiliary stream, avoid synchronizing main compute).
+   - Multi-horizon prediction (shared rank-32 trunk + horizon-specific heads for H=4,6,8,10,12).
+   - Router logits as features (test: x_L, router_logits_L, top-K IDs + weights, concatenation).
+
+6. **Architectural improvements worth considering once `predictions_used > 0`:**
+   - Replace `submit-all` (current fix) with a shared `pending_predictions` map on `ggml_backend_sched` to avoid duplicate prefetches.
+   - Fix `prefetch_async` (`ggml-backend-expert-cache.cpp:1477`) to detect non-host tensors and use `cudaMemcpy(device->pinned, ...)` instead of CPU `memcpy`, removing the need for the host-buffer guard in the cb.
+   - Move `pending_predictions` lookup off the cache and onto the sched so submit and settle don't have to agree on a backend index.
 
 **Benchmark Configuration:**
 ```bash

@@ -2021,6 +2021,7 @@ struct test {
                                             std::to_string(expert_cache_stats.n_map_updates),
                                             std::to_string(expert_cache_stats.map_update_bytes),
                                             std::to_string(expert_cache_stats.dma_ns),
+                                            std::to_string(expert_cache_stats.dma_wait_ns),
                                             std::to_string(routing_predictor_horizon),
                                             std::to_string(routing_predictor_stats.predictions_generated),
                                             std::to_string(routing_predictor_stats.predictions_used),

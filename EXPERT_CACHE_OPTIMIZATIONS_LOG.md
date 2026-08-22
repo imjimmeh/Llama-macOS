@@ -912,6 +912,183 @@ Train a tiny external model to predict future expert routes H layers ahead, enab
 
 5. **Never wait for prediction:** If prediction arrives too late, drop it. Never block compute stream.
 
+## Phase 5F: Runtime Utilization Debug Session (2026-08-22, continued from Phase 5E)
+
+### Goal Recap (`docs/plans/2026-08-22-runtime-utilization.md`)
+
+Get `predictions_generated > 0` AND `predictions_used > 0` during real bench inference with the learned LRPD v2 predictor loaded from `tools/training_data/model.bin` (input_dim=256, rank=32, num_experts=256). Followed by Phase R3 baseline-vs-predictor bench matrix.
+
+### Environment
+
+- Branch: `feat/expert-cache-only`
+- MSVC Release, GTX 1080 (8 GB VRAM, Compute 6.1) + AMD Ryzen 7 5700X (8C/16T, Windows 11)
+- Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf` (qwen35moe 35B.A3B Q4_K, 40 layers, 256 experts, 8 used)
+- Build target: `cmake --build build --config Release --target llama-bench` (~10-11s incremental)
+
+### Five Root Causes Found and Resolved
+
+#### 5F.1 CSV column misalignment (predictions_generated WAS real)
+>
+- **Symptom:** CSV row claimed `predictions_generated=0` even though stderr logs showed the cb firing and `[P4CacheWriteConfirm] add_predictions_generated ... new_total=1..200` increments.
+- **Root cause:** `tools/llama-bench/llama-bench.cpp` `test::get_fields()` emitted 78 entries, `test::get_values()` emitted 77. `csv_printer::print_test` joined the two lists positionally, so values shifted left by one after the missing column. The true `predictions_generated` value (e.g. 160) was being written under the `routing_predictor_horizon` column header.
+- **Missing field:** `expert_cache_stats.dma_wait_ns` (declared in `struct ggml_backend_expert_cache_stats` at `ggml/include/ggml-backend.h:401`, listed in `get_fields()` at `tools/llama-bench/llama-bench.cpp:1844`, absent from `get_values()`).
+- **Fix:** added `std::to_string(expert_cache_stats.dma_wait_ns)` to `get_values()` between `dma_ns` (line 2023) and `routing_predictor_horizon` (line 2025) in `tools/llama-bench/llama-bench.cpp`.
+- **Verification:** post-fix CSV header = 78 fields, data row = 78 fields. The PP row's `routing_predictor_horizon=8` and the gen row's `predictions_generated=160` (and `routing_predictor_horizon=8`) lined up correctly with their header labels.
+- **Future-proofing:** ANY new field added to `ggml_backend_expert_cache_stats` (or `ggml_routing_predictor_stats`) must be appended to BOTH `get_fields()` AND `get_values()`. The `csv_printer::print_test` does `join(values, ",")` blindly with no size assertion, so silent shift goes unnoticed.
+
+#### 5F.2 Layer extraction in cb parsed the wrong tensor-name shape
+>
+- **Symptom:** with the CSV fixed, `predictions_generated>0` but `predictions_used=0`. Submit prediction path never fired.
+- **Root cause:** the routing predictor cb (`llm_graph_context::routing_predictor_callback` in `src/llama-graph.cpp`) extracted the layer via `strstr(tensor->name, "blk.")`. But the cb runs on the `ffn_moe_logits-N` tensor (created at `src/llama-graph.cpp:2164` via `cb(logits, "ffn_moe_logits", il)`; runtime name built by `ggml_format_name(cur, "%s-%d", name, il)` at `src/llama-context.cpp:2568`). No `blk.` substring in `ffn_moe_logits-N`, so `current_layer = atoi("blk." + 4) = 0` then `-1` after the guard `if (current_layer >= 0)`. `submit_prediction` was never called, so no pending predictions were registered and settle had nothing to find.
+- **Cache-side canonical parser is `ggml_expert_cache_get_tensor_layer`** (`ggml/src/ggml-backend-expert-cache.cpp:222-231`) using `sscanf(name, "blk.%d.")` - it works on weight tensors like `blk.N.ffn_gate_exps.weight`, so the cache side was fine; only the cb-side extraction was broken.
+- **Fix:** parse the trailing `-N` suffix as a fallback when no `blk.` prefix is found. Applied at both call sites (`record_router_logits` block ~4086 and `submit_prediction` block ~4118):
+```cpp
+int32_t current_layer = -1;
+if (tensor && tensor->name) {
+    const char * blk_pos = strstr(tensor->name, "blk.");
+    if (blk_pos) {
+        current_layer = atoi(blk_pos + 4);
+    } else {
+        const char * dash = strrchr(tensor->name, '-');
+        if (dash != nullptr && dash != tensor->name) {
+            current_layer = atoi(dash + 1);
+        }
+    }
+}
+```
+- **Verification:** stderr showed `[predict] layer=0 n_predicted=16 ...` (was -1) and `[predictor] Layer 8: 16 experts predicted: 197(0.01), ...` proving submit_prediction now reached the `prefetch_async` call.
+
+#### 5F.3 CUDA prefetch memcpy crash when submitting for GPU-resident target layer
+>
+- **Symptom:** gen-only bench (`-p 0 -n 4 -fitt 256 -exc 256 -excp 64 -ngl 20 --routing-predictor-model ...`) crashed with Windows exit code 5 (access violation on Win32 = `STATUS_ACCESS_VIOLATION` 0xC0000005). CSV was 0 lines, stderr ended after `[P4CacheWriteConfirm] add_predictions_generated cache=... n=1 new_total=1` (and only `[predictor] Layer 8:` printed when env was set). The combined `-p 32 -n 4` run exited 5 too, but only after the PP row was printed (TG row lost to the crash).
+- **Root cause:** `ggml_backend_expert_cache_submit_prediction` (`ggml/src/ggml-backend-expert-cache.cpp:2312-2358`) calls `prefetch_async` for each of the target layer's `{gate, up, down}` bundle tensors. `prefetch_async` (`ggml/src/ggml-backend-expert-cache.cpp:1411-1531`) acquires a pinned host staging buffer and does:
+```
+      memcpy(pinned_buf, (const uint8_t *) tensor->data + src_off, expert_size);
+```
+For CUDA-resident weight tensors, `tensor->data` is a CUDA device pointer; a CPU `memcpy` from a device pointer is an invalid access -> crash. The heuristic path that calls `prefetch_async` from `ggml-backend.cpp:1873` is gated by `ggml_backend_buffer_is_host(input->buffer)` at line 1758, so it never reaches this bug. My cb bypassed that gate by calling `submit_prediction` directly without checking whether the target layer's weights were host-resident.
+- **Why this wasn't caught earlier:** the diagnostic config (`-ngl 20`) puts layers 0-19 on CUDA and 20-39 on CPU. Layer 0's logits -> `target_layer = 0 + 8 = 8`, which is CUDA-resident, so the first submit crashes before any CPU-layer submit can happen. With `-ngl 0` (all CPU) this would not have crashed.
+- **Fix (guard in cb, `src/llama-graph.cpp:4099-4108`):**
+```cpp
+const bool host_buffer = tensor && tensor->buffer &&
+    ggml_backend_buffer_is_host(tensor->buffer);
+if (!host_buffer) {
+    return true;
+}
+```
+Only run predict+submit when the cb's own tensor buffer is host-resident. For `-ngl 20 split_mode=layer`, layers 0-19 logits are on CUDA (skipped), layers 20-39 logits are on CPU (allowed -> submits for targets 28-39, all CPU-resident, prefetch is safe).
+- **Architectural alternative NOT taken:** fix `prefetch_async` to detect non-host tensors and use `cudaMemcpy(device->pinned, src, n, cudaMemcpyDeviceToHost)` instead of `memcpy`. This would let the cb submit for any layer. Considered but rejected for this debug cycle because it touches a shared hot path and the guard already yields valid CPU-only predictions.
+
+#### 5F.4 Submit routed to one cache but settle reads another
+>
+- **Symptom:** after fix 5F.3, gen-only bench completed (exit 0) with `predictions_generated=4>0` but `predictions_used=0` and `expert_cache_requests=0`.
+- **Root cause:** `ggml_backend_sched_submit_prediction(sched, backend_idx, target_layer, ...)` (`ggml/src/ggml-backend.cpp:2666-2684`) forwarded to a SINGLE cache: `expert_caches[backend_idx]`. The cb always passes `res->predictor_backend_idx`, which is set to the first GPU backend (`CUDA0`, index 0) at init time. So pending predictions were stored in the CUDA cache's `pending_predictions`. But settle at `ggml/src/ggml-backend.cpp:1886` calls `ggml_backend_expert_cache_settle_prediction(cache, layer, ...)` where `cache = sched->expert_caches[split_backend_id]` and `split_backend_id` is the backend that owns the MUL_MAT_ID weight tensor's buffer (CPU for CPU-resident MoE layers). The CUDA cache and CPU cache each have their OWN `pending_predictions` map (line 215 of `ggml-backend-expert-cache.cpp`). The pending and settle live in different maps -> `settle.find(layer)` returns `end()` -> used stays 0.
+- **Why bundles don't help disambiguate:** `ggml_backend_sched_register_expert_bundle` (line 2602) registers the bundle in EVERY cache (loops `sched->n_backends`), so every cache has `bundle_registrations[layer]` populated. The bundle tensors are the same CPU weight pointer in every cache. So you cannot pick "the right cache" by checking bundle ownership - they are intentionally identical.
+- **Fix (submit-all):** changed `ggml_backend_sched_submit_prediction` to forward the prediction to every non-NULL cache, not just `expert_caches[backend_idx]`:
+```cpp
+for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+    if (sched->expert_caches[b]) {
+        ggml_backend_expert_cache_submit_prediction(
+            sched->expert_caches[b], target_layer,
+            expert_ids, n_experts, confidences);
+    }
+}
+```
+**Trade-off:** the call now triggers `prefetch_async` in EVERY cache. For a CPU-resident target layer the bundle tensor is CPU-resident, so the CUDA cache's `prefetch_async` does `cudaMemcpyHostToDevice` and the CPU cache does `memcpy` - both succeed. For a CUDA-resident target layer, the CUDA cache's `prefetch_async` would crash (the 5F.3 bug). The 5F.3 host-buffer guard prevents this case from being submitted in the first place, so the trade-off is bounded. The duplicate prefetch work is wasteful but small (16 experts x 3 tensors = 48 prefetches per submit) and only happens once per graph build (graph-reuse means the cb fires once per gen session).
+- **Architectural alternatives NOT taken:**
+  - Move `pending_predictions` to a shared map on `ggml_backend_sched`. Would require a new settle API (`ggml_backend_sched_settle_prediction`) and updating the call site at `ggml-backend.cpp:1886`. Cleaner but bigger diff.
+  - Determine the target backend from the target layer's weight tensor buffer and submit to only that cache. Requires the cb to look up the weight tensor (e.g. via `llama_model_get_tensor("blk.N.ffn_gate_exps.weight")`), which is heavier than submitting to all caches.
+
+#### 5F.5 Cache never engages during single-token gen (mul_mat_id_inputs = 0)
+>
+- **Symptom:** after fixes 5F.1-5F.4, gen-only bench reports `predictions_generated=4>0` (good!) but `predictions_used=0`, `expert_cache_requests=0`, `expert_cache_misses=0`, `expert_cache_eligible_ops=0`, `expert_cache_mul_mat_id_inputs=0`, `expert_cache_speculative_prefetches=15`. The PP row of the combined `-p 32 -n 4` run still showed `expert_cache_requests=4239`, `expert_cache_misses=4239` (i.e. the cache DOES engage during PP). Gen engages nowhere.
+- **Root cause:** the cache-engagement gate at `ggml/src/ggml-backend.cpp:1756-1758` requires `is_eligible = (node != NULL) && (input->buffer usage == WEIGHTS) && is_host(input->buffer)`. `node = ggml_backend_find_mul_mat_id_node(&split->graph, input_cpy)` (`ggml-backend.cpp:1747`). The `record_mul_mat_id_input` call right above it (line 1749, gated only on `node != NULL`) shows that during gen no MUL_MAT_ID node is ever identified. So `is_eligible` is false for every input_cpy processed by the gen compute path. The cache's `prefetch_async` is only ever called from the cb's submit path (yielding 15 speculative prefetches per gen session = 5 submits x 3 bundle tensors), never from the compute path's heuristic predictor. `settle_prediction` is only invoked from `ggml-backend.cpp:1886`, which is inside `if (cache_can_store) {...}` (line 1781) and therefore also unreachable when `is_eligible` is false. `predictions_used` cannot increment until settle fires.
+- **PP vs gen divergence:** `find_mul_mat_id_node` uses two strategies - exact pointer match on `node->src[0] == input`, then a name-stripping fallback that strips `<backend>#` prefix and trailing `#<digits>` suffix (the fix from Phase 5E bug #2). During PP (32 tokens, `ne[1]=32`), the scheduler rewrites `node->src[0]` to per-backend copies that match the exact-pointer path. During single-token gen with graph reuse, either the graph topology differs, or the input_cpy pointer never aliases a MUL_MAT_ID src[0], and the name fallback also fails for this model's MoE graph.
+- **NOT YET RESOLVED.** This is the active blocker for `predictions_used > 0`.
+- **Diagnostic steps that confirm the gate is dead:**
+  - `expert_cache_mul_mat_id_inputs=0` and `expert_cache_eligible_ops=0` confirm no node passed `find_mul_mat_id_node` or the WEIGHTS+host check.
+  - `expert_cache_speculative_prefetches=15` and `expert_cache_requests=0` simultaneously is the smoking gun: prefetches happen (from cb submit) but no record_hit/miss/zero_copy calls happen (those live in the slot_tensor / fallback paths at `ggml-backend.cpp:1902+` and `2014+`, both inside `if (cache_can_store)`).
+  - Compare PP row `expert_cache_requests=4239` (cache engaged) vs gen row `expert_cache_requests=0` (cache did not engage) on the same model.
+- **Hypotheses to test (NOT YET ATTEMPTED in this session):**
+  1. **`ggml_backend_find_mul_mat_id_node` graph-reuse miss.** The reused gen graph might not contain a MUL_MAT_ID node that references the per-backend copy tensor. Check `split->graph.n_nodes` and node op distribution during gen. If `n_nodes > 0` but `op == MUL_MAT_ID` count is 0, the graph is genuinely missing the node (different decode path). If the node IS present but `input_cpy != node->src[0]` and the name fallback fails, the name fallback needs a richer matching rule for qwen35moe's weight naming.
+  2. **`ggml_backend_buffer_get_usage(input->buffer) != WEIGHTS` for the gen input_cpy.** PP might go through a different buffer (e.g. split into multiple smaller buffers per token) where the usage flag differs. Add an env-gated fprintf of `ggml_backend_buffer_get_usage(input->buffer)` and `ggml_backend_buffer_is_host(input->buffer)` for every input_cpy in gen compute_splits.
+  3. **`is_host` is true but the wrong split_backend is selected.** Less likely given the explicit gate, but worth confirming `split_backend_id` and the buffer host status are consistent.
+  4. **Single-token decode uses a different op than MUL_MAT_ID.** Some MoE implementations switch to MUL_MAT for single tokens to avoid the index overhead. If the gen graph uses MUL_MAT, `find_mul_mat_id_node` returns NULL by design and the entire cache path is bypassed for gen. This would explain both the 0 mul_mat_id_inputs and 0 cache engagement, and would mean the cache currently only helps PP, not gen. If true, the route-trace data should show this (the Phase 5C vector 6 "Prefill vs. Decode Adaptive Mode Switching" may need to be extended).
+  5. **Cache-disabled-during-graph-reuse branch.** Check whether `ggml_backend_sched_compute_splits` has any fast-path that skips the cache lookup when the graph is reused. If so, the gen path may not invoke the lookup at all.
+
+### Diagnostic Instrumentation Added (then removed) in this session
+
+All of these were added to confirm hypotheses, then stripped once the fix was proven. Listed here so future debuggers can re-enable them quickly:
+
+- `src/llama-graph.cpp:1535-1554` `[predictor-init] n_test=N variant=V have_model=M path=P` - init self-test, confirmed variant B model loads and `n_test > 0`.
+- `src/llama-graph.cpp:4017-4028` `[cb] ask=A name=N ne0=X ne1=Y moe=M` - first N cb calls + every MoE call, env-gated by `GGML_PREDICTOR_DEBUG`. Confirmed the cb fires for `ffn_moe_logits-N` tensors.
+- `src/llama-graph.cpp:4045-4049` prev_cb chain cancel fix - latent bug where returning false on `ask==false` cancelled the chained cb_eval compute. Unconditional `return true` after delegating to prev_cb.
+- `src/llama-graph.cpp:4116-4133` `[predict] layer=L n_predicted=N ... tensor_buffer_host=H` - confirmed `current_layer` was -1 before fix 5F.2 and `tensor_buffer_host=0` for the failing CUDA path.
+- `ggml/src/ggml-backend.cpp:2693-2698` `[add_pred] backend_idx=B cache=C n=N sched_nback=K` - static counter limited to first 5 prints. Confirmed `expert_caches[predictor_backend_idx]` was non-NULL and `add_predictions_generated` was being called.
+- `ggml/src/ggml-backend-expert-cache.cpp:2483` `[P4CacheWriteConfirm] add_predictions_generated cache=C n=N new_total=T` - unconditional. Confirmed the counter was incrementing (hit values 1..5 during gen).
+- **All six prints were removed after their hypothesis was confirmed.** Re-enable by re-adding the corresponding `fprintf(stderr, ...)` lines; the `is_moe_logits` filter and `ggml_routing_predictor_predict` call are still present in the cb.
+- **GPU backend detection at `src/llama-graph.cpp:1524-1534`** was changed from `strcmp(backend_name, "cuda")` (can never match "CUDA0") to `ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU`. Kept (not just diagnostic) because it is strictly more correct. Not the root cause of any observed issue, but worth keeping to avoid the same bug recurring.
+
+### Subagent Fan-out Debug (worked well, ~10 min for 4 hypotheses)
+
+Used the parallel `task` tool to dispatch four scouts simultaneously. All four returned actionable findings; one of them (P4) provided the decisive empirical evidence (counter going 1 -> 200 in the unconditional debug print) that proved the CSV misalignment was the real blocker, not phantom wiring bugs.
+
+| Subagent | Hypothesis | Verdict | Key finding |
+|---|---|---|---|
+| P1SchedCacheMismatch | Cache lifetime < bench query | REJECTED | Cache lifetime matches bench query exactly; same sched, same cache object; fresh ctx per bench instance. |
+| P2BenchCtxLifecycle | Bench reuses stale ctx | REJECTED | Fresh ctx per bench instance; no UAF path. |
+| P3StatsResetPath | A code path zeros predictions_generated | REJECTED | Stats are value-initialized once at cache construction (`ggml-backend-expert-cache.cpp:383`); no reset path exists. |
+| P4CacheWriteConfirm | The writes never land | CONFIRMED | Counter DID increment 1..200, but the CSV row placed the value under the wrong column header. |
+
+### Key Files Modified This Session (uncommitted, `feat/expert-cache-only`)
+
+- `tools/llama-bench/llama-bench.cpp:2024` - added `std::to_string(expert_cache_stats.dma_wait_ns)` to `get_values()`. **THE CSV fix.**
+- `src/llama-graph.cpp:1524-1534` - GPU backend detection via `ggml_backend_dev_type` (kept).
+- `src/llama-graph.cpp:3990-4138` (routing_predictor_callback) - layer extraction fix (blk./suffix) + host_buffer guard. Six diagnostic fprintf blocks added then removed.
+- `src/llama-graph.cpp:1492-1557` (llm_graph_context ctor) - init self-test removed.
+- `ggml/src/ggml-backend.cpp:2666-2689` (`ggml_backend_sched_submit_prediction`) - now forwards to every expert cache (submit-all fix).
+- `ggml/src/ggml-backend.cpp:2693-2698` - [add_pred] debug fprintf removed.
+- `ggml/src/ggml-backend-expert-cache.cpp:2483` - [P4CacheWriteConfirm] debug fprintf removed.
+
+### Verified Bench Command
+
+```
+build/bin/Release/llama-bench.exe -m "C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf" \
+    -p 32 -n 4 -fitt 256 -exc 256 -excp 64 -ngl 20 \
+    --routing-predictor-model tools/training_data/model.bin \
+    --routing-predictor-variant low-rank-mlp --routing-predictor-stats \
+    -r 1 -o csv
+```
+
+**Post-fix gen row:** `n_prompt=0, n_gen=4, routing_predictor_horizon=8, predictions_generated=4, predictions_used=0, predictions_too_late=0, predictions_wrong=0, expert_cache_speculative_prefetches=15, expert_cache_requests=0, expert_cache_eligible_ops=0, expert_cache_mul_mat_id_inputs=0, expert_cache_misses=0`. `predictions_generated > 0` is CONFIRMED.
+
+**PP row of the combined run** still shows `expert_cache_requests=4239, expert_cache_misses=4239, predictions_generated=0` (PP has `ne[1]=32`, cb early-returns on the `n_tokens==1` guard before predict - expected; the cache's heuristic predictor path prefetches but the learned cb does not run for PP).
+
+### Known Structural Issue (carried forward, NOT fixed this session)
+
+Cache lookup at `ggml-backend.cpp:1756-1781` requires `ggml_backend_buffer_is_host(input->buffer)` AND `expert_caches[split_backend_id] != NULL` AND `find_mul_mat_id_node` returning non-NULL AND `ggml_backend_buffer_get_usage == WEIGHTS`. For single-token gen with `-fitt 256 -ngl 20 split_mode=layer`, ALL FOUR conditions appear to be false for the gen compute path (mul_mat_id_inputs=0, eligible_ops=0), so the cache compute path is dead during gen. Blocks `predictions_used>0` and any decode tok/s speedup from the predictor.
+
+### What's Been Tried vs Not (for the next debugger)
+
+**Tried (worked):**
+- Layer extraction in cb (suffix parse).
+- CSV column alignment (add `dma_wait_ns`).
+- Host-buffer guard to prevent CUDA prefetch memcpy crash.
+- Submit-all to bridge the per-cache pending_predictions mismatch.
+- Removed 6 diagnostic fprintf blocks once each hypothesis was confirmed.
+- GPU backend detection via `ggml_backend_dev_type` (kept as a correctness improvement).
+- 4-way parallel subagent fan-out to localize the CSV bug (worked great; ~10 min).
+
+**Tried (did NOT work / not the fix):**
+- None of the diagnostic hypotheses (cache lifetime, ctx lifecycle, stats reset path) turned out to be the bug. P4's empirical counter-dump finding was the only one that held.
+- `strcmp(backend_name, "cuda")` was a red herring (the actual names are "CUDA0", "Vulkan0", "Metal"); replaced anyway.
+
+**NOT yet tried (open hypotheses for 5F.5):**
+- Instrument `ggml_backend_sched_compute_splits` to count MUL_MAT_ID nodes in the gen split graph and dump `ggml_backend_buffer_get_usage(input->buffer)` + `is_host(input->buffer)` per input_cpy.
+- Compare the PP graph node list against the gen graph node list to see whether the gen graph omits MUL_MAT_ID entirely (single-token decode may use MUL_MAT instead).
+- Check whether `split_backend_id` differs for gen and PP and whether `expert_caches[split_backend_id]` is NULL in the gen case.
+- Test with `-ngl 0` (all CPU) to see if mul_mat_id_inputs goes non-zero. If yes, the issue is the GPU/CPU split; if no, the issue is the single-token graph topology.
+- Test with a larger `-n` (e.g. `-n 32`) to see if gen engages once the graph processes more tokens, or to compare batched-decode vs single-token-decode cache engagement.
+
 ### Remaining Work
 
 1. **Immediate fixes (1-2 days):**

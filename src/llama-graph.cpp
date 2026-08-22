@@ -1520,18 +1520,19 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
             res->pinned_logits_buffer = (float*)aligned_alloc(4096, logits_size);
 #endif
             res->pinned_logits_capacity = logits_size;
-            
-            // Find the GPU backend index for expert cache
+
+            // Find the GPU backend index for expert cache. The case-insensitive
+            // suffix match is required because ggml returns "CUDA0", "Vulkan0",
+            // "Metal" (capitalized prefix), while this code only compared lowercase.
             res->predictor_backend_idx = 0;  // Default to first backend
             for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); i++) {
                 ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
-                if (strcmp(ggml_backend_name(backend), "cuda") == 0 ||
-                    strcmp(ggml_backend_name(backend), "vulkan") == 0 ||
-                    strcmp(ggml_backend_name(backend), "metal") == 0) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                     res->predictor_backend_idx = i;
                     break;
                 }
             }
+
         }
     }
     }
@@ -3996,6 +3997,8 @@ bool llm_graph_context::routing_predictor_callback(
 
      const bool is_moe_logits = tensor && tensor->name && strstr(tensor->name, "ffn_moe_logits");
 
+
+
     if (ask) {
         // Scheduler asks whether we want to observe this node. Ourselves we
         // only care about ffn_moe_logits; otherwise defer to the chained
@@ -4010,10 +4013,13 @@ bool llm_graph_context::routing_predictor_callback(
     }
 
     // ask == false: observation pass. Returning false cancels the split's
-    // remaining compute, so never return false here.
+    // remaining compute (ggml-backend.cpp:2191), so never return false here.
+    // The chained user callback is invoked only for its side effect; its
+    // bool return is deliberately discarded to protect downstream nodes in
+    // the same split (notably subsequent ffn_moe_logits).
     if (!res || !tensor || !res->routing_predictor || !is_moe_logits) {
         if (res && res->prev_cb) {
-            return res->prev_cb(tensor, false, res->prev_cb_user_data);
+            res->prev_cb(tensor, false, res->prev_cb_user_data);
         }
         return true;
     }
@@ -4046,16 +4052,38 @@ bool llm_graph_context::routing_predictor_callback(
         n_experts,
         features.data()
     );
+    // Extract the MoE layer index. The logits tensor is named
+    // "ffn_moe_logits-<il>", not "blk.<il>...", so handle both forms.
+    // Same layer number space as the cache's ctx-side weight tensors.
+    int32_t current_layer = -1;
+    if (tensor && tensor->name) {
+        const char * blk_pos = strstr(tensor->name, "blk.");
+        if (blk_pos) {
+            current_layer = atoi(blk_pos + 4);
+        } else {
+            const char * dash = strrchr(tensor->name, '-');
+            if (dash != nullptr && dash != tensor->name) {
+                current_layer = atoi(dash + 1);
+            }
+        }
+    }
+
+    // Only run predict+submit when the cb tensor buffer is host-resident.
+    // The expert cache engages (prefetch + settle) only for host-resident MoE
+    // weight tensors; calling submit_prediction for GPU-resident targets
+    // triggers prefetch_async which does a CPU memcpy from a CUDA device
+    // pointer (ggml-backend-expert-cache.cpp:1477) and crashes.
+    const bool host_buffer = tensor && tensor->buffer &&
+        ggml_backend_buffer_is_host(tensor->buffer);
+    if (!host_buffer) {
+        return true;
+    }
 
     // Stage logits so the expert-cache route trace (v2) can attach them
     // to this layer's next trace entry
-    {
-        const char * blk_pos = strstr(tensor->name, "blk.");
-        if (blk_pos) {
-            const int32_t layer = atoi(blk_pos + 4);
-            ggml_backend_sched_record_router_logits(res->sched,
-                    res->predictor_backend_idx, layer, logits_ptr, n_experts);
-        }
+    if (current_layer >= 0) {
+        ggml_backend_sched_record_router_logits(res->sched,
+                res->predictor_backend_idx, current_layer, logits_ptr, n_experts);
     }
 
     int32_t predicted_ids[32];
@@ -4068,15 +4096,10 @@ bool llm_graph_context::routing_predictor_callback(
         res->predictor_depth
     );
 
+
+
     if (n_predicted > 0) {
         ggml_backend_sched_add_predictions_generated(res->sched, res->predictor_backend_idx, 1);
-
-
-        int32_t current_layer = -1;
-        const char * blk_pos = strstr(tensor->name, "blk.");
-        if (blk_pos) {
-            current_layer = atoi(blk_pos + 4);
-        }
 
         if (current_layer >= 0) {
             const int32_t target_layer = current_layer + res->predictor_horizon;

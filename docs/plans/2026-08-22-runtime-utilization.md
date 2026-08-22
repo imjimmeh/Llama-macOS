@@ -1,7 +1,8 @@
 # Learned predictor runtime utilization
 
-Status: planning
+Status: partially complete (Phase 5F done 2026-08-22)
 Branch: `feat/expert-cache-only`
+Outcome: `predictions_generated > 0` achieved (CSV fix + cb layer extraction + host-buffer guard + submit-all routing). `predictions_used > 0` blocked by Phase 5F.5 (cache does not engage during single-token gen; see EXPERT_CACHE_OPTIMIZATIONS_LOG.md Phase 5F.5 for hypotheses). Phase R3 bench matrix NOT run yet (blocked on Phase 5F.5).
 
 ## Goal
 
