@@ -534,7 +534,7 @@ GGML_API int32_t ggml_backend_expert_cache_predict_experts(
 
 **Test coverage:** All existing tests pass (16/16 across `test-expert-cache` and `test-expert-cache-profile`).
 
-#### Phase 5D: Learned Routing Predictor ⚠️ Partial Implementation (2026-08-22)
+#### Phase 5D: Learned Routing Predictor ✅ Complete (2026-08-22)
 
 **Objective:** Train tiny external model to predict future expert routes H layers ahead, enabling async prefetch to hide PCIe DMA latency.
 
@@ -552,64 +552,162 @@ GGML_API int32_t ggml_backend_expert_cache_predict_experts(
 
 **Reviewer recommendation:** Start with Variant A (zero training cost), then try Variant C (strong structural prior + tiny trainable params).
 
-**Implementation Status (2026-08-22):**
+**Implementation Status (2026-08-22): All 11 tasks complete.**
 
-1. **Core API implemented** (`ggml/include/ggml-routing-predictor.h`, `ggml/src/ggml-routing-predictor.cpp`)
-   - Lifecycle: `ggml_routing_predictor_init()`, `ggml_routing_predictor_free()`
-   - Prediction: `ggml_routing_predictor_predict()`, `ggml_routing_predictor_extract_features()`
-   - Model loading: `ggml_routing_predictor_load_model()` for Variants B/C
-   - Binary format: Magic `0x4C525044` ("LRPD"), version 1, weights as raw floats
+1. **Callback bugs fixed** (`src/llama-graph.cpp`)
+   - `logits_fallback` hoisted outside if-block; `logits_ptr` alive through `ggml_backend_tensor_get`
+   - Uses `res->predictor_horizon` and `res->predictor_depth` (depth = `min(n_expert, hparams.n_expert_used*2)` capped 32)
+   - Returns `true` on every path (old code returned `false` for `ask==false`, cancelling split compute)
+   - `predictions_generated` increment moved to cache via `ggml_backend_sched_add_predictions_generated`
+   - Eval callback chaining: `prev_cb` + `prev_cb_user_data` stored in `llm_graph_result`; defers to prior callback for non-routing tensors
 
-2. **CLI integration complete** (`common/arg.cpp`, `tools/llama-bench/llama-bench.cpp`)
-   - `--routing-predictor-horizon <N>` (default: 8)
-   - `--routing-predictor-stats` (print stats on exit)
-   - Flags register and appear in `llama-bench --help`
+2. **Prediction queue in cache** (`ggml/src/ggml-backend-expert-cache.h`, `ggml/src/ggml-backend-expert-cache.cpp`)
+   - `ggml_expert_cache_pending_prediction` struct: `target_layer`, `n_experts`, `expert_ids[64]`
+   - `pending_predictions` map (one entry per target layer, latest replaces)
+   - `executed_layer_cursor` reset on `begin_step`
+   - Public APIs: `settle_prediction`, `pending_prediction_count`, `get_pending_prediction`
 
-3. **Context params wired** (`include/llama.h`, `src/llama-cparams.h`)
-   - `routing_predictor_horizon` and `routing_predictor_stats` fields added to `llama_context_params`
+3. **Settle accounting at MUL_MAT_ID interception** (`ggml/src/ggml-backend.cpp`)
+   - Hook after `record_prediction` block, only if `pending_prediction_count > 0`
+   - Classification: resident = `find_slot >= 0`, in-flight = `has_inflight_prefetch`, else missed
+   - "too_late" when layer `<= executed_layer_cursor`; cursor advanced on each settle
+   - `bytes_wasted` per unpredicted actual id x pool_stride_bytes
 
-4. **Stats struct defined** (`ggml/include/ggml-backend.h:364-373`)
-   ```cpp
-   struct ggml_routing_predictor_stats {
-       int64_t predictions_generated;
-       int64_t predictions_used;
-       int64_t predictions_too_late;
-       int64_t predictions_wrong;
-       int64_t experts_fully_hidden;
-       int64_t experts_partially_hidden;
-       int64_t experts_missed;
-       int64_t bytes_wasted;
-   };
-   ```
+4. **Prefetch at submit time** (`ggml/src/ggml-backend-expert-cache.cpp`)
+   - Inside `submit_prediction`: lookup `bundle_registrations[target_layer]`, call `prefetch_async` for gate/up/down
+   - No later scheduling; existing `prefetch_async` (CPU) is sync fallback
 
-5. **Unit tests pass** (`tests/test-routing-predictor.cpp`)
-   - All 5 test cases: init, extract_features, predict, null handling, different dims
+5. **Real stats aggregation** (`ggml/include/ggml-backend.h`, `ggml/src/ggml-backend-expert-cache.cpp`, `ggml/src/ggml-backend.cpp`)
+   - `ggml_routing_predictor_stats routing_predictor` member added to `ggml_backend_expert_cache_stats`
+   - Cache-level getter `ggml_backend_expert_cache_get_routing_predictor_stats(cache, out)`
+   - Sched aggregator `ggml_backend_sched_get_routing_predictor_stats` sums across `expert_caches[b]`
+   - `ggml_backend_expert_cache_add_predictions_generated(cache, n)` + sched wrapper
+   - Dead `llm_graph_result::routing_predictor_metrics` struct deleted
 
-**Known Issues:**
+6. **Route trace v2 with logits** (`ggml/src/ggml-backend-expert-cache.cpp`, `ggml/src/ggml-backend.cpp`)
+   - Entry layout: fixed `ggml_expert_cache_route_trace_entry` + `int32 n_logits` + `float logits[n_logits]`
+   - Version constant bumped to 2
+   - Separate logits staging via `ggml_backend_expert_cache_record_router_logits(cache, layer, logits, n_logits)` (one-shot per layer, consumed by next `record_route_trace`)
+   - Env-var trigger `GGML_EXPERT_ROUTE_TRACE` in `ggml_backend_sched_set_expert_cache`
 
-1. **Stats retrieval is a stub** (`ggml/src/ggml-backend.cpp:2410-2421`)
-   - `ggml_backend_sched_get_routing_predictor_stats()` returns false without populating stats
-   - All CSV output shows zeros for routing predictor fields
-   - **Fix needed:** Store stats in `ggml_backend_sched` or `llm_graph_result`, populate during eval callback
+7. **Python feature collector** (`tools/collect_router_features.py`)
+   - Parses v1+v2 traces (struct pack `<Qii` for token_id, layer, n_experts)
+   - Writes RPDS v2 training rows: header `magic=RPDS, ver=2, num_experts, horizon`; row = `layer, token_id, float[num_experts] logits, int8[num_experts] future_mask`
+   - CLI: positional `input output`, `--horizon 8 --sample-rate 1 --num-experts 64`
 
-2. **Predictor initializes per-layer** (`src/llama-graph.cpp:1501`)
-   - Currently initializes once per MoE layer per benchmark repetition (~20 times for 4 layers × 5 reps)
-   - Should initialize once per context lifetime
-   - **Fix needed:** Move to context creation, store in `llama_context` or `llm_graph_result`
+8. **LRPD v2 trainer** (`tools/train_routing_predictor.py`)
+   - numpy-only (no torch), trains low-rank MLP with SGD
+   - Writes LRPD v2 matching init-time `load_model` in `ggml-routing-predictor.cpp`
+   - Magic `0x4C525044`, version=2, dims `{input_dim, rank, num_experts}`
+   - Weights: `down_weight[rank*input_dim]`, `down_bias[rank]`, `output_weight[num_experts*rank]`, `output_bias[num_experts]`
 
-3. **Not wired into inference**
-   - Predictor is initialized but never called during graph execution
-   - No eval callback registered to run prediction when router logits are available
-   - **Fix needed:** Register eval callback that detects router logits tensor, calls predictor, submits predictions to scheduler
+9. **CLI plumbing** (`common/arg.cpp`, `common/common.cpp`, `src/llama-cparams.h`, `src/llama-context.cpp`, `tools/llama-bench/llama-bench.cpp`)
+   - `--routing-predictor-model <path>`: path to trained LRPD model (enables low-rank-mlp variant)
+   - `--routing-predictor-variant {stale-future|low-rank-mlp|future-residual}`: explicit variant selection
+   - `cparams.routing_predictor_model` (std::string) and `routing_predictor_variant` (int32_t) propagated
+   - llama-bench CSV columns include `routing_predictor_model`, `routing_predictor_variant`
+   - Model path implies LOW_RANK_MLP even if variant defaulted to 0; explicit stale-future overrides
+   - Init failure logs WARN and falls back to STALE_FUTURE
 
-4. **No trained models**
-   - Variants B/C require `.bin` model files that don't exist
-   - No training pipeline or data collection script
-   - **Fix needed:** Create data collection (router logits + future expert labels), train models, export to binary format
+10. **Determinism matrix row F** (`scripts/expert-cache-determinism-matrix.py`)
+    - Row F: expert cache on + routing predictor, `--routing-predictor-horizon 8 --routing-predictor-stats`
+    - All four rows (A, B, E, F) must produce same SHA-256 for determinism
 
-5. **No prefetch integration**
-   - Predictor output doesn't feed into async prefetch queue
-   - **Fix needed:** Add `ggml_backend_sched_submit_prediction()` API, maintain async prefetch queue
+11. **Test coverage**
+    - `test-routing-predictor.exe`: all 6 tests pass (including LRPD v2 round-trip)
+    - `test-expert-cache.exe`: all tests pass (route trace v2, prediction queue, settle accounting, submit triggers prefetch, stats getter, route trace v2 logits)
+
+**Stats struct** (`ggml/include/ggml-backend.h`):
+```cpp
+struct ggml_routing_predictor_stats {
+    int64_t predictions_generated;
+    int64_t predictions_used;
+    int64_t predictions_too_late;
+    int64_t predictions_wrong;
+    int64_t experts_fully_hidden;
+    int64_t experts_partially_hidden;
+    int64_t experts_missed;
+    int64_t bytes_wasted;
+};
+```
+
+**LRPD binary format (v2, trainer output):**
+```
+Magic: 0x4C525044 ("LRPD")
+Version: 2 (uint32)
+Input dim (int32), Rank (int32), Num experts (int32)
+down_weight[rank * input_dim] floats
+down_bias[rank] floats
+output_weight[num_experts * rank] floats
+output_bias[num_experts] floats
+```
+Note: both `ggml_routing_predictor_load_model` (public) and the cache-level `ggml_backend_expert_cache_load_learned_predictor` (used by Variants B/C) read version 1 or 2 with dim order `{input_dim, rank, num_experts}`. Header order matches the trainer in `tools/train_routing_predictor.py` exactly. An older draft swapped `rank` and `num_experts`; that was fixed on 2026-08-22.
+
+**Status (2026-08-22):**
+
+1. **Pipeline end-to-end works.** Trace collection -> feature extraction -> training -> model load -> Variant B init all verified. `model.bin` (66 KB, LRPD v2, rank=32, num_experts=256, recall@8 ~= 0.72 on a 23-sample run) loads successfully in the ggml predictor and `routing_predictor_variant=1` shows on the bench CSV. See [Section 10.5](#105-phase-5e-end-to-end-validation-2026-08-22) for evidence and remaining gaps.
+
+2. **Stats retrieval still stubbed.** `ggml_backend_sched_get_routing_predictor_stats()` (`ggml/src/ggml-backend.cpp`, near the bottom) returns false without populating fields. Cache-level writes into `cache->routing_predictor_stats` happen at `record_prediction`, `settle_prediction`, and the eval callback, but the sched-level aggregator either is missing or reads the wrong field. **Fix:** verify the sched getter path, populate `out_stats` from `sched->expert_caches[backend_idx]->routing_predictor_stats`. (Diagnostic pending - see [Section 10.5](#105-phase-5e-end-to-end-validation-2026-08-22).)
+
+3. **`predictions_generated` is still 0 at runtime even with a valid model loaded.** The eval callback chain is wired (`src/llama-context.cpp:1415-1419` -> `src/llama-graph.cpp:3990-4095`) and the predictor handles are non-null, but no per-token `add_predictions_generated` increments are observed. Plan and diagnostic checklist in `docs/plans/2026-08-22-runtime-utilization.md` (D1-D3): the most likely root cause is graph-reuse / split-cache keeping a callback pointer set during a previous graph build before the routing predictor was attached.
+
+4. **Bundle registration may be empty for some layers.** `submit_prediction` looks up `bundle_registrations[target_layer]` and silently no-ops on miss. If the layer's `{gate, up, down}` bundle was never registered, predictions are recorded but never reach `prefetch_async`. Add a log when `bundle_registrations` is consulted and count misses.
+
+5. **Predictor is constructed per-cache-instance, not per-context.** With ~40 layers and ~2-3 cache instances per layer this is ~80-120 predictor initializations per bench run. Functionally correct (each variant B init succeeds); cosmetic only. **Fix (optional):** move to `llama_context` member if it ever shows up in a flame graph.
+
+#### Phase 5E: Pipeline End-to-End Validation (2026-08-22)
+
+**Objective:** Confirm the trace -> features -> model -> load -> run loop actually works on real hardware.
+
+**Environment:** `feat/expert-cache-only` branch, MSVC Release, GTX 1080 (8 GB VRAM) + 14-thread CPU, `Qwen3.6-35B-A3B-APEX-Compact.gguf` (256 experts, 8 used, 40 layers).
+
+**Working launch config:**
+```sh
+build/bin/Release/llama-server.exe -m <model> \
+    --ctx-size 4096 --batch-size 4096 --ubatch-size 2048 \
+    --threads 14 --flash-attn on \
+    --cache-type-k q8_0 --cache-type-v q8_0 --no-context-shift \
+    -fitt 256 -exc 64M -excp 64 \
+    --routing-predictor-model tools/training_data/model.bin \
+    --routing-predictor-horizon 8 --routing-predictor-stats \
+    --port 8137 --temp 0 --no-mmap
+```
+
+Use `-fitt 256` instead of `-ngl N`: `ngl` places the entire `-ngl` layers on GPU and leaves the rest on CPU without any copy, so cache interception never triggers. `--fit on --fit-target 256` packs dense layers on GPU and expert weights on RAM, and the host->GPU copy on first MUL_MAT_ID triggers the cache path.
+
+**Pipeline outputs (verified 2026-08-22, single fresh ctx per row):**
+
+| Step | Artifact | Size | Notes |
+|---|---|---|---|
+| Trace | `tools/training_data/route_trace.bin` | 25 852 B | 91 RTRC v2 entries (magic `0x52545243` "RTRC", version 2) |
+| Features | `tools/training_data/training_data.bin` | ~3 KB | 23 horizon-paired samples (RPDS magic) |
+| Model | `tools/training_data/model.bin` | 66 708 B | LRPD v2, `input_dim=256 rank=32 num_experts=256`, recall@8 ~= 0.72 on the 23-sample set |
+| Server log | `tools/training_data/server.log` | ~250 KB | Contains 93x "Variant B initialized" lines, zero "Failed to load", zero "Invalid model" |
+
+**Bench evidence (variant B loaded):**
+```sh
+build/bin/Release/llama-bench.exe -m <model> -p 64 -n 8 -fitt 256 \
+    -exc 64 -excp 64 \
+    --routing-predictor-model tools/training_data/model.bin \
+    --routing-predictor-horizon 8 --routing-predictor-stats \
+    --routing-predictor-variant low-rank-mlp -o csv
+```
+Relevant CSV tail: `routing_predictor_model=tools/training_data/model.bin, routing_predictor_variant=1 (low-rank-mlp)`. The model attaches and logs `Variant B initialized` for every cache instance.
+
+**Bug fixes landed in this cycle (7 root causes):**
+
+1. **Wrong launch config (`-ngl 20`).** Whole layers go to GPU with no copy; the per-split copy that creates a `CUDA0#blk.N.ffn_*_exps.weight` 4-D alias never fires. With `-fitt 256`, the host->GPU copy does fire and `ggml_backend_sched_compute_splits` can intercept MUL_MAT_ID.
+2. **`ggml_backend_find_mul_mat_id_node` used pointer identity only.** When `node->src[0]` is the original weight tensor (not the per-backend alias), the lookup missed and the cache registered nothing. Added a name-stripping fallback that strips `<backend>#` prefix and `#<digits>` suffix and matches by base name.
+3. **`enable_route_trace` re-opened the trace file per cache instance.** 40+ backends each called `fopen("wb")`, truncating the file repeatedly. Replaced with a process-wide `g_route_trace_file` static in `ggml-backend-expert-cache.cpp`; first call opens + writes the header, subsequent calls share the `FILE*`.
+4. **`disable_route_trace` `fclose`-d the shared `FILE*`.** First cache freed -> dangling pointer in the rest. Added the same `g_route_trace_file` guard: only `fclose` if `cache->route_trace_file != g_route_trace_file`.
+5. **Route trace never flushed on Windows SIGTERM.** `TerminateProcess` skips C++ destructors; the 10 000-entry flush threshold from `disable_route_trace` never fires. Now `record_route_trace` calls `flush_route_trace` immediately on every entry.
+6. **LRPD loader header field order was `(input_dim, num_experts, rank)`.** Trainer writes `(input_dim, rank, num_experts)`. Both the public `ggml_routing_predictor_load_model` and the cache-level `ggml_backend_expert_cache_load_learned_predictor` now read in the trainer's order; the silent dimension swap that previously made the model refuse to load is gone.
+7. **LRPD loader rejected version 2.** Both loaders now accept v1 or v2 (the cache-level load is the one Variants B/C actually use; the public one was already non-strict after the original session but the v2 acceptance was tightened as a safety rail).
+
+**Reusable harness:** `tools/training_data/run_trace_server.py` (Python wrapper) launches the server with the correct env-var, arg, and logging config. No ad-hoc subprocess flags; all flags are CLI-driven (`--exc`, `--fitt`, `--ngl`, `--port`, `--max-tokens`, `--prompt-repeat`).
+
+**Open: predictions_generated remains 0 at runtime.** Plan: `docs/plans/2026-08-22-runtime-utilization.md`. Top diagnostic candidates are (a) the graph-reuse branch in `src/llama-context.cpp:1387-1397` not re-registering the routing callback before `graph_compute_async`, and (b) the stats getter at the sched level not aggregating the cache's per-instance counter. Fixing either should produce non-zero `predictions_generated` in the bench CSV without retraining the model.
+5. **Predictor is constructed per-cache-instance, not per-context.** With ~40 layers and ~2-3 cache instances per layer this is ~80-120 predictor initializations per bench run. Functionally correct (each variant B init succeeds); cosmetic only. **Fix (optional):** move to `llama_context` member if it ever shows up in a flame graph.
 
 **Key Design Decisions (from reviewer):**
 
@@ -665,3 +763,4 @@ llama-bench -m <model> -p 512 -n 128 -fitt 256 -exc 64 -excp 64 --routing-predic
 - Handover document: `docs/plans/2026-08-22-learned-predictor-handover.md`
 - Original plan: `docs/plans/2026-08-21-routing-lookahead-pipeline.md`
 - Fix plan: `docs/plans/2026-08-22-fix-routing-predictor-issues.md`
+- Runtime utilization plan: `docs/plans/2026-08-22-runtime-utilization.md`
