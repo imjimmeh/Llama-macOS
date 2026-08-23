@@ -240,6 +240,14 @@ GGML_API void ggml_backend_expert_cache_record_probe_upload(
     uint64_t us);
 
 
+// Task 8: Fine-grained router-id sync. Mark wait start/end so we can
+// sum the dedupe win per split in n_route_sync_us_total.
+GGML_API void ggml_backend_expert_cache_route_wait_begin(
+    ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_route_wait_end(
+    ggml_backend_expert_cache_t cache,
+    uint64_t wait_us);
+
 // V2.2: Bounded Direct Host Page Registration
 GGML_API bool ggml_backend_expert_cache_register_host_memory(
     ggml_backend_expert_cache_t cache,

@@ -1144,6 +1144,18 @@ void ggml_backend_expert_cache_record_probe_host(ggml_backend_expert_cache_t cac
 void ggml_backend_expert_cache_record_probe_upload(ggml_backend_expert_cache_t cache, uint64_t us) {
     if (cache == NULL) return;
     cache->stats.probe_upload_us += us;
+
+
+// Task 8: per-split wait accumulator for the fine-grained ids event.
+// begin/end are no-ops aside from the stats bookend; the actual wait
+// lives in compute_splits so it can pick the right backend primitive.
+void ggml_backend_expert_cache_route_wait_begin(ggml_backend_expert_cache_t cache) {
+    (void)cache;
+}
+
+void ggml_backend_expert_cache_route_wait_end(ggml_backend_expert_cache_t cache, uint64_t wait_us) {
+    if (cache == NULL) return;
+    cache->stats.n_route_sync_us_total += wait_us;
 }
 
 

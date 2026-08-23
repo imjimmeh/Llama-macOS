@@ -1860,7 +1860,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = input->ne[2];
                     const size_t expert_size = input->nb[2];
 
-                    ggml_backend_synchronize(input_backend);
+                    // Task 8: skip full device drain; tensor_set_async ordering
+                    // already places prior work before the consumer node.
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1879,7 +1880,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
+                        ggml_backend_expert_cache_route_wait_begin(cache);
+                        ggml_backend_synchronize(ids_backend);
+                        ggml_backend_expert_cache_route_wait_end(cache, ggml_time_us() - t_sync_start);
+
 
                         // find the used experts
                         used_ids.assign(ggml_bitset_size(n_expert), 0);
