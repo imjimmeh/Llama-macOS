@@ -69,6 +69,10 @@ struct ggml_expert_cache_slot_entry {
     uint64_t last_used = 0;
     uint64_t hit_count = 0;
     uint32_t access_in_window = 0;
+    // Slot lifecycle: EMPTY -> LOADING -> RESIDENT. alloc publishes LOADING;
+    // the fill site flips RESIDENT once its enqueue is ordered before the
+    // consumer node. find_slot only returns RESIDENT entries.
+    ggml_expert_slot_state state = ggml_expert_slot_state::EMPTY;
 };
 
 struct ggml_expert_cache_slot_pool {
@@ -133,6 +137,16 @@ struct ggml_expert_cache_prefetch_slot {
     int32_t slot_idx;
 };
 
+// Pack (from_layer, to_layer, src_expert, dst_expert) into one uint64 map key.
+// Fields bounded by predictor_max_layers/experts; 8 bits per layer + 20 per expert fits.
+static inline uint64_t ggml_expert_cache_pack_transition_key(
+        int32_t from_layer, int32_t to_layer, int32_t src_expert, int32_t dst_expert) {
+    return ((uint64_t)from_layer << 48) |
+           ((uint64_t)to_layer   << 40) |
+           ((uint64_t)src_expert << 20) |
+           ((uint64_t)dst_expert);
+}
+
 struct ggml_backend_expert_cache {
     ggml_backend_t backend;
 
@@ -157,6 +171,10 @@ struct ggml_backend_expert_cache {
 
     // Phase 1: Slot Pools
     size_t pool_alloc_offset = 0;
+    // Task 6: sum of every pool's bytes (carved + extra backend buffers)
+    // against cache->capacity; get_or_create_pool rejects when this would
+    // overflow. Decremented when pool buffers are freed.
+    size_t pool_bytes_total = 0;
     std::unordered_map<ggml_expert_cache_pool_key, ggml_expert_cache_slot_pool, ggml_expert_cache_pool_key_hash> slot_pools;
 
     // Phase 3: Expert Bundles
@@ -168,9 +186,17 @@ struct ggml_backend_expert_cache {
     // Phase 5: Host Pinned Staging Buffer
     void * pinned_host_buffer = nullptr;
     size_t pinned_host_capacity = 0;
+    // True when pinned_host_buffer was allocated with cudaHostAlloc; tracked
+    // so the matching free path uses cudaFreeHost instead of aligned free.
+    bool pinned_is_cuda = false;
     // Phase 5b: staging ring keyed by (tensor, slot_idx); waits before reuse
     std::vector<ggml_backend_event_t> staging_events;
     std::vector<bool>                 staging_in_flight;
+#if defined(GGML_USE_CUDA)
+    // Parallel ring holding raw cudaEvent_t handles recorded on whichever
+    // stream the caller used; stage_acquire waits via cudaEventSynchronize.
+    std::vector<void *> staging_cuda_events;
+#endif
 
 
 
@@ -193,14 +219,21 @@ struct ggml_backend_expert_cache {
 
     // Phase 5C: Async DMA Pipeline
     void * prefetch_stream = nullptr;  // cudaStream_t when CUDA available
-    std::vector<ggml_expert_cache_prefetch_slot> prefetch_slots;
+    // Keyed map holds exactly the current generation of in-flight / just-
+    // completed prefetches. Failed setups erase the entry; completion
+    // transitions mark the slot resident and erase the entry (residency now
+    // lives in the pool).
+    std::unordered_map<ggml_expert_cache_key,
+                       ggml_expert_cache_prefetch_slot,
+                       ggml_expert_cache_key_hash,
+                       ggml_expert_cache_key_eq> prefetch_slots;
     
     // Phase 5C: Heuristic Predictor (Transition Tables)
     bool predictor_enabled = false;
     int32_t predictor_max_layers = 0;
     int32_t predictor_max_experts = 0;
-    // transition_table[from_layer][to_layer][expert_id] = count
-    std::vector<std::vector<std::vector<int32_t>>> transition_table;
+    // transition_sparse key = pack(from, to, src, dst); value = count of (src -> dst)
+    std::unordered_map<uint64_t, int32_t> transition_sparse;
     // current_experts[layer] = list of expert IDs used
     std::vector<std::vector<int32_t>> current_experts;
     
@@ -301,24 +334,34 @@ static ggml_expert_cache_slot_pool * ggml_backend_expert_cache_get_or_create_poo
     }
 
     const size_t pool_bytes = max_slots * stride;
+    // Task 6: every pool's bytes count against cache->capacity (carved and
+    // extra backend buffers alike). Refuse creation rather than aliasing
+    // the flat cache buffer when the global budget is exhausted.
+    if (cache->pool_bytes_total + pool_bytes > cache->capacity) {
+        ggml_free(pctx);
+        return NULL;
+    }
     ggml_backend_buffer_t pbuffer = NULL;
 
     if (cache->used == 0 && cache->pool_alloc_offset + pool_bytes <= cache->capacity && cache->tensor != NULL && cache->tensor->data != NULL) {
         ptensor->data = (uint8_t *)cache->tensor->data + cache->pool_alloc_offset;
         ptensor->buffer = cache->buffer;
         cache->pool_alloc_offset += pool_bytes;
+        cache->pool_bytes_total += pool_bytes;
     } else {
         pbuffer = ggml_backend_alloc_buffer(cache->backend, pool_bytes);
-        if (pbuffer != NULL) {
-            if (ggml_backend_tensor_alloc(pbuffer, ptensor, ggml_backend_buffer_get_base(pbuffer)) != GGML_STATUS_SUCCESS) {
-                ggml_free(pctx);
-                ggml_backend_buffer_free(pbuffer);
-                return NULL;
-            }
-        } else {
-            ptensor->data = cache->tensor->data;
-            ptensor->buffer = cache->buffer;
+        if (pbuffer == NULL) {
+            // Fallback path no longer aliases the flat cache buffer; treat
+            // backend-allocator refusal as an exhausted budget.
+            ggml_free(pctx);
+            return NULL;
         }
+        if (ggml_backend_tensor_alloc(pbuffer, ptensor, ggml_backend_buffer_get_base(pbuffer)) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(pbuffer);
+            ggml_free(pctx);
+            return NULL;
+        }
+        cache->pool_bytes_total += pool_bytes;
     }
 
     ptensor->nb[0] = weight_tensor->nb[0];
@@ -421,18 +464,35 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
             ggml_free(kv.second.ctx);
         }
         if (kv.second.buffer) {
+            // Mirror the increment in get_or_create_pool's extra-buffer path
+            // so pool_bytes_total cannot drift positive after teardown.
+            const size_t used_bytes = (size_t) kv.second.max_slots * kv.second.stride;
+            if (cache->pool_bytes_total >= used_bytes) {
+                cache->pool_bytes_total -= used_bytes;
+            } else {
+                cache->pool_bytes_total = 0;
+            }
             ggml_backend_buffer_free(kv.second.buffer);
         }
     }
     cache->slot_pools.clear();
 
     if (cache->pinned_host_buffer) {
-#if defined(_WIN32)
-        _aligned_free(cache->pinned_host_buffer);
-#else
-        free(cache->pinned_host_buffer);
+#if defined(GGML_USE_CUDA)
+        if (cache->pinned_is_cuda) {
+            cudaFreeHost(cache->pinned_host_buffer);
+            cache->pinned_is_cuda = false;
+        } else
 #endif
+        {
+#if defined(_WIN32)
+            _aligned_free(cache->pinned_host_buffer);
+#else
+            free(cache->pinned_host_buffer);
+#endif
+        }
         cache->pinned_host_buffer = nullptr;
+        cache->pinned_host_capacity = 0;
     }
 
     for (size_t i = 0; i < cache->staging_events.size(); i++) {
@@ -441,6 +501,14 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
         }
     }
     cache->staging_events.clear();
+#if defined(GGML_USE_CUDA)
+    for (void * e : cache->staging_cuda_events) {
+        if (e != nullptr) {
+            cudaEventDestroy((cudaEvent_t) e);
+        }
+    }
+    cache->staging_cuda_events.clear();
+#endif
 
 
 #if defined(GGML_USE_CUDA)
@@ -454,9 +522,9 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
         cudaStreamDestroy((cudaStream_t)cache->prefetch_stream);
         cache->prefetch_stream = nullptr;
     }
-    for (auto& slot : cache->prefetch_slots) {
-        if (slot.ready_event) {
-            cudaEventDestroy((cudaEvent_t)slot.ready_event);
+    for (auto& kv : cache->prefetch_slots) {
+        if (kv.second.ready_event) {
+            cudaEventDestroy((cudaEvent_t)kv.second.ready_event);
         }
     }
     cache->prefetch_slots.clear();
@@ -884,9 +952,57 @@ int32_t ggml_backend_expert_cache_find_slot(
     ggml_expert_cache_key key = { tensor, expert_id };
     auto it = pool->key_to_slot.find(key);
     if (it != pool->key_to_slot.end()) {
+        // Only publish the slot once data is observable by the consumer.
+        const int32_t s = it->second;
+        if (s >= 0 && s < (int32_t)pool->slots.size() &&
+            pool->slots[s].state == ggml_expert_slot_state::RESIDENT) {
+            return s;
+        }
+    }
+    return -1;
+}
+
+int32_t ggml_backend_expert_cache_find_or_loading_slot(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id) {
+    if (cache == NULL || tensor == NULL) {
+        return -1;
+    }
+    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
+    if (pool == NULL) {
+        return -1;
+    }
+
+    ggml_expert_cache_key key = { tensor, expert_id };
+    auto it = pool->key_to_slot.find(key);
+    if (it != pool->key_to_slot.end()) {
         return it->second;
     }
     return -1;
+}
+
+void ggml_backend_expert_cache_mark_resident(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id) {
+    if (cache == NULL || tensor == NULL) {
+        return;
+    }
+    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
+    if (pool == NULL) {
+        return;
+    }
+    ggml_expert_cache_key key = { tensor, expert_id };
+    auto it = pool->key_to_slot.find(key);
+    if (it == pool->key_to_slot.end()) {
+        return;
+    }
+    const int32_t s = it->second;
+    if (s < 0 || s >= (int32_t)pool->slots.size()) {
+        return;
+    }
+    pool->slots[s].state = ggml_expert_slot_state::RESIDENT;
 }
 
 int32_t ggml_backend_expert_cache_alloc_slot_idx(
@@ -916,7 +1032,7 @@ int32_t ggml_backend_expert_cache_alloc_slot_idx(
     // 1. Look for an empty slot
     for (int32_t s = 0; s < pool->max_slots; s++) {
         if (pool->slots[s].tensor == NULL) {
-            pool->slots[s] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1 };
+            pool->slots[s] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1, ggml_expert_slot_state::LOADING };
             pool->key_to_slot[key] = s;
             pool->used_slots++;
             pool->probationary_used++;
@@ -990,7 +1106,7 @@ int32_t ggml_backend_expert_cache_alloc_slot_idx(
         pool->key_to_slot.erase(vkey);
         cache->stats.n_evictions++;
 
-        pool->slots[victim_slot] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1 };
+        pool->slots[victim_slot] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1, ggml_expert_slot_state::LOADING };
         pool->key_to_slot[key] = victim_slot;
         pool->probationary_used++;
         if (layer >= 0) cache->layer_slots[layer]++;
@@ -1085,6 +1201,19 @@ void ggml_backend_expert_cache_record_probe_host(ggml_backend_expert_cache_t cac
 void ggml_backend_expert_cache_record_probe_upload(ggml_backend_expert_cache_t cache, uint64_t us) {
     if (cache == NULL) return;
     cache->stats.probe_upload_us += us;
+}
+
+
+// Task 8: per-split wait accumulator for the fine-grained ids event.
+// begin/end are no-ops aside from the stats bookend; the actual wait
+// lives in compute_splits so it can pick the right backend primitive.
+void ggml_backend_expert_cache_route_wait_begin(ggml_backend_expert_cache_t cache) {
+    (void)cache;
+}
+
+void ggml_backend_expert_cache_route_wait_end(ggml_backend_expert_cache_t cache, uint64_t wait_us) {
+    if (cache == NULL) return;
+    cache->stats.n_route_sync_us_total += wait_us;
 }
 
 
@@ -1288,18 +1417,39 @@ void * ggml_backend_expert_cache_get_pinned_buffer(
 
     if (cache->pinned_host_capacity < required_size) {
         if (cache->pinned_host_buffer) {
-#if defined(_WIN32)
-            _aligned_free(cache->pinned_host_buffer);
-#else
-            free(cache->pinned_host_buffer);
+#if defined(GGML_USE_CUDA)
+            if (cache->pinned_is_cuda) {
+                cudaFreeHost(cache->pinned_host_buffer);
+                cache->pinned_is_cuda = false;
+            } else
 #endif
+            {
+#if defined(_WIN32)
+                _aligned_free(cache->pinned_host_buffer);
+#else
+                free(cache->pinned_host_buffer);
+#endif
+            }
+            cache->pinned_host_buffer = nullptr;
+            cache->pinned_host_capacity = 0;
         }
         cache->pinned_host_capacity = GGML_EXPERT_CACHE_PAD(required_size);
-#if defined(_WIN32)
-        cache->pinned_host_buffer = _aligned_malloc(cache->pinned_host_capacity, GGML_EXPERT_CACHE_ALIGN);
-#else
-        posix_memalign(&cache->pinned_host_buffer, GGML_EXPERT_CACHE_ALIGN, cache->pinned_host_capacity);
+#if defined(GGML_USE_CUDA)
+        // Prefer truly pinned CUDA host pages when the build links CUDA so
+        // staging memcpys skip the pageable bounce buffer. Fall back to
+        // aligned malloc if the driver refuses the allocation.
+        if (cudaHostAlloc(&cache->pinned_host_buffer, cache->pinned_host_capacity, cudaHostAllocDefault) == cudaSuccess) {
+            cache->pinned_is_cuda = true;
+        } else
 #endif
+        {
+#if defined(_WIN32)
+            cache->pinned_host_buffer = _aligned_malloc(cache->pinned_host_capacity, GGML_EXPERT_CACHE_ALIGN);
+#else
+            posix_memalign(&cache->pinned_host_buffer, GGML_EXPERT_CACHE_ALIGN, cache->pinned_host_capacity);
+#endif
+            cache->pinned_is_cuda = false;
+        }
     }
     return cache->pinned_host_buffer;
 }
@@ -1330,10 +1480,18 @@ void * ggml_backend_expert_cache_stage_acquire(
         for (size_t i = 0; i < GGML_EXPERT_CACHE_STAGING_ENTRIES; i++) {
             cache->staging_events[i] = ggml_backend_event_new(dev);
         }
+#if defined(GGML_USE_CUDA)
+        cache->staging_cuda_events.assign(GGML_EXPERT_CACHE_STAGING_ENTRIES, nullptr);
+#endif
     }
 
     // never write over a copy that may still be read by the DMA engine
     if (cache->staging_in_flight[idx]) {
+#if defined(GGML_USE_CUDA)
+        if (!cache->staging_cuda_events.empty() && cache->staging_cuda_events[idx] != nullptr) {
+            cudaEventSynchronize((cudaEvent_t)cache->staging_cuda_events[idx]);
+        } else
+#endif
         if (cache->staging_events[idx] != NULL) {
             ggml_backend_event_synchronize(cache->staging_events[idx]);
         } else {
@@ -1356,11 +1514,26 @@ void * ggml_backend_expert_cache_stage_acquire(
 void ggml_backend_expert_cache_stage_commit(
         ggml_backend_expert_cache_t cache,
         const struct ggml_tensor * tensor,
-        int32_t slot_idx) {
+        int32_t slot_idx,
+        enum ggml_expert_cache_stage_stream stream) {
     if (cache == NULL || tensor == NULL || cache->staging_events.empty()) {
         return;
     }
     const size_t idx = ggml_expert_cache_staging_index(tensor, slot_idx);
+#if defined(GGML_USE_CUDA)
+    if (stream == GGML_EXPERT_CACHE_STAGE_PREFETCH && cache->prefetch_stream != nullptr) {
+        if (!cache->staging_cuda_events.empty() && cache->staging_cuda_events[idx] == nullptr) {
+            cudaEventCreateWithFlags((cudaEvent_t *)&cache->staging_cuda_events[idx], cudaEventDisableTiming);
+        }
+        if (!cache->staging_cuda_events.empty() && cache->staging_cuda_events[idx] != nullptr) {
+            cudaEventRecord((cudaEvent_t)cache->staging_cuda_events[idx], (cudaStream_t)cache->prefetch_stream);
+        }
+        cache->staging_in_flight[idx] = true;
+        return;
+    }
+#else
+    (void) stream;
+#endif
     if (cache->staging_events[idx] != NULL) {
         ggml_backend_event_record(cache->staging_events[idx], cache->backend);
     }
@@ -1413,6 +1586,11 @@ void ggml_backend_expert_cache_prefetch(
                     dst_off,
                     expert_size);
             }
+            // Backend-ordered fill: set_async is enqueued before the
+            // consumer node, so the slot is observable on read. Mark
+            // resident immediately so find_slot returns this slot.
+            ggml_backend_expert_cache_mark_resident(cache, tensor, eid);
+
             cache->stats.n_speculative_prefetches++;
         }
         // else: do nothing (cannot allocate a slot)
@@ -1447,7 +1625,7 @@ void ggml_backend_expert_cache_prefetch_async(
     // buffer, which lives on cache->backend (a device for the GPU cache).
     const bool pool_is_host = pool->tensor->buffer != NULL &&
         ggml_backend_buffer_is_host(pool->tensor->buffer);
-    if (ggml_backend_buffer_is_host(tensor->buffer) && pool_is_host) {
+    if ((tensor->buffer == NULL || ggml_backend_buffer_is_host(tensor->buffer)) && pool_is_host) {
         return;
     }
     const size_t expert_size = pool->stride;
@@ -1456,47 +1634,75 @@ void ggml_backend_expert_cache_prefetch_async(
         int32_t eid = expert_ids[i];
         if (eid < 0 || (int64_t)eid >= tensor->ne[2]) continue;
         
-        // Skip if already resident
+        ggml_expert_cache_key key = { tensor, eid };
+
+        // Skip if already resident (find_slot gates on RESIDENT)
         if (ggml_backend_expert_cache_find_slot(cache, tensor, eid) >= 0) {
             cache->stats.n_already_resident++;
             continue;
         }
-        
-        // Check if already prefetching this expert
-        bool already_prefetching = false;
-        for (const auto& slot : cache->prefetch_slots) {
-            if (slot.tensor == tensor && slot.expert_id == eid && 
-                slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
-                already_prefetching = true;
-                break;
+
+        // Dedupe first: if an in-flight record already covers this expert,
+        // do not enqueue a second copy. This protects both the staged
+        // bytes and the dedupe count invariant in the contract.
+        {
+            auto dup = cache->prefetch_slots.find(key);
+            if (dup != cache->prefetch_slots.end() &&
+                dup->second.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
+                continue;
             }
         }
-        if (already_prefetching) {
-            continue;
-        }
-        
-        // Allocate slot for this expert
+
+        // Allocate slot last: any failure before this point leaves no
+        // published key_to_slot entry to roll back.
         int32_t slot_idx = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, eid, NULL, 0);
         if (slot_idx < 0) {
             continue;
         }
-        
+
         const size_t src_off = (size_t)eid * expert_size;
         const size_t dst_off = (size_t)slot_idx * expert_size;
-        
+
 #if defined(GGML_USE_CUDA)
-        // Create CUDA event for this prefetch
+        // Create CUDA event for this prefetch BEFORE acquiring staging. On
+        // either failure we must erase the just-published key_to_slot entry
+        // and decrement used_slots/segment counters symmetrically.
         cudaEvent_t event;
         if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+            auto * p = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
+            if (p != NULL) {
+                ggml_expert_cache_key k2 = { tensor, eid };
+                auto vit = p->key_to_slot.find(k2);
+                if (vit != p->key_to_slot.end()) {
+                    const int32_t vs = vit->second;
+                    if (vs >= 0 && vs < (int32_t)p->slots.size()) {
+                        if (p->slots[vs].segment == GGML_EXPERT_CACHE_SEG_PROBATIONARY) {
+                            p->probationary_used--;
+                        } else {
+                            p->protected_used--;
+                        }
+                        p->slots[vs] = ggml_expert_cache_slot_entry();
+                        p->used_slots--;
+                        const int32_t layer = ggml_expert_cache_get_tensor_layer(tensor);
+                        if (layer >= 0) {
+                            auto lit = cache->layer_slots.find(layer);
+                            if (lit != cache->layer_slots.end() && lit->second > 0) {
+                                lit->second--;
+                            }
+                        }
+                    }
+                    p->key_to_slot.erase(vit);
+                }
+            }
             continue;
         }
-        
+
         // Get pinned buffer for staging
         void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, tensor, slot_idx, expert_size);
         if (pinned_buf != NULL) {
             // Copy to pinned buffer
             memcpy(pinned_buf, (const uint8_t *) tensor->data + src_off, expert_size);
-            
+
             // Issue async copy on dedicated prefetch stream
             cudaMemcpyAsync(
                 (uint8_t*)pool->tensor->data + dst_off,
@@ -1505,30 +1711,58 @@ void ggml_backend_expert_cache_prefetch_async(
                 cudaMemcpyHostToDevice,
                 (cudaStream_t)cache->prefetch_stream
             );
-            
+
             // Record event on prefetch stream
             cudaEventRecord(event, (cudaStream_t)cache->prefetch_stream);
-            
-            ggml_backend_expert_cache_stage_commit(cache, tensor, slot_idx);
+
+            ggml_backend_expert_cache_stage_commit(
+                cache, tensor, slot_idx, GGML_EXPERT_CACHE_STAGE_PREFETCH);
         } else {
-            // No pinned buffer available, skip this prefetch
+            // No pinned buffer available: roll back the published slot
+            // and event, then skip.
             cudaEventDestroy(event);
+            auto * p = pool;
+            if (p != NULL) {
+                auto vit = p->key_to_slot.find(key);
+                if (vit != p->key_to_slot.end()) {
+                    const int32_t vs = vit->second;
+                    if (vs >= 0 && vs < (int32_t)p->slots.size()) {
+                        if (p->slots[vs].segment == GGML_EXPERT_CACHE_SEG_PROBATIONARY) {
+                            p->probationary_used--;
+                        } else {
+                            p->protected_used--;
+                        }
+                        p->slots[vs] = ggml_expert_cache_slot_entry();
+                        p->used_slots--;
+                        const int32_t layer = ggml_expert_cache_get_tensor_layer(tensor);
+                        if (layer >= 0) {
+                            auto lit = cache->layer_slots.find(layer);
+                            if (lit != cache->layer_slots.end() && lit->second > 0) {
+                                lit->second--;
+                            }
+                        }
+                    }
+                    p->key_to_slot.erase(vit);
+                }
+            }
             continue;
         }
-        
-        // Track this prefetch
+
+        // Track this prefetch (IN_FLIGHT until event fires).
         ggml_expert_cache_prefetch_slot slot;
         slot.state = GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT;
         slot.ready_event = event;
         slot.tensor = tensor;
         slot.expert_id = eid;
         slot.slot_idx = slot_idx;
-        cache->prefetch_slots.push_back(slot);
+        cache->prefetch_slots[key] = slot;
 
         cache->stats.n_prefetch_issued++;
 #else
         // Backend-ordered copy: set_async enqueues on the target backend
-        // stream before the consumer node, so the data is resident when read
+        // stream before the consumer node, so the data is observable as
+        // soon as we flip the slot state. Mark resident and erase the
+        // pending entry immediately.
         void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, tensor, slot_idx, expert_size);
         if (pinned_buf != NULL) {
             memcpy(pinned_buf, (const uint8_t *) tensor->data + src_off, expert_size);
@@ -1548,14 +1782,12 @@ void ggml_backend_expert_cache_prefetch_async(
                 expert_size);
         }
 
-        // Track so was_prefetched/is_prefetch_ready see this fill
-        ggml_expert_cache_prefetch_slot slot;
-        slot.state = GGML_EXPERT_CACHE_PREFETCH_RESIDENT;
-        slot.ready_event = NULL;
-        slot.tensor = tensor;
-        slot.expert_id = eid;
-        slot.slot_idx = slot_idx;
-        cache->prefetch_slots.push_back(slot);
+        // Move LOADING -> RESIDENT (slot is now observable to the consumer)
+        // and remove the pending entry: residency lives in the pool.
+        ggml_backend_expert_cache_mark_resident(cache, tensor, eid);
+        // Non-CUDA: erase the entry we never published (the dedupe check
+        // above ran before alloc_slot_idx, so this is just defensive).
+        cache->prefetch_slots.erase(key);
 
         cache->stats.n_prefetch_issued++;
 #endif
@@ -1582,15 +1814,16 @@ bool ggml_backend_expert_cache_was_prefetched(
         ggml_backend_expert_cache_t cache,
         const struct ggml_tensor * tensor,
         int32_t expert_id) {
-    for (const auto & slot : cache->prefetch_slots) {
-        if (slot.tensor == tensor && slot.expert_id == expert_id &&
-            (slot.state == GGML_EXPERT_CACHE_PREFETCH_RESIDENT ||
-             slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT)) {
-            // entry may outlive its pool slot (eviction); verify residency
-            return ggml_backend_expert_cache_find_slot(cache, tensor, expert_id) >= 0;
-        }
+    if (cache == NULL || tensor == NULL) {
+        return false;
     }
-    return false;
+    ggml_expert_cache_key key = { tensor, expert_id };
+    auto it = cache->prefetch_slots.find(key);
+    if (it == cache->prefetch_slots.end()) {
+        return false;
+    }
+    // Residency now lives in the pool; verify the slot is observable.
+    return ggml_backend_expert_cache_find_slot(cache, tensor, expert_id) >= 0;
 }
 
 void ggml_backend_expert_cache_record_gpu_slot_from_prediction(ggml_backend_expert_cache_t cache) {
@@ -1610,23 +1843,34 @@ bool ggml_backend_expert_cache_is_prefetch_ready(
     }
 
 #if defined(GGML_USE_CUDA)
-    for (auto& slot : cache->prefetch_slots) {
-        if (slot.tensor == tensor && slot.expert_id == expert_id) {
-            if (slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
-                cudaError_t err = cudaEventQuery((cudaEvent_t)slot.ready_event);
-                if (err == cudaSuccess) {
-                    slot.state = GGML_EXPERT_CACHE_PREFETCH_RESIDENT;
-                    cache->stats.n_prefetch_hits++;
-                    return true;
-                } else if (err == cudaErrorNotReady) {
-                    return false;
-                } else {
-                    return false;
-                }
-            } else if (slot.state == GGML_EXPERT_CACHE_PREFETCH_RESIDENT) {
-                return true;
+    ggml_expert_cache_key key = { tensor, expert_id };
+    auto it = cache->prefetch_slots.find(key);
+    if (it == cache->prefetch_slots.end()) {
+        return false;
+    }
+    if (it->second.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
+        cudaError_t err = cudaEventQuery((cudaEvent_t)it->second.ready_event);
+        if (err == cudaSuccess) {
+            // Completion: flip pool slot to RESIDENT and drop the entry
+            // (residency now lives in the pool).
+            ggml_backend_expert_cache_mark_resident(cache, tensor, expert_id);
+            if (it->second.ready_event) {
+                cudaEventDestroy((cudaEvent_t)it->second.ready_event);
             }
+            cache->prefetch_slots.erase(it);
+            cache->stats.n_prefetch_hits++;
+            return true;
         }
+        return false;
+    }
+    if (it->second.state == GGML_EXPERT_CACHE_PREFETCH_RESIDENT) {
+        // Stale resident record: promote to pool and erase.
+        ggml_backend_expert_cache_mark_resident(cache, tensor, expert_id);
+        if (it->second.ready_event) {
+            cudaEventDestroy((cudaEvent_t)it->second.ready_event);
+        }
+        cache->prefetch_slots.erase(it);
+        return true;
     }
 #endif
 
@@ -1640,18 +1884,27 @@ void ggml_backend_expert_cache_wait_prefetch(
     if (cache == NULL || tensor == NULL) {
         return;
     }
-    
+
 #if defined(GGML_USE_CUDA)
-    // Find and wait for this prefetch
-    for (auto& slot : cache->prefetch_slots) {
-        if (slot.tensor == tensor && slot.expert_id == expert_id) {
-            if (slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
-                cudaEventSynchronize((cudaEvent_t)slot.ready_event);
-                slot.state = GGML_EXPERT_CACHE_PREFETCH_RESIDENT;
-                cache->stats.n_prefetch_waits++;
-            }
-            break;
+    ggml_expert_cache_key key = { tensor, expert_id };
+    auto it = cache->prefetch_slots.find(key);
+    if (it == cache->prefetch_slots.end()) {
+        return;
+    }
+    if (it->second.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
+        cudaEventSynchronize((cudaEvent_t)it->second.ready_event);
+        ggml_backend_expert_cache_mark_resident(cache, tensor, expert_id);
+        if (it->second.ready_event) {
+            cudaEventDestroy((cudaEvent_t)it->second.ready_event);
         }
+        cache->prefetch_slots.erase(it);
+        cache->stats.n_prefetch_waits++;
+    } else if (it->second.state == GGML_EXPERT_CACHE_PREFETCH_RESIDENT) {
+        ggml_backend_expert_cache_mark_resident(cache, tensor, expert_id);
+        if (it->second.ready_event) {
+            cudaEventDestroy((cudaEvent_t)it->second.ready_event);
+        }
+        cache->prefetch_slots.erase(it);
     }
 #endif
 }
@@ -1671,15 +1924,9 @@ void ggml_backend_expert_cache_enable_predictor(
     cache->predictor_max_layers = max_layers;
     cache->predictor_max_experts = max_experts_per_layer;
     
-    // Initialize transition table: [from_layer][to_layer][expert_id]
-    cache->transition_table.resize(max_layers);
-    for (int32_t i = 0; i < max_layers; i++) {
-        cache->transition_table[i].resize(max_layers);
-        for (int32_t j = 0; j < max_layers; j++) {
-            cache->transition_table[i][j].resize(max_experts_per_layer, 0);
-        }
-    }
-    
+    // transition_sparse is grown lazily on first record.
+    cache->transition_sparse.clear();
+
     // Initialize current experts tracking
     cache->current_experts.resize(max_layers);
     
@@ -1694,7 +1941,7 @@ void ggml_backend_expert_cache_disable_predictor(
     }
     
     cache->predictor_enabled = false;
-    cache->transition_table.clear();
+    cache->transition_sparse.clear();
     cache->current_experts.clear();
     
     GGML_LOG_INFO("Expert cache predictor disabled\n");
@@ -1710,14 +1957,15 @@ void ggml_backend_expert_cache_record_prediction(
         return;
     }
     
-    // Update transition table: for each expert used in this layer,
-    // increment the transition count from previous layer's experts
+    // Record sparse (prev, curr) transition counts conditioned on source expert.
     if (layer > 0 && !cache->current_experts[layer - 1].empty()) {
         for (int32_t prev_expert : cache->current_experts[layer - 1]) {
             for (int32_t i = 0; i < n_experts; i++) {
                 int32_t curr_expert = expert_ids[i];
                 if (curr_expert >= 0 && curr_expert < cache->predictor_max_experts) {
-                    cache->transition_table[layer - 1][layer][curr_expert]++;
+                    uint64_t key = ggml_expert_cache_pack_transition_key(
+                            layer - 1, layer, prev_expert, curr_expert);
+                    cache->transition_sparse[key]++;
                 }
             }
         }
@@ -1745,29 +1993,28 @@ int32_t ggml_backend_expert_cache_predict_experts(
         return 0;
     }
     
-    // If we have current experts for from_layer, use transition table
+    // Score each candidate dst by summing (src -> dst) counters restricted
+    // to the experts actually used at from_layer.
     if (!cache->current_experts[from_layer].empty()) {
-        // Collect all predicted experts with their scores
-        std::vector<std::pair<int32_t, int32_t>> expert_scores; // (expert_id, score)
-        
+        std::unordered_map<int32_t, int32_t> dst_score;
+        dst_score.reserve(cache->predictor_max_experts);
+
         for (int32_t prev_expert : cache->current_experts[from_layer]) {
-            for (int32_t expert_id = 0; expert_id < cache->predictor_max_experts; expert_id++) {
-                int32_t score = cache->transition_table[from_layer][to_layer][expert_id];
-                if (score > 0) {
-                    // Check if expert already in list
-                    bool found = false;
-                    for (auto& p : expert_scores) {
-                        if (p.first == expert_id) {
-                            p.second += score;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        expert_scores.push_back({expert_id, score});
-                    }
+            if (prev_expert < 0 || prev_expert >= cache->predictor_max_experts) continue;
+            for (int32_t dst_expert = 0; dst_expert < cache->predictor_max_experts; dst_expert++) {
+                uint64_t key = ggml_expert_cache_pack_transition_key(
+                        from_layer, to_layer, prev_expert, dst_expert);
+                auto it = cache->transition_sparse.find(key);
+                if (it != cache->transition_sparse.end()) {
+                    dst_score[dst_expert] += it->second;
                 }
             }
+        }
+
+        std::vector<std::pair<int32_t, int32_t>> expert_scores;
+        expert_scores.reserve(dst_score.size());
+        for (auto& p : dst_score) {
+            expert_scores.emplace_back(p.first, p.second);
         }
         
         // Sort by score (descending)
@@ -2231,11 +2478,13 @@ void ggml_backend_expert_cache_disable_route_trace(
     // Flush remaining entries
     ggml_backend_expert_cache_flush_route_trace(cache);
 
-    // Only close the file if it's not the process-wide shared handle.
-    // Multiple caches share the same FILE* via g_route_trace_file; closing it
-    // from one cache's disable leaves siblings with dangling pointers.
-    if (cache->route_trace_file != nullptr && cache->route_trace_file != g_route_trace_file) {
+    // Close even the process-wide shared handle: a later enable must open a
+    // fresh file, and leaving it set would point new tracers at the old path.
+    if (cache->route_trace_file != nullptr) {
         fclose(cache->route_trace_file);
+        if (cache->route_trace_file == g_route_trace_file) {
+            g_route_trace_file = nullptr;
+        }
     }
     cache->route_trace_file = nullptr;
 
@@ -2543,22 +2792,32 @@ void ggml_backend_expert_cache_submit_prediction(
 
     auto bit = cache->bundle_registrations.find(target_layer);
     if (bit != cache->bundle_registrations.end()) {
-        if (bit->second.gate) ggml_backend_expert_cache_prefetch_async(cache, bit->second.gate, e.expert_ids, e.n_experts, target_layer);
-        if (bit->second.up)   ggml_backend_expert_cache_prefetch_async(cache, bit->second.up,   e.expert_ids, e.n_experts, target_layer);
-        if (bit->second.down) ggml_backend_expert_cache_prefetch_async(cache, bit->second.down, e.expert_ids, e.n_experts, target_layer);
+        // Skip bundle tensors not host-buffer-backed; they cannot be staged.
+        auto prefetch_if_host = [&](const struct ggml_tensor * t) {
+            if (!t) return;
+            if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+                cache->stats.n_prefetch_src_not_host++;
+                return;
+            }
+            ggml_backend_expert_cache_prefetch_async(
+                cache, t, e.expert_ids, e.n_experts, target_layer);
+        };
+        prefetch_if_host(bit->second.gate);
+        prefetch_if_host(bit->second.up);
+        prefetch_if_host(bit->second.down);
     }
 
 }
 
 static bool has_inflight_prefetch(ggml_backend_expert_cache_t cache,
         const struct ggml_tensor * tensor, int32_t expert_id) {
-    for (const auto & slot : cache->prefetch_slots) {
-        if (slot.tensor == tensor && slot.expert_id == expert_id &&
-            slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
-            return true;
-        }
+    if (cache == NULL || tensor == NULL) {
+        return false;
     }
-    return false;
+    ggml_expert_cache_key key = { tensor, expert_id };
+    auto it = cache->prefetch_slots.find(key);
+    return it != cache->prefetch_slots.end() &&
+           it->second.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT;
 }
 
 bool ggml_backend_expert_cache_settle_prediction(
@@ -2681,4 +2940,3 @@ void ggml_backend_expert_cache_add_predictions_generated(
     }
     cache->stats.routing_predictor.predictions_generated += n;
 }
-

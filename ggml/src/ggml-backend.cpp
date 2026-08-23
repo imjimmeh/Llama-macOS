@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <tuple>
 #include <vector>
 
 #ifdef __APPLE__
@@ -773,6 +774,13 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_expert_remap_ids {
+    struct ggml_tensor * node;
+    struct ggml_context * ctx;
+    ggml_backend_buffer_t buffer;
+    struct ggml_tensor * tensor;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -840,6 +848,8 @@ struct ggml_backend_sched {
     std::vector<int32_t> requested_experts_scratch;
     std::vector<ggml_expert_cache_key> pinned_keys_scratch;
     std::vector<int32_t> remapped_ids_scratch;
+    std::vector<struct ggml_expert_remap_ids> expert_remap_pool;
+
 
 };
 
@@ -1737,8 +1747,10 @@ static void ggml_backend_sched_expert_route_discovery(
     int32_t n_predicted = ggml_backend_expert_cache_predict_experts(
         cache, layer, layer + 1, predicted_experts, width);
     if (n_predicted > 0) {
-        ggml_backend_expert_cache_prefetch_async(
-            cache, w, predicted_experts, n_predicted, layer + 1);
+        // Route through submit_prediction so prefetch resolves the
+        // target layer's bundle tensors, not the current layer's.
+        ggml_backend_expert_cache_submit_prediction(
+            cache, layer + 1, predicted_experts, n_predicted, NULL);
     }
 
     if (ggml_backend_expert_cache_pending_prediction_count(cache) > 0) {
@@ -1748,6 +1760,8 @@ static void ggml_backend_sched_expert_route_discovery(
             pool_stride_bytes);
     }
 }
+
+static struct ggml_tensor * ggml_backend_sched_expert_remap_ids(struct ggml_backend_sched * sched, ggml_backend_t split_backend, struct ggml_tensor * node);
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
@@ -1780,7 +1794,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
-        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> restored_nodes;
+        std::vector<std::tuple<ggml_tensor *, ggml_tensor *, ggml_tensor *>> restored_nodes;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1858,7 +1872,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = input->ne[2];
                     const size_t expert_size = input->nb[2];
 
-                    ggml_backend_synchronize(input_backend);
+                    // Task 8: skip full device drain; tensor_set_async ordering
+                    // already places prior work before the consumer node.
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1877,7 +1892,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
+                        ggml_backend_expert_cache_route_wait_begin(cache);
+                        ggml_backend_synchronize(ids_backend);
+                        ggml_backend_expert_cache_route_wait_end(cache, ggml_time_us() - t_sync_start);
+
 
                         // find the used experts
                         used_ids.assign(ggml_bitset_size(n_expert), 0);
@@ -1935,15 +1953,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 ggml_backend_expert_cache_record_prediction(
                                     cache, layer, requested_experts.data(), (int32_t)requested_experts.size());
                                 
-                                // Predict next layer's experts and issue prefetches
+                                // Predict next layer's experts and route prefetch
+                                // through submit_prediction so it resolves the
+                                // target layer's bundle, not the current one.
                                 int32_t next_layer = layer + 1;
                                 const int32_t width = ggml_backend_sched_expert_prefetch_width();
                                 int32_t predicted_experts[16];
                                 int32_t n_predicted = ggml_backend_expert_cache_predict_experts(
                                     cache, layer, next_layer, predicted_experts, width);
                                 if (n_predicted > 0) {
-                                    ggml_backend_expert_cache_prefetch_async(
-                                        cache, input, predicted_experts, n_predicted, next_layer);
+                                    ggml_backend_expert_cache_submit_prediction(
+                                        cache, next_layer, predicted_experts, n_predicted, NULL);
                                 }
                             }
                         }
@@ -2072,6 +2092,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                             ggml_backend_expert_cache_record_probe_upload(cache, ggml_time_us() - t_upload_start);
 
                                         }
+                                        // Backend-ordered fill: set_async is enqueued
+                                        // before the consumer node on split_backend,
+                                        // so the slot data is observable on read.
+                                        ggml_backend_expert_cache_mark_resident(cache, input, exp_id);
                                     } else {
                                         all_slots_ready = false;
                                         break;
@@ -2085,16 +2109,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 } else {
                                     ggml_backend_expert_cache_record_cpu_id_remap(cache);
                                 }
-                                ggml_backend_tensor_set_async(split_backend,
-                                    ids_tensor,
-                                    remapped_ids.data(),
-                                    0,
-                                    remapped_ids.size() * sizeof(int32_t));
-
                                 if (!force_cpu) {
-                                    node->src[0] = slot_tensor;
-                                    restored_nodes.push_back({ node, input_cpy });
-                                    used_zero_copy = true;
+                                    // Per-node remap tensor keeps the shared
+                                    // router ids untouched and per-pool correct.
+                                    struct ggml_tensor * remap_tensor =
+                                        ggml_backend_sched_expert_remap_ids(sched, split_backend, node);
+                                    if (remap_tensor != NULL) {
+                                        ggml_backend_tensor_set_async(split_backend,
+                                            remap_tensor,
+                                            remapped_ids.data(),
+                                            0,
+                                            remapped_ids.size() * sizeof(int32_t));
+                                        restored_nodes.push_back({ node, input_cpy, ids_tensor });
+                                        node->src[0] = slot_tensor;
+                                        node->src[2] = remap_tensor;
+                                        used_zero_copy = true;
+                                    }
 
                                     // Phase 5H: execution economics
                                     ggml_backend_expert_cache_record_gpu_slot_execution(cache);
@@ -2344,9 +2374,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // restore any modified node src[0] pointers for graph idempotency
+        // restore modified node src pointers for graph idempotency
         for (auto & rn : restored_nodes) {
-            rn.first->src[0] = rn.second;
+            struct ggml_tensor * rn_node = std::get<0>(rn);
+            rn_node->src[0] = std::get<1>(rn);
+            rn_node->src[2] = std::get<2>(rn);
         }
 
         // record the event of this copy
@@ -2432,6 +2464,43 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+static struct ggml_tensor * ggml_backend_sched_expert_remap_ids(
+        struct ggml_backend_sched * sched,
+        ggml_backend_t       split_backend,
+        struct ggml_tensor * node) {
+    for (auto & r : sched->expert_remap_pool) {
+        if (r.node == node && r.tensor->ne[0] == node->src[2]->ne[0] &&
+            r.tensor->ne[1] == node->src[2]->ne[1]) {
+            return r.tensor;
+        }
+    }
+
+    struct ggml_init_params params = {
+        /* .mem_size   = */ 2 * ggml_tensor_overhead(),
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc   = */ true,
+    };
+    struct ggml_context * rctx = ggml_init(params);
+    if (rctx == NULL) {
+        return NULL;
+    }
+    struct ggml_tensor * src_ids = node->src[2];
+    struct ggml_tensor * rtensor = ggml_new_tensor_2d(rctx, GGML_TYPE_I32,
+            src_ids->ne[0], src_ids->ne[1]);
+    if (rtensor == NULL) {
+        ggml_free(rctx);
+        return NULL;
+    }
+    ggml_backend_buffer_t rbuf = ggml_backend_alloc_ctx_tensors_from_buft(
+            rctx, ggml_backend_get_default_buffer_type(split_backend));
+    if (rbuf == NULL) {
+        ggml_free(rctx);
+        return NULL;
+    }
+    sched->expert_remap_pool.push_back({ node, rctx, rbuf, rtensor });
+    return rtensor;
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
@@ -2458,6 +2527,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
+    for (auto & r : sched->expert_remap_pool) {
+        ggml_backend_buffer_free(r.buffer);
+        ggml_free(r.ctx);
+    }
     free(sched->prev_leaf_backend_ids);
     free(sched->context_buffer);
     free(sched->graph.nodes);

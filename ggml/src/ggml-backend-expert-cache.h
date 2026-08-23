@@ -8,6 +8,26 @@
 #include <stdbool.h>
 
 #ifdef __cplusplus
+// Slot lifecycle state machine: EMPTY -> LOADING -> RESIDENT.
+// Typed via C++ enum class for safe field access in the slot entry struct.
+// C callers only need the integer constants; they see them via the regular
+// enum below.
+enum class ggml_expert_slot_state {
+    EMPTY = 0,
+    LOADING = 1,
+    RESIDENT = 2,
+};
+#endif
+
+// C-visible companion enum with the same numeric values so C TUs can refer
+// to the states by name. Not used by C++ code (which uses the enum class).
+enum ggml_expert_slot_state_c {
+    GGML_EXPERT_SLOT_STATE_EMPTY = 0,
+    GGML_EXPERT_SLOT_STATE_LOADING = 1,
+    GGML_EXPERT_SLOT_STATE_RESIDENT = 2,
+};
+
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -138,6 +158,18 @@ GGML_API int32_t ggml_backend_expert_cache_find_slot(
     const struct ggml_tensor * tensor,
     int32_t expert_id);
 
+// Same as find_slot but also returns LOADING entries; used for dedupe.
+GGML_API int32_t ggml_backend_expert_cache_find_or_loading_slot(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
+// Mark a previously LOADING slot as RESIDENT (data is now visible to consumers).
+GGML_API void ggml_backend_expert_cache_mark_resident(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
 GGML_API int32_t ggml_backend_expert_cache_alloc_slot_idx(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * tensor,
@@ -208,6 +240,14 @@ GGML_API void ggml_backend_expert_cache_record_probe_upload(
     uint64_t us);
 
 
+// Task 8: Fine-grained router-id sync. Mark wait start/end so we can
+// sum the dedupe win per split in n_route_sync_us_total.
+GGML_API void ggml_backend_expert_cache_route_wait_begin(
+    ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_route_wait_end(
+    ggml_backend_expert_cache_t cache,
+    uint64_t wait_us);
+
 // V2.2: Bounded Direct Host Page Registration
 GGML_API bool ggml_backend_expert_cache_register_host_memory(
     ggml_backend_expert_cache_t cache,
@@ -230,10 +270,17 @@ GGML_API void * ggml_backend_expert_cache_stage_acquire(
     int32_t slot_idx,
     size_t required_size);
 
+// The guard event is recorded on the stream that issued the staging copy.
+enum ggml_expert_cache_stage_stream {
+    GGML_EXPERT_CACHE_STAGE_BACKEND,
+    GGML_EXPERT_CACHE_STAGE_PREFETCH,
+};
+
 GGML_API void ggml_backend_expert_cache_stage_commit(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * tensor,
-    int32_t slot_idx);
+    int32_t slot_idx,
+    enum ggml_expert_cache_stage_stream stream = GGML_EXPERT_CACHE_STAGE_BACKEND);
 
 
 

@@ -432,6 +432,8 @@ struct ggml_backend_expert_cache_stats {
 
         // Phase 5D: Learned Predictor Metrics
         uint64_t n_predictions_submitted;
+
+        uint64_t n_route_sync_us_total; // total us spent waiting on ids event
         struct ggml_routing_predictor_stats routing_predictor;
 
 
