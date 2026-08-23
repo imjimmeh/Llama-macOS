@@ -827,6 +827,60 @@ static void test_prefetch_record_lifecycle() {
 
     printf("  prefetch record lifecycle tests passed\n");
 }
+static void test_prediction_targets_bundle_tensors() {
+    printf("testing prediction routes through target layer bundle...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    const size_t expert_bytes = 512;
+    const size_t cache_capacity = 16 * expert_bytes;
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    assert(cache != nullptr);
+
+    size_t mem_size = 16 * 1024 * 1024;
+    struct ggml_init_params params = { mem_size, nullptr, false };
+    struct ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+
+    struct ggml_tensor * l0w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 8);
+    ggml_set_name(l0w, "blk.0.ffn_gate_exps.weight");
+    l0w->nb[2] = expert_bytes;
+    memset(l0w->data, 0xAB, ggml_nbytes(l0w));
+
+    struct ggml_tensor * l1w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 8);
+    ggml_set_name(l1w, "blk.1.ffn_gate_exps.weight");
+    l1w->nb[2] = expert_bytes;
+    memset(l1w->data, 0xCD, ggml_nbytes(l1w));
+
+    ggml_backend_expert_cache_register_bundle(cache, 0, l0w, nullptr, nullptr);
+    ggml_backend_expert_cache_register_bundle(cache, 1, l1w, nullptr, nullptr);
+
+    const int32_t preds[2] = { 2, 7 };
+    ggml_backend_expert_cache_submit_prediction(cache, 1, preds, 2, nullptr);
+
+    // Old broken pattern uploaded current-layer tensor under next-layer
+    // keys; layer 0 must remain untouched after the route fix.
+    assert(ggml_backend_expert_cache_find_or_loading_slot(cache, l0w, 2) == -1);
+    assert(ggml_backend_expert_cache_find_or_loading_slot(cache, l0w, 7) == -1);
+
+    // Host-to-host prefetch is a no-op on the CPU backend, so no slot
+    // pool entries are created even on l1. Verify routing via the
+    // pending prediction queue: layer 1 must be queued.
+    assert(ggml_backend_expert_cache_pending_prediction_count(cache) == 1);
+    int32_t routed[8] = { 0 };
+    int32_t n_routed = ggml_backend_expert_cache_get_pending_prediction(
+        cache, 1, routed, 8);
+    assert(n_routed == 2);
+    assert((routed[0] == 2 && routed[1] == 7) ||
+           (routed[0] == 7 && routed[1] == 2));
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  prediction targets bundle tensors tests passed\n");
+}
 
 int main() {
     printf("running test-expert-cache (V2 features)...\n");
@@ -847,6 +901,7 @@ int main() {
     test_submit_triggers_prefetch();
     test_stats_getter();
     test_prefetch_record_lifecycle();
+    test_prediction_targets_bundle_tensors();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

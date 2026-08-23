@@ -2683,9 +2683,19 @@ void ggml_backend_expert_cache_submit_prediction(
 
     auto bit = cache->bundle_registrations.find(target_layer);
     if (bit != cache->bundle_registrations.end()) {
-        if (bit->second.gate) ggml_backend_expert_cache_prefetch_async(cache, bit->second.gate, e.expert_ids, e.n_experts, target_layer);
-        if (bit->second.up)   ggml_backend_expert_cache_prefetch_async(cache, bit->second.up,   e.expert_ids, e.n_experts, target_layer);
-        if (bit->second.down) ggml_backend_expert_cache_prefetch_async(cache, bit->second.down, e.expert_ids, e.n_experts, target_layer);
+        // Skip bundle tensors not host-buffer-backed; they cannot be staged.
+        auto prefetch_if_host = [&](const struct ggml_tensor * t) {
+            if (!t) return;
+            if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+                cache->stats.n_prefetch_src_not_host++;
+                return;
+            }
+            ggml_backend_expert_cache_prefetch_async(
+                cache, t, e.expert_ids, e.n_experts, target_layer);
+        };
+        prefetch_if_host(bit->second.gate);
+        prefetch_if_host(bit->second.up);
+        prefetch_if_host(bit->second.down);
     }
 
 }

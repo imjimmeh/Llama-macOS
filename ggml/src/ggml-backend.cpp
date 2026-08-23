@@ -1737,8 +1737,10 @@ static void ggml_backend_sched_expert_route_discovery(
     int32_t n_predicted = ggml_backend_expert_cache_predict_experts(
         cache, layer, layer + 1, predicted_experts, width);
     if (n_predicted > 0) {
-        ggml_backend_expert_cache_prefetch_async(
-            cache, w, predicted_experts, n_predicted, layer + 1);
+        // Route through submit_prediction so prefetch resolves the
+        // target layer's bundle tensors, not the current layer's.
+        ggml_backend_expert_cache_submit_prediction(
+            cache, layer + 1, predicted_experts, n_predicted, NULL);
     }
 
     if (ggml_backend_expert_cache_pending_prediction_count(cache) > 0) {
@@ -1935,15 +1937,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 ggml_backend_expert_cache_record_prediction(
                                     cache, layer, requested_experts.data(), (int32_t)requested_experts.size());
                                 
-                                // Predict next layer's experts and issue prefetches
+                                // Predict next layer's experts and route prefetch
+                                // through submit_prediction so it resolves the
+                                // target layer's bundle, not the current one.
                                 int32_t next_layer = layer + 1;
                                 const int32_t width = ggml_backend_sched_expert_prefetch_width();
                                 int32_t predicted_experts[16];
                                 int32_t n_predicted = ggml_backend_expert_cache_predict_experts(
                                     cache, layer, next_layer, predicted_experts, width);
                                 if (n_predicted > 0) {
-                                    ggml_backend_expert_cache_prefetch_async(
-                                        cache, input, predicted_experts, n_predicted, next_layer);
+                                    ggml_backend_expert_cache_submit_prediction(
+                                        cache, next_layer, predicted_experts, n_predicted, NULL);
                                 }
                             }
                         }
