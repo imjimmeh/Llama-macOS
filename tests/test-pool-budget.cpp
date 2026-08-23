@@ -8,7 +8,8 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-backend-expert-cache.h"
+#include "../ggml/src/ggml-backend-expert-cache.h"
+#include "ggml-cpu.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -23,7 +24,7 @@ static void test_global_pool_budget() {
     ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
     assert(cache != nullptr);
 
-    size_t mem_size = 16 * 1024 * 1024;
+    size_t mem_size = 512 * 1024 * 1024;
     struct ggml_init_params params = {
         /*.mem_size   =*/ mem_size,
         /*.mem_buffer =*/ nullptr,
