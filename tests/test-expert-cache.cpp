@@ -828,6 +828,44 @@ static void test_prefetch_record_lifecycle() {
     printf("  prefetch record lifecycle tests passed\n");
 }
 
+static void test_transition_conditioned_on_source() {
+    printf("testing transition table conditioned on source expert...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 64 * 1024);
+    assert(cache != nullptr);
+
+    ggml_backend_expert_cache_enable_predictor(cache, 4, 64);
+
+    // Train: (layer0={1} -> layer1={5}) ten times; (layer0={2} -> layer1={9}) once.
+    const int32_t ids_0[1] = {1};
+    const int32_t ids_1[1] = {5};
+    for (int i = 0; i < 10; i++) {
+        ggml_backend_expert_cache_record_prediction(cache, 0, ids_0, 1);
+        ggml_backend_expert_cache_record_prediction(cache, 1, ids_1, 1);
+    }
+    const int32_t ids_2_0[1] = {2};
+    const int32_t ids_2_1[1] = {9};
+    ggml_backend_expert_cache_record_prediction(cache, 0, ids_2_0, 1);
+    ggml_backend_expert_cache_record_prediction(cache, 1, ids_2_1, 1);
+
+    // Re-record (0,{2}) right before predicting so current_experts[0]={2}.
+    ggml_backend_expert_cache_record_prediction(cache, 0, ids_2_0, 1);
+
+    int32_t out[8] = {};
+    int32_t n = ggml_backend_expert_cache_predict_experts(cache, 0, 1, out, 8);
+    assert(n > 0);
+    assert(out[0] == 9);
+
+    ggml_backend_expert_cache_disable_predictor(cache);
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_free(backend);
+
+    printf("  transition conditioned on source tests passed\n");
+}
+
 int main() {
     printf("running test-expert-cache (V2 features)...\n");
 
@@ -847,6 +885,7 @@ int main() {
     test_submit_triggers_prefetch();
     test_stats_getter();
     test_prefetch_record_lifecycle();
+    test_transition_conditioned_on_source();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;
