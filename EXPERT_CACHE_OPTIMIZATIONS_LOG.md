@@ -1368,5 +1368,41 @@ verified with identical counter values.
 Round 2 (5I attribution fix): [pa-ptr], [zc-ptr], [wp-dbg] -
 GGML_PREDICTOR_DEBUG-gated with print caps; used to disprove
 pointer-mismatch and confirm was_prefetched firing. All removed after
-diagnosis.
+
+#### Phase 5I.1: per-op MUL_MAT_ID slot-pool carve-out (2026-08-23)
+
+**Goal:** replace the global `GGML_OP_OFFLOAD_MIN_BATCH=1` knob with a
+scoped carve-out that only affects MUL_MAT_ID on MoE expert weights.
+
+**Approach.** The first attempt tagged pool tensors with a sentinel value
+in `ggml_tensor::extra` and matched on that pointer in the CUDA offload
+gate. That failed: the sentinel was not observable at
+`op->src[0]->extra` (always NULL) because the slot tensor passed through
+the scheduler's view/copy paths between creation and the offload gate.
+
+**Plan B (committed):** carve-out uses the structural shape of MoE expert
+weights directly in the gate:
+```cpp
+if (op->op == GGML_OP_MUL_MAT_ID && op->ne[1] <= 8 &&
+    op->src[0] != NULL && op->src[0]->ne[2] > 1) {
+    return true;
+}
+```
+Reasoning: decode MUL_MAT_ID for qwen35moe folds top-k=8 experts into
+`ne[1]`, and MoE expert weights are 3D with `ne[2] == n_experts (> 1)`,
+whereas plain linear weights are 2D (`ne[2] == 1`). The combination is
+structurally unique to expert-cache-served decode.
+
+**Verification (-p 32 -n 16):**
+
+```
+                  ts  exec  from  reactive  zc  issued
+carve-out:     5.40  1360  554    1880    1074  19319
+MIN_BATCH=1:   5.54  1360  549    1880    1069  19338
+```
+
+Same attribution; carve-out is slightly faster (noise). Sums:
+`from + reactive = 2434` for carve-out, 2429 for MIN_BATCH=1; both
+consistent with `n_valid` (8 experts * 40 layers * 8 decode steps = 2560
+minus absent cases).
 

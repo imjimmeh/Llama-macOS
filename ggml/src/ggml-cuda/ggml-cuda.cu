@@ -5323,9 +5323,19 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
             return ggml_nrows(op);
     }
 }
-
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    // Phase 5I carve-out: single-token MUL_MAT_ID on MoE expert weights.
+    // Decode layout folds top-k experts into a small batch dim (ne[1] in
+    // {1..8} for the typical 8-used config). MoE expert weights are 3D
+    // with ne[2] == n_experts (> 1); plain linear weights are 2D (ne[2]==1).
+    // Without this carve-out, GGML_OP_OFFLOAD_MIN_BATCH=1 must be set
+    // globally, which over-broadly offloads unrelated small-batch ops.
+    if (op->op == GGML_OP_MUL_MAT_ID && op->ne[1] <= 8 &&
+        op->src[0] != NULL && op->src[0]->ne[2] > 1) {
+        return true;
+    }
 
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
