@@ -1992,22 +1992,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     n_ready++;
                                     if (ggml_backend_expert_cache_was_prefetched(cache, input, exp_id)) {
                                         n_from_pred++;
+                                        ggml_backend_expert_cache_record_gpu_slot_from_prediction(cache);
+                                    } else {
+                                        ggml_backend_expert_cache_record_gpu_slot_reactive(cache);
                                     }
                                 } else {
-                                    // Phase 5C: Check if async prefetch is ready
                                     if (ggml_backend_expert_cache_is_prefetch_ready(cache, input, exp_id)) {
                                         slot = ggml_backend_expert_cache_find_slot(cache, input, exp_id);
                                         if (slot >= 0) {
                                             remapped_ids[i] = slot;
                                             ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
                                             n_ready++;
-                                            if (ggml_backend_expert_cache_was_prefetched(cache, input, exp_id)) {
-                                                n_from_pred++;
-                                            }
+                                            n_from_pred++;
+                                            ggml_backend_expert_cache_record_gpu_slot_from_prediction(cache);
                                             continue;
                                         }
                                     }
-                                    // Phase 5H: bounded wait on an in-flight prefetch
                                     if (slot < 0 && ggml_backend_expert_cache_has_inflight_prefetch(cache, input, exp_id)) {
                                         const int64_t t_wait_start = ggml_time_us();
                                         ggml_backend_expert_cache_wait_prefetch(cache, input, exp_id);
@@ -2019,6 +2019,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                             ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
                                             n_inflight++;
                                             n_from_pred++;
+                                            ggml_backend_expert_cache_record_gpu_slot_from_prediction(cache);
                                             continue;
                                         }
                                     }

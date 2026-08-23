@@ -1569,9 +1569,6 @@ bool ggml_backend_expert_cache_was_prefetched(
         ggml_backend_expert_cache_t cache,
         const struct ggml_tensor * tensor,
         int32_t expert_id) {
-    if (cache == NULL || tensor == NULL) {
-        return false;
-    }
     for (const auto & slot : cache->prefetch_slots) {
         if (slot.tensor == tensor && slot.expert_id == expert_id &&
             (slot.state == GGML_EXPERT_CACHE_PREFETCH_RESIDENT ||
@@ -1598,24 +1595,19 @@ bool ggml_backend_expert_cache_is_prefetch_ready(
     if (cache == NULL || tensor == NULL) {
         return false;
     }
-    
+
 #if defined(GGML_USE_CUDA)
-    // Check if this expert has an in-flight prefetch
     for (auto& slot : cache->prefetch_slots) {
         if (slot.tensor == tensor && slot.expert_id == expert_id) {
             if (slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT) {
-                // Check if the event is complete
                 cudaError_t err = cudaEventQuery((cudaEvent_t)slot.ready_event);
                 if (err == cudaSuccess) {
-                    // Prefetch complete, mark as resident
                     slot.state = GGML_EXPERT_CACHE_PREFETCH_RESIDENT;
                     cache->stats.n_prefetch_hits++;
                     return true;
                 } else if (err == cudaErrorNotReady) {
-                    // Still in flight
                     return false;
                 } else {
-                    // Error occurred
                     return false;
                 }
             } else if (slot.state == GGML_EXPERT_CACHE_PREFETCH_RESIDENT) {
@@ -1624,7 +1616,7 @@ bool ggml_backend_expert_cache_is_prefetch_ready(
         }
     }
 #endif
-    
+
     return false;
 }
 

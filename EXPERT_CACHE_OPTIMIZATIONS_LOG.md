@@ -1321,28 +1321,52 @@ than reactive vs reactive.
    require `find_slot(...) >= 0` so stale entries after eviction do not
    produce false positives.
 
-#### Current state (uncommitted)
+#### Real root cause of `from_pred=0` (found 2026-08-23, fix landed)
 
-Predictive fills now issue (`issued=19338` for `-p 32 -n 16 -fitt 256
--exc 256 -excp 64`) but attribution remains fully reactive
-(`from_pred=0`). Leading hypothesis: tensor pointer mismatch - bundle
-registration keys `(tensor*, eid)` off the host originals from
-`src/llama-context.cpp`, while graph MUL_MAT_ID src0 may be a different
-(fit-promoted) pointer, so zero-copy lookup misses. Debug print pointers
-per layer to confirm before fixing.
+Pointer-mismatch hypothesis from the previous session was disproven:
+paired `[pa-ptr]`/`[zc-ptr]` traces show bundle-registered tensors and
+graph MUL_MAT_ID src0 are the same object per layer (e.g. layer 11
+`input=00000210665CB910` in zc-ptr equals `tensor=...CB910` in pa-ptr).
+`[wp-dbg]` instrumentation inside `was_prefetched` showed it returning
+TRUE many times per step (e.g. `layer=11 exp=180 entry=yes resident=8`,
+`layer=12 exp=52 entry=yes resident=15/31`), yet `from_pred=0`.
+
+Real cause is the **all-or-nothing attribution gate** at the bottom of
+the zero-copy loop: `if (n_from_pred == n_valid) record_from_prediction
+else record_reactive`. The strict gate required the predictor to land
+ALL 8 experts for a layer before any count, which never happens with
+current predictor recall (~22% of routed experts served from prefetched
+slots). was_prefetched fired correctly and n_from_pred accumulated in
+the local, but the gate discarded it.
+
+**Fix:** switched attribution to per-expert. Inside the per-expert loop,
+`was_prefetched(eid)` increments `n_from_pred` and calls
+`record_gpu_slot_from_prediction`; every other routed expert calls
+`record_gpu_slot_reactive`. The strict gate after the loop was removed.
+Sum invariant: `from_pred + reactive == n_valid` (routed experts served
+via slot install).
+
+#### Outcome (-p 32 -n 16, single run each)
+
+```
+             exec  from_pred  reactive  zero_copy_hits  ts t/s
+predictor:  1360      549      1880       1069           5.37
+no-pred:    1360      486      1898       1024           4.36
+```
+
+Predictor adds ~13% extra from-predicted slots but ts regresses ~1 t/s
+because the predictor's prefetch path costs CPU + DMA while the
+heuristic predictor already populates most slots on its own. Plumbing
+is correct; perf optimization is Phase 5J.
 
 #### Diagnostic instrumentation added then removed
 
-zc-dbg / attr-dbg / agg-dbg / rx-dbg / pa-dbg x2 / sub-dbg / bench-dbg -
-all removed; clean rebuild verified with identical counter values.
+Round 1 (5I plumbing commit `ad60cc644`): zc-dbg / attr-dbg / agg-dbg /
+rx-dbg / pa-dbg x2 / sub-dbg / bench-dbg - all removed; clean rebuild
+verified with identical counter values.
 
-#### Bench command (canonical for 5I verification)
-
-```
-GGML_OP_OFFLOAD_MIN_BATCH=1 ./build/bin/Release/llama-bench.exe \
-  -m "C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf" \
-  -p 32 -n 16 -fitt 256 -exc 256 -excp 64 \
-  --routing-predictor-model tools/training_data/model.bin \
-  --routing-predictor-variant low-rank-mlp --routing-predictor-stats -r 1 -o csv
-```
+Round 2 (5I attribution fix): [pa-ptr], [zc-ptr], [wp-dbg] -
+GGML_PREDICTOR_DEBUG-gated with print caps; used to disprove
+pointer-mismatch and confirm was_prefetched firing. All removed after
+diagnosis.
 

@@ -813,20 +813,46 @@ gpu_slot_exec_reactive == gpu_slot_executions` invariant).
    still be resident in the pool (`find_slot >= 0`) to count, so stale
    entries after eviction do not inflate attribution.
 
-**Status after cleanup rebuild (-p 32 -n 16 smoke):**
+**Status after attribution fix (per-expert counters):**
 
 ```
-exec=1360 from_pred=0 reactive=1360 issued=19338 src_nh=176 zc=1069
-pred_gen=640 pred_used=464 ts=5.83
+exec=1360 from_pred=549 reactive=1880 zc=1069 pred_used=464 issued=19338 ts=5.37
 ```
 
-Predictive fills issue and predictions are consumed, but attribution is
-still fully reactive. Leading hypothesis: pointer mismatch between bundle
-registration keys (host originals from `src/llama-context.cpp`) and the
-graph MUL_MAT_ID src0 weight tensor (fit-promoted copy), so the zero-copy
-lookup `(tensor*, eid) -> slot` misses prefetched slots. Next step is a
-pointer-trace comparison per layer; see Phase 5I in
-`EXPERT_CACHE_OPTIMIZATIONS_LOG.md`.
+**Root cause of `from_pred=0` found:** the attribution gate was strictly
+all-or-nothing per decode step: `n_from_pred == n_valid` was required
+before incrementing from_pred, meaning the predictor had to land ALL 8
+experts for a layer before any count. With current predictor recall
+(~22% of routed experts served from prefetched slots), the gate never
+closed, so from_pred stayed 0. The pointer-mismatch hypothesis from the
+previous session was disproven by paired per-layer `pa-ptr` and `zc-ptr`
+traces: bundle-registered tensors and graph MUL_MAT_ID src0 are the
+same object. The pre-existing `wp-dbg` instrumentation showed
+`was_prefetched` returning TRUE many times per step but the strict gate
+throwing those counts away.
+
+**Fix:** switched attribution to per-expert. Inside the zero-copy loop,
+`was_prefetched(eid)` increments from_pred; every other routed expert
+increments reactive. Sum invariant: `from_pred + reactive == n_valid`
+(routed experts served via slot install). The all-or-nothing gate was
+removed.
+
+**Outcome (-p 32 -n 16):**
+
+```
+             exec  from_pred  reactive  zero_copy_hits  ts t/s
+predictor:  1360      549      1880       1069           5.37
+no-pred:    1360      486      1898       1024           4.36
+```
+
+Predictor adds ~13% extra from-predicted slots; ts regresses ~1 t/s
+because the predictor's prefetch path costs CPU + DMA while the
+heuristic predictor already populates most slots. Plumbing is correct;
+perf optimization is Phase 5J.
+
+**Diagnostic hooks removed:** temp `[pa-ptr]`/`[zc-ptr]`/`[wp-dbg]`
+fprintf blocks are removed; re-enable by re-adding at the sites listed in
+`EXPERT_CACHE_OPTIMIZATIONS_LOG.md` Phase 5I.
 
 **Row-pair convention for matrix summaries:** each row of a matrix CSV is
 a config; deltas come from pairing rows via `summarize_matrix.py`
