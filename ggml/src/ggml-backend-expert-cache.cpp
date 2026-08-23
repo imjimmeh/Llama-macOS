@@ -171,6 +171,10 @@ struct ggml_backend_expert_cache {
 
     // Phase 1: Slot Pools
     size_t pool_alloc_offset = 0;
+    // Task 6: sum of every pool's bytes (carved + extra backend buffers)
+    // against cache->capacity; get_or_create_pool rejects when this would
+    // overflow. Decremented when pool buffers are freed.
+    size_t pool_bytes_total = 0;
     std::unordered_map<ggml_expert_cache_pool_key, ggml_expert_cache_slot_pool, ggml_expert_cache_pool_key_hash> slot_pools;
 
     // Phase 3: Expert Bundles
@@ -182,9 +186,17 @@ struct ggml_backend_expert_cache {
     // Phase 5: Host Pinned Staging Buffer
     void * pinned_host_buffer = nullptr;
     size_t pinned_host_capacity = 0;
+    // True when pinned_host_buffer was allocated with cudaHostAlloc; tracked
+    // so the matching free path uses cudaFreeHost instead of aligned free.
+    bool pinned_is_cuda = false;
     // Phase 5b: staging ring keyed by (tensor, slot_idx); waits before reuse
     std::vector<ggml_backend_event_t> staging_events;
     std::vector<bool>                 staging_in_flight;
+#if defined(GGML_USE_CUDA)
+    // Parallel ring holding raw cudaEvent_t handles recorded on whichever
+    // stream the caller used; stage_acquire waits via cudaEventSynchronize.
+    std::vector<void *> staging_cuda_events;
+#endif
 
 
 
@@ -322,24 +334,34 @@ static ggml_expert_cache_slot_pool * ggml_backend_expert_cache_get_or_create_poo
     }
 
     const size_t pool_bytes = max_slots * stride;
+    // Task 6: every pool's bytes count against cache->capacity (carved and
+    // extra backend buffers alike). Refuse creation rather than aliasing
+    // the flat cache buffer when the global budget is exhausted.
+    if (cache->pool_bytes_total + pool_bytes > cache->capacity) {
+        ggml_free(pctx);
+        return NULL;
+    }
     ggml_backend_buffer_t pbuffer = NULL;
 
     if (cache->used == 0 && cache->pool_alloc_offset + pool_bytes <= cache->capacity && cache->tensor != NULL && cache->tensor->data != NULL) {
         ptensor->data = (uint8_t *)cache->tensor->data + cache->pool_alloc_offset;
         ptensor->buffer = cache->buffer;
         cache->pool_alloc_offset += pool_bytes;
+        cache->pool_bytes_total += pool_bytes;
     } else {
         pbuffer = ggml_backend_alloc_buffer(cache->backend, pool_bytes);
-        if (pbuffer != NULL) {
-            if (ggml_backend_tensor_alloc(pbuffer, ptensor, ggml_backend_buffer_get_base(pbuffer)) != GGML_STATUS_SUCCESS) {
-                ggml_free(pctx);
-                ggml_backend_buffer_free(pbuffer);
-                return NULL;
-            }
-        } else {
-            ptensor->data = cache->tensor->data;
-            ptensor->buffer = cache->buffer;
+        if (pbuffer == NULL) {
+            // Fallback path no longer aliases the flat cache buffer; treat
+            // backend-allocator refusal as an exhausted budget.
+            ggml_free(pctx);
+            return NULL;
         }
+        if (ggml_backend_tensor_alloc(pbuffer, ptensor, ggml_backend_buffer_get_base(pbuffer)) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(pbuffer);
+            ggml_free(pctx);
+            return NULL;
+        }
+        cache->pool_bytes_total += pool_bytes;
     }
 
     ptensor->nb[0] = weight_tensor->nb[0];
@@ -442,18 +464,35 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
             ggml_free(kv.second.ctx);
         }
         if (kv.second.buffer) {
+            // Mirror the increment in get_or_create_pool's extra-buffer path
+            // so pool_bytes_total cannot drift positive after teardown.
+            const size_t used_bytes = (size_t) kv.second.max_slots * kv.second.stride;
+            if (cache->pool_bytes_total >= used_bytes) {
+                cache->pool_bytes_total -= used_bytes;
+            } else {
+                cache->pool_bytes_total = 0;
+            }
             ggml_backend_buffer_free(kv.second.buffer);
         }
     }
     cache->slot_pools.clear();
 
     if (cache->pinned_host_buffer) {
-#if defined(_WIN32)
-        _aligned_free(cache->pinned_host_buffer);
-#else
-        free(cache->pinned_host_buffer);
+#if defined(GGML_USE_CUDA)
+        if (cache->pinned_is_cuda) {
+            cudaFreeHost(cache->pinned_host_buffer);
+            cache->pinned_is_cuda = false;
+        } else
 #endif
+        {
+#if defined(_WIN32)
+            _aligned_free(cache->pinned_host_buffer);
+#else
+            free(cache->pinned_host_buffer);
+#endif
+        }
         cache->pinned_host_buffer = nullptr;
+        cache->pinned_host_capacity = 0;
     }
 
     for (size_t i = 0; i < cache->staging_events.size(); i++) {
@@ -462,6 +501,14 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
         }
     }
     cache->staging_events.clear();
+#if defined(GGML_USE_CUDA)
+    for (void * e : cache->staging_cuda_events) {
+        if (e != nullptr) {
+            cudaEventDestroy((cudaEvent_t) e);
+        }
+    }
+    cache->staging_cuda_events.clear();
+#endif
 
 
 #if defined(GGML_USE_CUDA)
@@ -1369,18 +1416,39 @@ void * ggml_backend_expert_cache_get_pinned_buffer(
 
     if (cache->pinned_host_capacity < required_size) {
         if (cache->pinned_host_buffer) {
-#if defined(_WIN32)
-            _aligned_free(cache->pinned_host_buffer);
-#else
-            free(cache->pinned_host_buffer);
+#if defined(GGML_USE_CUDA)
+            if (cache->pinned_is_cuda) {
+                cudaFreeHost(cache->pinned_host_buffer);
+                cache->pinned_is_cuda = false;
+            } else
 #endif
+            {
+#if defined(_WIN32)
+                _aligned_free(cache->pinned_host_buffer);
+#else
+                free(cache->pinned_host_buffer);
+#endif
+            }
+            cache->pinned_host_buffer = nullptr;
+            cache->pinned_host_capacity = 0;
         }
         cache->pinned_host_capacity = GGML_EXPERT_CACHE_PAD(required_size);
-#if defined(_WIN32)
-        cache->pinned_host_buffer = _aligned_malloc(cache->pinned_host_capacity, GGML_EXPERT_CACHE_ALIGN);
-#else
-        posix_memalign(&cache->pinned_host_buffer, GGML_EXPERT_CACHE_ALIGN, cache->pinned_host_capacity);
+#if defined(GGML_USE_CUDA)
+        // Prefer truly pinned CUDA host pages when the build links CUDA so
+        // staging memcpys skip the pageable bounce buffer. Fall back to
+        // aligned malloc if the driver refuses the allocation.
+        if (cudaHostAlloc(&cache->pinned_host_buffer, cache->pinned_host_capacity, cudaHostAllocDefault) == cudaSuccess) {
+            cache->pinned_is_cuda = true;
+        } else
 #endif
+        {
+#if defined(_WIN32)
+            cache->pinned_host_buffer = _aligned_malloc(cache->pinned_host_capacity, GGML_EXPERT_CACHE_ALIGN);
+#else
+            posix_memalign(&cache->pinned_host_buffer, GGML_EXPERT_CACHE_ALIGN, cache->pinned_host_capacity);
+#endif
+            cache->pinned_is_cuda = false;
+        }
     }
     return cache->pinned_host_buffer;
 }
@@ -1411,10 +1479,18 @@ void * ggml_backend_expert_cache_stage_acquire(
         for (size_t i = 0; i < GGML_EXPERT_CACHE_STAGING_ENTRIES; i++) {
             cache->staging_events[i] = ggml_backend_event_new(dev);
         }
+#if defined(GGML_USE_CUDA)
+        cache->staging_cuda_events.assign(GGML_EXPERT_CACHE_STAGING_ENTRIES, nullptr);
+#endif
     }
 
     // never write over a copy that may still be read by the DMA engine
     if (cache->staging_in_flight[idx]) {
+#if defined(GGML_USE_CUDA)
+        if (!cache->staging_cuda_events.empty() && cache->staging_cuda_events[idx] != nullptr) {
+            cudaEventSynchronize((cudaEvent_t)cache->staging_cuda_events[idx]);
+        } else
+#endif
         if (cache->staging_events[idx] != NULL) {
             ggml_backend_event_synchronize(cache->staging_events[idx]);
         } else {
@@ -1437,11 +1513,26 @@ void * ggml_backend_expert_cache_stage_acquire(
 void ggml_backend_expert_cache_stage_commit(
         ggml_backend_expert_cache_t cache,
         const struct ggml_tensor * tensor,
-        int32_t slot_idx) {
+        int32_t slot_idx,
+        enum ggml_expert_cache_stage_stream stream) {
     if (cache == NULL || tensor == NULL || cache->staging_events.empty()) {
         return;
     }
     const size_t idx = ggml_expert_cache_staging_index(tensor, slot_idx);
+#if defined(GGML_USE_CUDA)
+    if (stream == GGML_EXPERT_CACHE_STAGE_PREFETCH && cache->prefetch_stream != nullptr) {
+        if (!cache->staging_cuda_events.empty() && cache->staging_cuda_events[idx] == nullptr) {
+            cudaEventCreateWithFlags((cudaEvent_t *)&cache->staging_cuda_events[idx], cudaEventDisableTiming);
+        }
+        if (!cache->staging_cuda_events.empty() && cache->staging_cuda_events[idx] != nullptr) {
+            cudaEventRecord((cudaEvent_t)cache->staging_cuda_events[idx], (cudaStream_t)cache->prefetch_stream);
+        }
+        cache->staging_in_flight[idx] = true;
+        return;
+    }
+#else
+    (void) stream;
+#endif
     if (cache->staging_events[idx] != NULL) {
         ggml_backend_event_record(cache->staging_events[idx], cache->backend);
     }
@@ -1623,7 +1714,8 @@ void ggml_backend_expert_cache_prefetch_async(
             // Record event on prefetch stream
             cudaEventRecord(event, (cudaStream_t)cache->prefetch_stream);
 
-            ggml_backend_expert_cache_stage_commit(cache, tensor, slot_idx);
+            ggml_backend_expert_cache_stage_commit(
+                cache, tensor, slot_idx, GGML_EXPERT_CACHE_STAGE_PREFETCH);
         } else {
             // No pinned buffer available: roll back the published slot
             // and event, then skip.

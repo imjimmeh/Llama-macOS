@@ -270,10 +270,17 @@ GGML_API void * ggml_backend_expert_cache_stage_acquire(
     int32_t slot_idx,
     size_t required_size);
 
+// The guard event is recorded on the stream that issued the staging copy.
+enum ggml_expert_cache_stage_stream {
+    GGML_EXPERT_CACHE_STAGE_BACKEND,
+    GGML_EXPERT_CACHE_STAGE_PREFETCH,
+};
+
 GGML_API void ggml_backend_expert_cache_stage_commit(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * tensor,
-    int32_t slot_idx);
+    int32_t slot_idx,
+    enum ggml_expert_cache_stage_stream stream = GGML_EXPERT_CACHE_STAGE_BACKEND);
 
 
 
