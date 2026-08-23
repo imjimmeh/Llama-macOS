@@ -137,6 +137,16 @@ struct ggml_expert_cache_prefetch_slot {
     int32_t slot_idx;
 };
 
+// Pack (from_layer, to_layer, src_expert, dst_expert) into one uint64 map key.
+// Fields bounded by predictor_max_layers/experts; 8 bits per layer + 20 per expert fits.
+static inline uint64_t ggml_expert_cache_pack_transition_key(
+        int32_t from_layer, int32_t to_layer, int32_t src_expert, int32_t dst_expert) {
+    return ((uint64_t)from_layer << 48) |
+           ((uint64_t)to_layer   << 40) |
+           ((uint64_t)src_expert << 20) |
+           ((uint64_t)dst_expert);
+}
+
 struct ggml_backend_expert_cache {
     ggml_backend_t backend;
 
@@ -210,8 +220,8 @@ struct ggml_backend_expert_cache {
     bool predictor_enabled = false;
     int32_t predictor_max_layers = 0;
     int32_t predictor_max_experts = 0;
-    // transition_table[from_layer][to_layer][expert_id] = count
-    std::vector<std::vector<std::vector<int32_t>>> transition_table;
+    // transition_sparse key = pack(from, to, src, dst); value = count of (src -> dst)
+    std::unordered_map<uint64_t, int32_t> transition_sparse;
     // current_experts[layer] = list of expert IDs used
     std::vector<std::vector<int32_t>> current_experts;
     
@@ -1821,15 +1831,9 @@ void ggml_backend_expert_cache_enable_predictor(
     cache->predictor_max_layers = max_layers;
     cache->predictor_max_experts = max_experts_per_layer;
     
-    // Initialize transition table: [from_layer][to_layer][expert_id]
-    cache->transition_table.resize(max_layers);
-    for (int32_t i = 0; i < max_layers; i++) {
-        cache->transition_table[i].resize(max_layers);
-        for (int32_t j = 0; j < max_layers; j++) {
-            cache->transition_table[i][j].resize(max_experts_per_layer, 0);
-        }
-    }
-    
+    // transition_sparse is grown lazily on first record.
+    cache->transition_sparse.clear();
+
     // Initialize current experts tracking
     cache->current_experts.resize(max_layers);
     
@@ -1844,7 +1848,7 @@ void ggml_backend_expert_cache_disable_predictor(
     }
     
     cache->predictor_enabled = false;
-    cache->transition_table.clear();
+    cache->transition_sparse.clear();
     cache->current_experts.clear();
     
     GGML_LOG_INFO("Expert cache predictor disabled\n");
@@ -1860,14 +1864,15 @@ void ggml_backend_expert_cache_record_prediction(
         return;
     }
     
-    // Update transition table: for each expert used in this layer,
-    // increment the transition count from previous layer's experts
+    // Record sparse (prev, curr) transition counts conditioned on source expert.
     if (layer > 0 && !cache->current_experts[layer - 1].empty()) {
         for (int32_t prev_expert : cache->current_experts[layer - 1]) {
             for (int32_t i = 0; i < n_experts; i++) {
                 int32_t curr_expert = expert_ids[i];
                 if (curr_expert >= 0 && curr_expert < cache->predictor_max_experts) {
-                    cache->transition_table[layer - 1][layer][curr_expert]++;
+                    uint64_t key = ggml_expert_cache_pack_transition_key(
+                            layer - 1, layer, prev_expert, curr_expert);
+                    cache->transition_sparse[key]++;
                 }
             }
         }
@@ -1895,29 +1900,28 @@ int32_t ggml_backend_expert_cache_predict_experts(
         return 0;
     }
     
-    // If we have current experts for from_layer, use transition table
+    // Score each candidate dst by summing (src -> dst) counters restricted
+    // to the experts actually used at from_layer.
     if (!cache->current_experts[from_layer].empty()) {
-        // Collect all predicted experts with their scores
-        std::vector<std::pair<int32_t, int32_t>> expert_scores; // (expert_id, score)
-        
+        std::unordered_map<int32_t, int32_t> dst_score;
+        dst_score.reserve(cache->predictor_max_experts);
+
         for (int32_t prev_expert : cache->current_experts[from_layer]) {
-            for (int32_t expert_id = 0; expert_id < cache->predictor_max_experts; expert_id++) {
-                int32_t score = cache->transition_table[from_layer][to_layer][expert_id];
-                if (score > 0) {
-                    // Check if expert already in list
-                    bool found = false;
-                    for (auto& p : expert_scores) {
-                        if (p.first == expert_id) {
-                            p.second += score;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        expert_scores.push_back({expert_id, score});
-                    }
+            if (prev_expert < 0 || prev_expert >= cache->predictor_max_experts) continue;
+            for (int32_t dst_expert = 0; dst_expert < cache->predictor_max_experts; dst_expert++) {
+                uint64_t key = ggml_expert_cache_pack_transition_key(
+                        from_layer, to_layer, prev_expert, dst_expert);
+                auto it = cache->transition_sparse.find(key);
+                if (it != cache->transition_sparse.end()) {
+                    dst_score[dst_expert] += it->second;
                 }
             }
+        }
+
+        std::vector<std::pair<int32_t, int32_t>> expert_scores;
+        expert_scores.reserve(dst_score.size());
+        for (auto& p : dst_score) {
+            expert_scores.emplace_back(p.first, p.second);
         }
         
         // Sort by score (descending)
@@ -2843,4 +2847,3 @@ void ggml_backend_expert_cache_add_predictions_generated(
     }
     cache->stats.routing_predictor.predictions_generated += n;
 }
-
