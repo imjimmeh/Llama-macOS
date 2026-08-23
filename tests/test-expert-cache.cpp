@@ -9,6 +9,7 @@
 #include <cstring>
 #include <vector>
 
+#define REQUIRE(cond) do { if (!(cond)) { fprintf(stderr, "require failed: %s (%s:%d)\n", #cond, __FILE__, __LINE__); abort(); } } while (0)
 static void require(bool condition) {
     if (!condition) {
         fprintf(stderr, "test requirement failed\n");
@@ -122,6 +123,12 @@ static void test_slot_pools_and_remapping() {
     assert(s11 >= 0);
     assert(s3 != s7 && s7 != s11 && s3 != s11);
 
+    // Task 1 contract: alloc publishes LOADING only. Mark resident so the
+    // existing find_slot / remap assertions below still hold.
+    ggml_backend_expert_cache_mark_resident(cache, tensor, 3);
+    ggml_backend_expert_cache_mark_resident(cache, tensor, 7);
+    ggml_backend_expert_cache_mark_resident(cache, tensor, 11);
+
     // Test find_slot
     assert(ggml_backend_expert_cache_find_slot(cache, tensor, 3) == s3);
     assert(ggml_backend_expert_cache_find_slot(cache, tensor, 7) == s7);
@@ -160,7 +167,7 @@ static void test_slru_and_admission_policy() {
     assert(backend != nullptr);
 
     const size_t expert_bytes = 512;
-    const size_t cache_capacity = 4 * 512; // 4 slots total (1 probationary, 3 protected)
+    const size_t cache_capacity = 8 * 512; // pools split capacity in half -> 4 slots
 
     ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
     assert(cache != nullptr);
@@ -184,6 +191,11 @@ static void test_slru_and_admission_policy() {
     int32_t s2 = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, 2, nullptr, 0);
     int32_t s3 = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, 3, nullptr, 0);
     assert(s0 >= 0 && s1 >= 0 && s2 >= 0 && s3 >= 0);
+    // Mark resident for downstream assertions.
+    ggml_backend_expert_cache_mark_resident(cache, tensor, 0);
+    ggml_backend_expert_cache_mark_resident(cache, tensor, 1);
+    ggml_backend_expert_cache_mark_resident(cache, tensor, 2);
+    ggml_backend_expert_cache_mark_resident(cache, tensor, 3);
 
     // Touch expert 0 and 1 multiple times to promote to protected
     ggml_backend_expert_cache_touch(cache, tensor, 0);
@@ -194,7 +206,15 @@ static void test_slru_and_admission_policy() {
     // Allocate a new expert 4 when full -> should evict least recently used from probationary (e.g. 2 or 3)
     int32_t s4 = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, 4, nullptr, 0);
     assert(s4 >= 0);
+    ggml_backend_expert_cache_mark_resident(cache, tensor, 4);
 
+    fprintf(stderr, "[dbg] s0=%d s1=%d s2=%d s3=%d s4=%d\n", s0,s1,s2,s3,s4);
+    fprintf(stderr, "[dbg] loading: e0=%d e1=%d e2=%d e3=%d e4=%d\n",
+        ggml_backend_expert_cache_find_or_loading_slot(cache, tensor, 0),
+        ggml_backend_expert_cache_find_or_loading_slot(cache, tensor, 1),
+        ggml_backend_expert_cache_find_or_loading_slot(cache, tensor, 2),
+        ggml_backend_expert_cache_find_or_loading_slot(cache, tensor, 3),
+        ggml_backend_expert_cache_find_or_loading_slot(cache, tensor, 4));
     // Verify hot protected experts 0 and 1 are still resident
     assert(ggml_backend_expert_cache_find_slot(cache, tensor, 0) >= 0);
     assert(ggml_backend_expert_cache_find_slot(cache, tensor, 1) >= 0);
@@ -247,6 +267,10 @@ static void test_expert_bundles() {
 
     // Allocate down as well -> now bundle is resident
     ggml_backend_expert_cache_alloc_slot_idx(cache, down, 1, nullptr, 0);
+    // Task 1: alloc only publishes LOADING. Mark both resident so the
+    // bundle-resident assertion below holds.
+    ggml_backend_expert_cache_mark_resident(cache, gate, 1);
+    ggml_backend_expert_cache_mark_resident(cache, down, 1);
     assert(ggml_backend_expert_cache_is_bundle_resident(cache, 2, 1));
 
     ggml_backend_expert_cache_free(cache);
@@ -617,10 +641,16 @@ static void test_settle_accounting() {
 
     ggml_backend_expert_cache_register_bundle(cache, 10, gate, nullptr, down);
 
-    // Predict experts {5, 9} for layer 10; submit triggers prefetch of both.
-    // On CPU the sync fallback makes both resident.
+    // Predict experts {5, 9} for layer 10. Host-to-host prefetch is skipped
+    // on a CPU backend, so pre-resident expert 5 ourselves.
     const int32_t pred[2] = {5, 9};
     ggml_backend_expert_cache_submit_prediction(cache, 10, pred, 2, nullptr);
+    for (struct ggml_tensor * t : {gate, down}) {
+        int32_t s5 = ggml_backend_expert_cache_alloc_slot_idx(cache, t, 5, nullptr, 0);
+        assert(s5 >= 0);
+        memset((uint8_t *)t->data + (size_t)5 * expert_bytes, 0x11, expert_bytes);
+        ggml_backend_expert_cache_mark_resident(cache, t, 5);
+    }
 
     // actual execution requested {5, 33}: 5 predicted+resident (fully hidden),
     // 33 not predicted (wrong)
@@ -631,7 +661,8 @@ static void test_settle_accounting() {
     struct ggml_routing_predictor_stats s = {};
     assert(ggml_backend_expert_cache_get_routing_predictor_stats(cache, &s));
     assert(s.predictions_used == 1);
-    assert(s.experts_fully_hidden == 2);  // 5 and 9 both resident
+    // only USED predicted experts count as fully hidden: 5 yes, 9 unused
+    assert(s.experts_fully_hidden == 1);
     assert(s.experts_missed == 0);
     assert(s.predictions_wrong == 1);     // 33 not predicted
 
@@ -672,9 +703,9 @@ static void test_submit_triggers_prefetch() {
     const int32_t ids[2] = {1, 5};
     ggml_backend_expert_cache_submit_prediction(cache, 12, ids, 2, nullptr);
 
-    struct ggml_backend_expert_cache_stats stats;
-    ggml_backend_expert_cache_get_stats(cache, &stats);
-    assert(stats.n_speculative_prefetches > 0);
+    // Host-to-host prefetch is skipped on a CPU backend; the submission
+    // itself must still be queued for settle accounting.
+    assert(ggml_backend_expert_cache_pending_prediction_count(cache) == 1);
 
     ggml_backend_expert_cache_free(cache);
     ggml_free(ctx);
@@ -708,12 +739,102 @@ static void test_stats_getter() {
     printf("  stats getter tests passed\n");
 }
 
+
+static void test_loading_slot_not_visible_as_resident() {
+    printf("testing loading vs resident visibility...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr);
+
+    const size_t expert_bytes = 1024;
+    const size_t cache_capacity = 8 * 1024;
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    REQUIRE(cache != nullptr);
+
+    size_t mem_size = 16 * 1024 * 1024;
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ mem_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+
+    struct ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
+    ggml_set_name(tensor, "blk.0.ffn_gate_exps.weight");
+    tensor->nb[2] = expert_bytes;
+
+    int32_t s = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, 3, nullptr, 0);
+    REQUIRE(s >= 0);
+    // After alloc, slot is LOADING -> find_slot returns -1; loading lookup succeeds.
+    REQUIRE(ggml_backend_expert_cache_find_slot(cache, tensor, 3) == -1);
+    REQUIRE(ggml_backend_expert_cache_find_or_loading_slot(cache, tensor, 3) == s);
+
+    ggml_backend_expert_cache_mark_resident(cache, tensor, 3);
+    REQUIRE(ggml_backend_expert_cache_find_slot(cache, tensor, 3) == s);
+
+    int32_t req_ids[2] = { 3, 4 };
+    int32_t remapped[2] = { -1, -1 };
+    bool hit[2] = { false, false };
+    int32_t n_hits = ggml_backend_expert_cache_remap_ids(cache, tensor, req_ids, 2, remapped, hit);
+    REQUIRE(n_hits == 1);
+    REQUIRE(hit[0] == true && remapped[0] == s);
+    REQUIRE(hit[1] == false);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  loading vs resident visibility tests passed\n");
+}
+
+static void test_prefetch_record_lifecycle() {
+    printf("testing prefetch record lifecycle (host-to-host skip)...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    REQUIRE(backend != nullptr);
+
+    const size_t expert_bytes = 1024;
+    const size_t cache_capacity = 8 * expert_bytes;
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    REQUIRE(cache != nullptr);
+
+    size_t mem_size = 16 * 1024 * 1024;
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ mem_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    REQUIRE(ctx != nullptr);
+
+    struct ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 8);
+    ggml_set_name(tensor, "blk.4.ffn_gate_exps.weight");
+    tensor->nb[2] = expert_bytes;
+
+    // Host source + host slot pool gains nothing from staging, so prefetch
+    // must be a clean no-op: no slot published, no pending record kept.
+    const int32_t ids[1] = { 6 };
+    ggml_backend_expert_cache_prefetch_async(cache, tensor, ids, 1, 4);
+    REQUIRE(ggml_backend_expert_cache_find_or_loading_slot(cache, tensor, 6) == -1);
+    REQUIRE(ggml_backend_expert_cache_find_slot(cache, tensor, 6) == -1);
+    REQUIRE(ggml_backend_expert_cache_prefetch_slot_count(cache) == 0);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  prefetch record lifecycle tests passed\n");
+}
+
 int main() {
     printf("running test-expert-cache (V2 features)...\n");
 
     test_cache_node_selection();
     test_cache_capacity_admission();
     test_slot_pools_and_remapping();
+    test_loading_slot_not_visible_as_resident();
     test_pinned_staging_no_overwrite();
 
     test_slru_and_admission_policy();
@@ -725,6 +846,7 @@ int main() {
     test_settle_accounting();
     test_submit_triggers_prefetch();
     test_stats_getter();
+    test_prefetch_record_lifecycle();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

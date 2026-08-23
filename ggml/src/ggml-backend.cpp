@@ -2072,6 +2072,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                             ggml_backend_expert_cache_record_probe_upload(cache, ggml_time_us() - t_upload_start);
 
                                         }
+                                        // Backend-ordered fill: set_async is enqueued
+                                        // before the consumer node on split_backend,
+                                        // so the slot data is observable on read.
+                                        ggml_backend_expert_cache_mark_resident(cache, input, exp_id);
                                     } else {
                                         all_slots_ready = false;
                                         break;

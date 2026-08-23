@@ -8,6 +8,26 @@
 #include <stdbool.h>
 
 #ifdef __cplusplus
+// Slot lifecycle state machine: EMPTY -> LOADING -> RESIDENT.
+// Typed via C++ enum class for safe field access in the slot entry struct.
+// C callers only need the integer constants; they see them via the regular
+// enum below.
+enum class ggml_expert_slot_state {
+    EMPTY = 0,
+    LOADING = 1,
+    RESIDENT = 2,
+};
+#endif
+
+// C-visible companion enum with the same numeric values so C TUs can refer
+// to the states by name. Not used by C++ code (which uses the enum class).
+enum ggml_expert_slot_state_c {
+    GGML_EXPERT_SLOT_STATE_EMPTY = 0,
+    GGML_EXPERT_SLOT_STATE_LOADING = 1,
+    GGML_EXPERT_SLOT_STATE_RESIDENT = 2,
+};
+
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -134,6 +154,18 @@ GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_slot_tensor(
     const struct ggml_tensor * weight_tensor);
 
 GGML_API int32_t ggml_backend_expert_cache_find_slot(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
+// Same as find_slot but also returns LOADING entries; used for dedupe.
+GGML_API int32_t ggml_backend_expert_cache_find_or_loading_slot(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
+// Mark a previously LOADING slot as RESIDENT (data is now visible to consumers).
+GGML_API void ggml_backend_expert_cache_mark_resident(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * tensor,
     int32_t expert_id);
