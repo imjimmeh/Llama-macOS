@@ -4068,16 +4068,9 @@ bool llm_graph_context::routing_predictor_callback(
         }
     }
 
-    // Only run predict+submit when the cb tensor buffer is host-resident.
-    // The expert cache engages (prefetch + settle) only for host-resident MoE
-    // weight tensors; calling submit_prediction for GPU-resident targets
-    // triggers prefetch_async which does a CPU memcpy from a CUDA device
-    // pointer (ggml-backend-expert-cache.cpp:1477) and crashes.
-    const bool host_buffer = tensor && tensor->buffer &&
-        ggml_backend_buffer_is_host(tensor->buffer);
-    if (!host_buffer) {
-        return true;
-    }
+    // Note: the logits tensor may be GPU-resident (fit configs place router
+    // weights on GPU); tensor_get above does the D2H read. Prefetch safety is
+    // enforced in prefetch_async itself, which skips non-host source weights.
 
     // Stage logits so the expert-cache route trace (v2) can attach them
     // to this layer's next trace entry

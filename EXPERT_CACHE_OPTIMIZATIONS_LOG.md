@@ -1281,3 +1281,68 @@ in this branch in favor of `--load-mode <enum>`. `--load-mode none` is the
 direct replacement. Help text lists `--no-mmap` as deprecated and the binary
 rejects it with `invalid parameter for argument: --no-mmap`.
 
+
+### Phase 5I: Predictor Engagement + Execution Attribution (2026-08-23)
+
+**Goal:** prove `gpu_slot_exec_from_prediction > 0` for at least one decode
+step, so the Phase 5H matrix compares learned lookahead vs reactive rather
+than reactive vs reactive.
+
+#### Root causes found this phase
+
+1. **Attribution delta stayed 0.** The EXPERT_CACHE_SUBTRACT list in
+   `tools/llama-bench/llama-bench.cpp` omitted
+   `n_gpu_slot_exec_reactive`, so the per-test delta was 0-initialized and
+   the CSV column always read 0. Fixed at line 1651. Verified invariant
+   `from_prediction + reactive == executions` holds (`exec=1360,
+   reactive=1360` for `-n 16`).
+2. **Prefetch never issued.** `#if defined(GGML_USE_CUDA)` is FALSE when
+   `ggml-backend-expert-cache.cpp` compiles into `ggml-base.dll`
+   (objdump-verified: ggml-base.dll imports no CUDA DLLs). The prefetch
+   stream was therefore never created, and the old code fell into a legacy
+   sync fallback that copied into the flat cache without creating
+   `prefetch_slots` entries or incrementing `n_prefetch_issued`.
+3. **Predictive fill reworked, backend-agnostic.** Removed the dead CUDA
+   branch and the sync fallback. Non-CUDA path now issues
+   `ggml_backend_tensor_set_async(cache->backend, pool->tensor, ...)`,
+   pushes a `prefetch_slot{state=RESIDENT}` entry, and increments
+   `n_prefetch_issued`. Stream ordering on the backend compute stream
+   guarantees residency before the consuming MUL_MAT_ID node executes -
+   same guarantee as the reactive miss path; no events needed.
+4. **Host-to-host skip guard.** Predictive fill only targets device slot
+   pools; when both source weights and pool are host-resident, fill is
+   skipped (a NULL pool buffer means carved from the device cache backing
+   buffer, which proceeds). This prevents massive pointless host->host
+   copies.
+5. **Aggregation gaps.** `ggml_backend_sched_get_expert_cache_stats` did
+   not aggregate `wasted_prefetch_bytes`, `in_flight_wait_us`,
+   `n_prefetch_issued`, `n_prefetch_src_not_host`. Added.
+6. **was_prefetched hardening.** On a matching prefetch_slots entry, also
+   require `find_slot(...) >= 0` so stale entries after eviction do not
+   produce false positives.
+
+#### Current state (uncommitted)
+
+Predictive fills now issue (`issued=19338` for `-p 32 -n 16 -fitt 256
+-exc 256 -excp 64`) but attribution remains fully reactive
+(`from_pred=0`). Leading hypothesis: tensor pointer mismatch - bundle
+registration keys `(tensor*, eid)` off the host originals from
+`src/llama-context.cpp`, while graph MUL_MAT_ID src0 may be a different
+(fit-promoted) pointer, so zero-copy lookup misses. Debug print pointers
+per layer to confirm before fixing.
+
+#### Diagnostic instrumentation added then removed
+
+zc-dbg / attr-dbg / agg-dbg / rx-dbg / pa-dbg x2 / sub-dbg / bench-dbg -
+all removed; clean rebuild verified with identical counter values.
+
+#### Bench command (canonical for 5I verification)
+
+```
+GGML_OP_OFFLOAD_MIN_BATCH=1 ./build/bin/Release/llama-bench.exe \
+  -m "C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf" \
+  -p 32 -n 16 -fitt 256 -exc 256 -excp 64 \
+  --routing-predictor-model tools/training_data/model.bin \
+  --routing-predictor-variant low-rank-mlp --routing-predictor-stats -r 1 -o csv
+```
+

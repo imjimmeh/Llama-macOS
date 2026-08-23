@@ -1648,8 +1648,12 @@ static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_ba
     EXPERT_CACHE_SUBTRACT(n_used_in_flight);
     EXPERT_CACHE_SUBTRACT(n_used_miss);
     EXPERT_CACHE_SUBTRACT(n_already_resident);
+    EXPERT_CACHE_SUBTRACT(n_gpu_slot_exec_reactive);
     EXPERT_CACHE_SUBTRACT(wasted_prefetch_bytes);
     EXPERT_CACHE_SUBTRACT(in_flight_wait_us);
+    EXPERT_CACHE_SUBTRACT(n_prefetch_issued);
+    EXPERT_CACHE_SUBTRACT(n_prefetch_src_not_host);
+    EXPERT_CACHE_SUBTRACT(n_gpu_slot_exec_from_prediction);
 #undef EXPERT_CACHE_SUBTRACT
     return delta;
 }
@@ -1861,8 +1865,12 @@ struct test {
             "expert_cache_used_in_flight",
             "expert_cache_used_miss",
             "expert_cache_already_resident",
+            "expert_cache_gpu_slot_exec_from_prediction",
+            "expert_cache_gpu_slot_exec_reactive",
             "expert_cache_wasted_prefetch_bytes",
             "expert_cache_in_flight_wait_us",
+            "expert_cache_prefetch_issued",
+            "expert_cache_prefetch_src_not_host",
             "routing_predictor_horizon",
             "routing_predictor_predictions_generated",
             "routing_predictor_predictions_used",
@@ -1931,6 +1939,10 @@ struct test {
             field == "expert_cache_used_in_flight" ||
             field == "expert_cache_used_miss" ||
             field == "expert_cache_already_resident" ||
+            field == "expert_cache_gpu_slot_exec_from_prediction" ||
+            field == "expert_cache_gpu_slot_exec_reactive" ||
+            field == "expert_cache_prefetch_issued" ||
+            field == "expert_cache_prefetch_src_not_host" ||
             field == "expert_cache_wasted_prefetch_bytes" ||
             field == "expert_cache_in_flight_wait_us" ||
             field == "routing_predictor_horizon" ||
@@ -2057,8 +2069,12 @@ struct test {
                                             std::to_string(expert_cache_stats.n_used_in_flight),
                                             std::to_string(expert_cache_stats.n_used_miss),
                                             std::to_string(expert_cache_stats.n_already_resident),
+                                            std::to_string(expert_cache_stats.n_gpu_slot_exec_from_prediction),
+                                            std::to_string(expert_cache_stats.n_gpu_slot_exec_reactive),
                                             std::to_string(expert_cache_stats.wasted_prefetch_bytes),
                                             std::to_string(expert_cache_stats.in_flight_wait_us),
+                                            std::to_string(expert_cache_stats.n_prefetch_issued),
+                                            std::to_string(expert_cache_stats.n_prefetch_src_not_host),
                                             std::to_string(routing_predictor_horizon),
                                             std::to_string(routing_predictor_stats.predictions_generated),
                                             std::to_string(routing_predictor_stats.predictions_used),

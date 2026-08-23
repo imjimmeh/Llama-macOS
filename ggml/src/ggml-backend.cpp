@@ -1972,7 +1972,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         // Vector 1 & 6: Zero-Copy Slot Pool execution during single-token decode
                         if (is_single_token_decode && slot_tensor != NULL && requested_experts.size() <= (size_t)slot_tensor->ne[2]) {
-                            int n_ready = 0, n_inflight = 0, n_absent = 0;
+                            int n_ready = 0, n_inflight = 0, n_absent = 0, n_from_pred = 0, n_valid = 0;
                             const bool force_cpu = getenv("GGML_EXPERT_EXEC_FORCE_CPU") != NULL;
                             remapped_ids.assign(ids.size(), -1);
                             bool all_slots_ready = true;
@@ -1986,10 +1986,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 }
 
                                 int32_t slot = ggml_backend_expert_cache_find_slot(cache, input, exp_id);
+                                n_valid++;
                                 if (slot >= 0) {
-                                    remapped_ids[i] = slot;
                                     ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
                                     n_ready++;
+                                    if (ggml_backend_expert_cache_was_prefetched(cache, input, exp_id)) {
+                                        n_from_pred++;
+                                    }
                                 } else {
                                     // Phase 5C: Check if async prefetch is ready
                                     if (ggml_backend_expert_cache_is_prefetch_ready(cache, input, exp_id)) {
@@ -1998,6 +2001,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                             remapped_ids[i] = slot;
                                             ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
                                             n_ready++;
+                                            if (ggml_backend_expert_cache_was_prefetched(cache, input, exp_id)) {
+                                                n_from_pred++;
+                                            }
                                             continue;
                                         }
                                     }
@@ -2012,6 +2018,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                             remapped_ids[i] = slot;
                                             ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
                                             n_inflight++;
+                                            n_from_pred++;
                                             continue;
                                         }
                                     }
@@ -2097,10 +2104,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     } else {
                                         ggml_backend_expert_cache_record_used_ready(cache);
                                     }
+                                    // Phase 5I: attribute node to prediction vs reactive
+                                    if (n_from_pred == n_valid) {
+                                        ggml_backend_expert_cache_record_gpu_slot_from_prediction(cache);
+                                    } else {
+                                        ggml_backend_expert_cache_record_gpu_slot_reactive(cache);
+                                    }
+
                                 }
 
                             }
                         }
+
 
                         if (is_single_token_decode && !used_zero_copy && slot_tensor != NULL) {
                             ggml_backend_expert_cache_record_cpu_fallback(cache);
@@ -2684,14 +2699,17 @@ bool ggml_backend_sched_get_expert_cache_stats(
             out_stats->n_used_in_flight += s.n_used_in_flight;
             out_stats->n_used_miss += s.n_used_miss;
             out_stats->n_already_resident += s.n_already_resident;
+            out_stats->n_gpu_slot_exec_from_prediction += s.n_gpu_slot_exec_from_prediction;
+            out_stats->n_gpu_slot_exec_reactive += s.n_gpu_slot_exec_reactive;
             out_stats->wasted_prefetch_bytes += s.wasted_prefetch_bytes;
             out_stats->in_flight_wait_us += s.in_flight_wait_us;
+            out_stats->n_prefetch_issued += s.n_prefetch_issued;
+            out_stats->n_prefetch_src_not_host += s.n_prefetch_src_not_host;
             found = true;
         }
     }
     return found;
 }
-
 size_t ggml_backend_sched_expert_cache_export_entries(
         ggml_backend_sched_t sched,
         int backend_idx,

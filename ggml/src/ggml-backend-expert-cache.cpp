@@ -1417,21 +1417,28 @@ void ggml_backend_expert_cache_prefetch_async(
     if (cache == NULL || tensor == NULL || expert_ids == NULL || n_experts <= 0) {
         return;
     }
-    
-    // Check if async prefetch is supported
-    if (cache->prefetch_stream == nullptr) {
-        // Fall back to synchronous prefetch
-        ggml_backend_expert_cache_prefetch(cache, tensor, expert_ids, n_experts);
+
+    // Source weights must be host-resident: the staging path memcpy's from
+    // tensor->data, which is a device pointer for GPU-resident weights.
+    if (tensor->buffer && !ggml_backend_buffer_is_host(tensor->buffer)) {
+        cache->stats.n_prefetch_src_not_host++;
         return;
     }
-    
     auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
     if (pool == NULL || tensor->data == NULL) {
         return;
     }
-    
+
+    // Host-to-host staging gains nothing; only fill device slot pools.
+    // A NULL pool buffer means the pool is carved out of the cache backing
+    // buffer, which lives on cache->backend (a device for the GPU cache).
+    const bool pool_is_host = pool->tensor->buffer != NULL &&
+        ggml_backend_buffer_is_host(pool->tensor->buffer);
+    if (ggml_backend_buffer_is_host(tensor->buffer) && pool_is_host) {
+        return;
+    }
     const size_t expert_size = pool->stride;
-    
+
     for (int32_t i = 0; i < n_experts; i++) {
         int32_t eid = expert_ids[i];
         if (eid < 0 || (int64_t)eid >= tensor->ne[2]) continue;
@@ -1504,10 +1511,11 @@ void ggml_backend_expert_cache_prefetch_async(
         slot.expert_id = eid;
         slot.slot_idx = slot_idx;
         cache->prefetch_slots.push_back(slot);
-        
+
         cache->stats.n_prefetch_issued++;
 #else
-        // Non-CUDA backend: fall back to synchronous
+        // Backend-ordered copy: set_async enqueues on the target backend
+        // stream before the consumer node, so the data is resident when read
         void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, tensor, slot_idx, expert_size);
         if (pinned_buf != NULL) {
             memcpy(pinned_buf, (const uint8_t *) tensor->data + src_off, expert_size);
@@ -1526,8 +1534,19 @@ void ggml_backend_expert_cache_prefetch_async(
                 dst_off,
                 expert_size);
         }
-        cache->stats.n_speculative_prefetches++;
+
+        // Track so was_prefetched/is_prefetch_ready see this fill
+        ggml_expert_cache_prefetch_slot slot;
+        slot.state = GGML_EXPERT_CACHE_PREFETCH_RESIDENT;
+        slot.ready_event = NULL;
+        slot.tensor = tensor;
+        slot.expert_id = eid;
+        slot.slot_idx = slot_idx;
+        cache->prefetch_slots.push_back(slot);
+
+        cache->stats.n_prefetch_issued++;
 #endif
+
     }
 }
 
@@ -1540,6 +1559,36 @@ bool ggml_backend_expert_cache_has_inflight_prefetch(
         const struct ggml_tensor * tensor,
         int32_t expert_id) {
     return has_inflight_prefetch(cache, tensor, expert_id);
+}
+
+int32_t ggml_backend_expert_cache_prefetch_slot_count(ggml_backend_expert_cache_t cache) {
+    return cache ? (int32_t)cache->prefetch_slots.size() : 0;
+}
+
+bool ggml_backend_expert_cache_was_prefetched(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id) {
+    if (cache == NULL || tensor == NULL) {
+        return false;
+    }
+    for (const auto & slot : cache->prefetch_slots) {
+        if (slot.tensor == tensor && slot.expert_id == expert_id &&
+            (slot.state == GGML_EXPERT_CACHE_PREFETCH_RESIDENT ||
+             slot.state == GGML_EXPERT_CACHE_PREFETCH_IN_FLIGHT)) {
+            // entry may outlive its pool slot (eviction); verify residency
+            return ggml_backend_expert_cache_find_slot(cache, tensor, expert_id) >= 0;
+        }
+    }
+    return false;
+}
+
+void ggml_backend_expert_cache_record_gpu_slot_from_prediction(ggml_backend_expert_cache_t cache) {
+    if (cache) cache->stats.n_gpu_slot_exec_from_prediction++;
+}
+
+void ggml_backend_expert_cache_record_gpu_slot_reactive(ggml_backend_expert_cache_t cache) {
+    if (cache) cache->stats.n_gpu_slot_exec_reactive++;
 }
 
 bool ggml_backend_expert_cache_is_prefetch_ready(
@@ -2382,7 +2431,6 @@ void ggml_backend_expert_cache_submit_prediction(
     e.n_experts = std::min(n_experts, (int32_t)64);
     memcpy(e.expert_ids, expert_ids, e.n_experts * sizeof(int32_t));
 
-    // Prefetch the predicted experts' weights immediately (D2)
     auto bit = cache->bundle_registrations.find(target_layer);
     if (bit != cache->bundle_registrations.end()) {
         if (bit->second.gate) ggml_backend_expert_cache_prefetch_async(cache, bit->second.gate, e.expert_ids, e.n_experts, target_layer);

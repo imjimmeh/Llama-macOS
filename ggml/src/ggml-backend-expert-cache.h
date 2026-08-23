@@ -340,7 +340,21 @@ GGML_API bool ggml_backend_expert_cache_has_inflight_prefetch(
     const struct ggml_tensor * tensor,
     int32_t expert_id);
 
-// Phase 5H accessor hooks
+// True if this tensor/expert slot was placed by a completed predictor prefetch
+GGML_API bool ggml_backend_expert_cache_was_prefetched(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id);
+
+// Phase 5I: attribute slot executions to their source
+GGML_API void ggml_backend_expert_cache_record_gpu_slot_from_prediction(ggml_backend_expert_cache_t cache);
+GGML_API void ggml_backend_expert_cache_record_gpu_slot_reactive(ggml_backend_expert_cache_t cache);
+GGML_API int32_t ggml_backend_expert_cache_prefetch_slot_count(ggml_backend_expert_cache_t cache);
+
+// Phase 5H accessor hooks. used_ready/used_in_flight/used_miss classify slot
+// readiness at node arrival for ALL executions (reactive + predicted); they do
+// NOT measure predictor hit/miss. See record_gpu_slot_from_prediction/_reactive
+// for attribution.
 GGML_API void ggml_backend_expert_cache_record_gpu_slot_execution(ggml_backend_expert_cache_t cache);
 GGML_API void ggml_backend_expert_cache_record_cpu_fallback(ggml_backend_expert_cache_t cache);
 GGML_API void ggml_backend_expert_cache_record_used_ready(ggml_backend_expert_cache_t cache);

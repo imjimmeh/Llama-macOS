@@ -780,6 +780,61 @@ identical regardless of mmap because both modes touch the same pages. The
 miss rate is a fundamental property of the cache (cold at decode because the
 predictor isn't supplying prefetches), not a residency artifact.
 
+#### Phase 5I: Predictor Engagement + Execution Attribution (2026-08-23, plumbing complete)
+
+**Objective:** make predictive fills actually reach the slot pool
+(`n_prefetch_issued > 0`) and attribute GPU slot executions between
+predictor-sourced and reactive (`gpu_slot_exec_from_prediction +
+gpu_slot_exec_reactive == gpu_slot_executions` invariant).
+
+**Root causes fixed:**
+
+1. **Attribution delta was always 0.** The `EXPERT_CACHE_SUBTRACT` list in
+   llama-bench omitted `n_gpu_slot_exec_reactive`, so the per-test delta
+   column stayed zero. Fixed. Invariant verified: `-p 32 -n 16` gives
+   `exec=1360, reactive=1360`.
+2. **Predictive fills never issued.** All `#if defined(GGML_USE_CUDA)`
+   code in `ggml-backend-expert-cache.cpp` is dead when compiled into
+   `ggml-base.dll` (no CUDA imports; objdump-verified), so the prefetch
+   stream never existed and the legacy sync fallback never created
+   `prefetch_slots` entries. Reworked backend-agnostic:
+   `ggml_backend_tensor_set_async` onto the cache backend + immediate
+   `RESIDENT` marking (stream ordering on the compute stream guarantees
+   residency before the consumer node - same guarantee as the reactive
+   miss path). No CUDA events needed.
+3. **Host-to-host skip guard:** predictive fill only targets device slot
+   pools; host source + host pool is skipped (NULL pool buffer = carved
+   from the device cache backing buffer = proceeds).
+4. **Stats aggregation gaps:** `wasted_prefetch_bytes`,
+   `in_flight_wait_us`, `n_prefetch_issued`, `n_prefetch_src_not_host`
+   were not summed across backends in
+   `ggml_backend_sched_get_expert_cache_stats`. Fixed.
+5. **was_prefetched hardening:** a matching prefetch_slots entry must also
+   still be resident in the pool (`find_slot >= 0`) to count, so stale
+   entries after eviction do not inflate attribution.
+
+**Status after cleanup rebuild (-p 32 -n 16 smoke):**
+
+```
+exec=1360 from_pred=0 reactive=1360 issued=19338 src_nh=176 zc=1069
+pred_gen=640 pred_used=464 ts=5.83
+```
+
+Predictive fills issue and predictions are consumed, but attribution is
+still fully reactive. Leading hypothesis: pointer mismatch between bundle
+registration keys (host originals from `src/llama-context.cpp`) and the
+graph MUL_MAT_ID src0 weight tensor (fit-promoted copy), so the zero-copy
+lookup `(tensor*, eid) -> slot` misses prefetched slots. Next step is a
+pointer-trace comparison per layer; see Phase 5I in
+`EXPERT_CACHE_OPTIMIZATIONS_LOG.md`.
+
+**Row-pair convention for matrix summaries:** each row of a matrix CSV is
+a config; deltas come from pairing rows via `summarize_matrix.py`
+(repo root; `python summarize_matrix.py matrix.csv` prints median t/s
+plus counter medians and pairwise deltas of the listed configs). Never
+hand-compute deltas; extend the script's pair list when adding matrix
+rows.
+
 #### Phase 5E: Pipeline End-to-End Validation (2026-08-22)
 **Objective:** Confirm the trace -> features -> model -> load -> run loop actually works on real hardware.
 
