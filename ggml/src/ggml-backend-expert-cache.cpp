@@ -189,6 +189,7 @@ struct ggml_backend_expert_cache {
     int32_t route_trace_staged_n = 0;
     size_t route_trace_max_entries = 0;
     uint64_t route_trace_token_id = 0;
+    bool seed_from_trace_done = false;
 
     // Phase 5C: Async DMA Pipeline
     void * prefetch_stream = nullptr;  // cudaStream_t when CUDA available
@@ -617,9 +618,21 @@ void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache, int 
     }
 }
 
+static void ggml_backend_expert_cache_seed_from_route_trace(
+        ggml_backend_expert_cache_t cache, const char * path);
+
 void ggml_backend_expert_cache_begin_step(ggml_backend_expert_cache_t cache) {
     if (cache == NULL) {
         return;
+    }
+    if (!cache->seed_from_trace_done) {
+        // one-shot: bundles register during graph build, so they exist by the
+        // first step; seeding here means decode starts with a hot pool
+        cache->seed_from_trace_done = true;
+        const char * seed_path = getenv("GGML_EXPERT_SEED_FROM_TRACE");
+        if (seed_path && seed_path[0]) {
+            ggml_backend_expert_cache_seed_from_route_trace(cache, seed_path);
+        }
     }
     cache->decode_step++;
     if (cache->route_trace_enabled) {
@@ -1984,6 +1997,101 @@ void ggml_backend_expert_cache_sync(ggml_backend_expert_cache_t cache) {
     ggml_backend_synchronize(cache->backend);
 }
 
+// Oracle variant E: pre-resident the routes recorded by a GGML_EXPERT_ROUTE_TRACE
+// pass so measured decode starts from GPU slot pools instead of warming up.
+// Routes are seeded most-frequent first; pool capacity bounds residency.
+static void ggml_backend_expert_cache_seed_from_route_trace(
+        ggml_backend_expert_cache_t cache, const char * path) {
+    FILE * f = fopen(path, "rb");
+    if (f == NULL) {
+        GGML_LOG_ERROR("seed-from-trace: cannot open %s\n", path);
+        return;
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != 0x52545243 ||
+        fread(&version, sizeof(version), 1, f) != 1 || version != 2) {
+        GGML_LOG_ERROR("seed-from-trace: unsupported trace header in %s\n", path);
+        fclose(f);
+        return;
+    }
+
+    // aggregate unique (layer, expert_id) routes across the whole trace
+    std::unordered_map<uint64_t, uint32_t> route_freq;
+    ggml_expert_cache_route_trace_entry e;
+    while (fread(&e, sizeof(e), 1, f) == 1) {
+        int32_t n_logits = 0;
+        if (fread(&n_logits, sizeof(n_logits), 1, f) != 1) {
+            break;
+        }
+        if (n_logits > 0 &&
+            fseek(f, (long)n_logits * sizeof(float), SEEK_CUR) != 0) {
+            break;
+        }
+        const uint64_t lbase = (uint64_t)(uint32_t)e.layer << 32;
+        const int32_t n = e.n_experts < 64 ? e.n_experts : 64;
+        for (int32_t i = 0; i < n; i++) {
+            if (e.expert_ids[i] >= 0) {
+                route_freq[lbase | (uint32_t)e.expert_ids[i]]++;
+            }
+        }
+    }
+    fclose(f);
+
+    std::vector<std::pair<uint64_t, uint32_t>> routes(route_freq.begin(), route_freq.end());
+    std::sort(routes.begin(), routes.end(),
+        [](const std::pair<uint64_t, uint32_t> & a, const std::pair<uint64_t, uint32_t> & b) {
+            return a.second > b.second;
+        });
+
+    size_t n_seeded = 0;
+    size_t n_pool_full = 0;
+    for (const auto & r : routes) {
+        const int32_t layer = (int32_t)(r.first >> 32);
+        const int32_t eid   = (int32_t)(r.first & 0xffffffffu);
+        auto bit = cache->bundle_registrations.find(layer);
+        if (bit == cache->bundle_registrations.end()) {
+            continue;
+        }
+        const struct ggml_tensor * bundle[3] = { bit->second.gate, bit->second.up, bit->second.down };
+        for (const struct ggml_tensor * t : bundle) {
+            if (t == NULL || t->data == NULL) {
+                continue;
+            }
+            // source weights must be host-resident, same guard as prefetch
+            if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, t);
+            if (pool == NULL) {
+                continue;
+            }
+            if (ggml_backend_expert_cache_find_slot(cache, t, eid) >= 0) {
+                continue; // already resident
+            }
+            const int32_t slot = ggml_backend_expert_cache_alloc_slot_idx(cache, t, eid, NULL, 0);
+            if (slot < 0) {
+                n_pool_full++;
+                continue;
+            }
+            const size_t expert_size = pool->stride;
+            ggml_backend_tensor_set_async(
+                cache->backend,
+                pool->tensor,
+                (const uint8_t *)t->data + (size_t)eid * expert_size,
+                (size_t)slot * expert_size,
+                expert_size);
+            // rank seeded routes high so rebalance keeps them
+            ggml_backend_expert_cache_record_access_count(cache, t, eid, r.second);
+            n_seeded++;
+        }
+    }
+    ggml_backend_expert_cache_sync(cache);
+    GGML_LOG_INFO("seed-from-trace: %zu slots seeded, %zu unique routes, %zu pool-full\n",
+        n_seeded, routes.size(), n_pool_full);
+}
+
 // Phase 5A: Route Trace Collection
 void ggml_backend_expert_cache_enable_route_trace(
         ggml_backend_expert_cache_t cache,
@@ -2422,6 +2530,16 @@ void ggml_backend_expert_cache_submit_prediction(
     e.target_layer = target_layer;
     e.n_experts = std::min(n_experts, (int32_t)64);
     memcpy(e.expert_ids, expert_ids, e.n_experts * sizeof(int32_t));
+
+    // GGML_EXPERT_PREFETCH_DISABLE=1 prices predictor overhead without
+    // prefetch DMA benefit; routes still served reactively.
+    static bool prefetch_disabled = [] {
+        const char * e = getenv("GGML_EXPERT_PREFETCH_DISABLE");
+        return e && atoi(e) > 0;
+    }();
+    if (prefetch_disabled) {
+        return;
+    }
 
     auto bit = cache->bundle_registrations.find(target_layer);
     if (bit != cache->bundle_registrations.end()) {
