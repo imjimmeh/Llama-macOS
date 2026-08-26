@@ -144,6 +144,7 @@ llama_context::llama_context(
     cparams.expert_cache_period = params.expert_cache_period;
     cparams.expert_cache_max_swaps = params.expert_cache_max_swaps;
     cparams.expert_cache_stats  = params.expert_cache_stats;
+    cparams.expert_cache_auto_reserve = params.expert_cache_auto_reserve;
 
     cparams.ctx_other = nullptr;
 
@@ -612,7 +613,7 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
-    auto register_bundles = [&]() {
+    auto register_expert_cache_metadata = [&]() {
         for (int il = 0; il < (int)model.layers.size(); il++) {
             // dynamically promoted MTP experts leave host memory on promotion, so the
             // cache must not register them as host-resident; static MTP stays on host
@@ -638,12 +639,19 @@ void llama_context::sched_reserve() {
         }
     };
 
-    // For explicit fixed cache sizes, configure upfront
-    if (sched && cparams.expert_cache_size > 0 && cparams.expert_cache_size != (size_t)-1) {
-        ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
+    auto configure_expert_cache = [&](size_t size) {
+        if (!sched || size == 0) {
+            return;
+        }
+        ggml_backend_sched_set_expert_cache(sched.get(), size);
         ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
         ggml_backend_sched_set_expert_cache_max_swaps(sched.get(), cparams.expert_cache_max_swaps);
-        register_bundles();
+        register_expert_cache_metadata();
+    };
+
+    // For explicit fixed cache sizes, configure upfront
+    if (sched && cparams.expert_cache_size > 0 && cparams.expert_cache_size != (size_t)-1) {
+        configure_expert_cache(cparams.expert_cache_size);
     }
 
     llama_memory_context_ptr mctx;
@@ -681,8 +689,7 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 if (cparams.expert_cache_size > 0 && cparams.expert_cache_size != (size_t)-1) {
-                    ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
-                    ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
+                    configure_expert_cache(cparams.expert_cache_size);
                 }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -739,22 +746,22 @@ void llama_context::sched_reserve() {
             if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 size_t free_mem = 0, total_mem = 0;
                 ggml_backend_dev_memory(dev, &free_mem, &total_mem);
-                const size_t safety_margin = 256 * 1024 * 1024;
-                if (free_mem > safety_margin) {
-                    eff_expert_cache_size = free_mem - safety_margin;
-                    LLAMA_LOG_INFO("%s: expert-cache auto: post-compute configured %.2f MiB on %s (remaining free: %.2f MiB, safety margin: %.2f MiB)\n",
+                const size_t reserve = (cparams.expert_cache_auto_reserve != (size_t)-1)
+                    ? cparams.expert_cache_auto_reserve
+                    : (512 * 1024 * 1024);
+                if (free_mem > reserve) {
+                    eff_expert_cache_size = free_mem - reserve;
+                    LLAMA_LOG_INFO("%s: expert-cache auto: post-compute configured %.2f MiB on %s (remaining free: %.2f MiB, reserve: %.2f MiB)%s\n",
                         __func__, (double)eff_expert_cache_size / (1024.0 * 1024.0),
                         ggml_backend_dev_name(dev), (double)free_mem / (1024.0 * 1024.0),
-                        (double)safety_margin / (1024.0 * 1024.0));
+                        (double)reserve / (1024.0 * 1024.0),
+                        (cparams.expert_cache_auto_reserve != (size_t)-1) ? " (from --fit-target)" : "");
                 }
                 break;
             }
         }
         if (eff_expert_cache_size > 0) {
-            ggml_backend_sched_set_expert_cache(sched.get(), eff_expert_cache_size);
-            ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
-            ggml_backend_sched_set_expert_cache_max_swaps(sched.get(), cparams.expert_cache_max_swaps);
-            register_bundles();
+            configure_expert_cache(eff_expert_cache_size);
         }
     }
 
@@ -3356,10 +3363,6 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
                 if (cparams.expert_cache_size > 0 && cparams.expert_cache_size != (size_t)-1) {
                     ret[buft].compute += cparams.expert_cache_size;
                     added_ec = true;
-                } else if (cparams.expert_cache_size == (size_t)-1 && model.hparams.n_expert > 0) {
-                    const size_t auto_budget = 768 * 1024 * 1024;
-                    ret[buft].compute += auto_budget;
-                    added_ec = true;
                 }
             }
         }
@@ -3638,6 +3641,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_cache_period         =*/ 64,
         /*.expert_cache_max_swaps      =*/ -1,
         /*.expert_cache_stats          =*/ false,
+        /*.expert_cache_auto_reserve   =*/ (size_t)-1,
     };
 
     return result;

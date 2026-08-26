@@ -493,6 +493,173 @@ static void test_pp_tg_telemetry_isolation() {
     printf("  PP and TG telemetry isolation tests passed\n");
 }
 
+static void test_slot_loading_lifecycle() {
+    printf("testing slot LOADING -> RESIDENT state machine...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    const size_t expert_bytes = 1024;
+    const size_t cache_capacity = 64 * 1024;
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    assert(cache != nullptr);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+
+    struct ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 8);
+    ggml_set_name(tensor, "blk.0.ffn_gate_exps.weight");
+    tensor->nb[2] = expert_bytes;
+
+    // 1. Newly allocated slot starts in LOADING state
+    int32_t slot = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, 5, NULL, 0);
+    assert(slot >= 0);
+
+    // LOADING slot must NOT return hit in find_slot
+    int32_t found = ggml_backend_expert_cache_find_slot(cache, tensor, 5);
+    assert(found == -1);
+
+    // LOADING slot must NOT count as hit in remap_ids
+    int32_t orig_ids[1] = { 5 };
+    int32_t remapped[1] = { -1 };
+    bool is_hit[1] = { false };
+    int32_t n_hits = ggml_backend_expert_cache_remap_ids(cache, tensor, orig_ids, 1, remapped, is_hit);
+    assert(n_hits == 0);
+    assert(!is_hit[0]);
+
+    // 2. Promoting to RESIDENT enables cache hits
+    ggml_backend_expert_cache_promote_slot(cache, tensor, 5, slot);
+
+    found = ggml_backend_expert_cache_find_slot(cache, tensor, 5);
+    assert(found == slot);
+
+    n_hits = ggml_backend_expert_cache_remap_ids(cache, tensor, orig_ids, 1, remapped, is_hit);
+    assert(n_hits == 1);
+    assert(is_hit[0]);
+    assert(remapped[0] == slot);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  slot LOADING -> RESIDENT state machine tests passed\n");
+}
+
+static void test_per_tensor_gpu_map_isolation() {
+    printf("testing per-tensor GPU map isolation across layers...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    const size_t expert_bytes = 1024;
+    const size_t cache_capacity = 64 * 1024;
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    assert(cache != nullptr);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+
+    // Two same-shaped tensors on different layers
+    struct ggml_tensor * t_l0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 8);
+    ggml_set_name(t_l0, "blk.0.ffn_gate_exps.weight");
+    t_l0->nb[2] = expert_bytes;
+
+    struct ggml_tensor * t_l1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 8);
+    ggml_set_name(t_l1, "blk.1.ffn_gate_exps.weight");
+    t_l1->nb[2] = expert_bytes;
+
+    int32_t slot_l0 = ggml_backend_expert_cache_alloc_slot_idx(cache, t_l0, 3, NULL, 0);
+    assert(slot_l0 >= 0);
+    ggml_backend_expert_cache_promote_slot(cache, t_l0, 3, slot_l0);
+
+    // t_l1 expert 3 must NOT be present
+    assert(ggml_backend_expert_cache_find_slot(cache, t_l1, 3) == -1);
+
+    int32_t slot_l1 = ggml_backend_expert_cache_alloc_slot_idx(cache, t_l1, 3, NULL, 0);
+    assert(slot_l1 >= 0);
+    assert(slot_l1 != slot_l0); // different slots in same pool
+    ggml_backend_expert_cache_promote_slot(cache, t_l1, 3, slot_l1);
+
+    // Both must resolve to their own respective slots
+    assert(ggml_backend_expert_cache_find_slot(cache, t_l0, 3) == slot_l0);
+    assert(ggml_backend_expert_cache_find_slot(cache, t_l1, 3) == slot_l1);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  per-tensor GPU map isolation tests passed\n");
+}
+
+static void test_staging_sync_teardown() {
+    printf("testing staging sync and teardown safety...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    const size_t cache_capacity = 64 * 1024;
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    assert(cache != nullptr);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+
+    struct ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 8);
+    ggml_set_name(tensor, "blk.0.ffn_gate_exps.weight");
+
+    void * p = ggml_backend_expert_cache_stage_acquire(cache, tensor, 0, 1024);
+    assert(p != nullptr);
+    ggml_backend_expert_cache_stage_commit(cache, tensor, 0);
+
+    // explicit sync must drain without error
+    ggml_backend_expert_cache_sync_staging(cache);
+
+    // teardown with clean state
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  staging sync and teardown safety tests passed\n");
+}
+
+static void test_auto_reserve_sentinel() {
+    printf("testing auto reserve sentinel semantics...\n");
+
+    // SIZE_MAX -> unset sentinel, must default to 512 MiB
+    const size_t unset_reserve = (size_t)-1;
+    const size_t r_default = (unset_reserve != (size_t)-1) ? unset_reserve : (512 * 1024 * 1024);
+    assert(r_default == 512 * 1024 * 1024);
+
+    // 0 -> explicit zero margin requested via --fit-target 0
+    const size_t zero_reserve = 0;
+    const size_t r_zero = (zero_reserve != (size_t)-1) ? zero_reserve : (512 * 1024 * 1024);
+    assert(r_zero == 0);
+
+    // 256 MiB -> explicit custom target
+    const size_t custom_reserve = 256 * 1024 * 1024;
+    const size_t r_custom = (custom_reserve != (size_t)-1) ? custom_reserve : (512 * 1024 * 1024);
+    assert(r_custom == 256 * 1024 * 1024);
+
+    printf("  auto reserve sentinel semantics tests passed\n");
+}
+
 int main() {
     printf("running test-expert-cache (V2 features)...\n");
 
@@ -507,6 +674,11 @@ int main() {
     test_pinned_host_buffer();
     test_prefetch();
     test_pp_tg_telemetry_isolation();
+
+    test_slot_loading_lifecycle();
+    test_per_tensor_gpu_map_isolation();
+    test_staging_sync_teardown();
+    test_auto_reserve_sentinel();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

@@ -841,6 +841,14 @@ struct ggml_backend_sched {
     std::vector<ggml_expert_cache_key> pinned_keys_scratch;
     std::vector<int32_t> remapped_ids_scratch;
 
+    struct ggml_backend_sched_remapped_ids_scratch {
+        ggml_backend_buffer_t buffer = nullptr;
+        size_t capacity = 0;
+        size_t offset = 0;
+        std::vector<struct ggml_tensor> tensors;
+    };
+    ggml_backend_sched_remapped_ids_scratch remapped_ids_buf[GGML_SCHED_MAX_BACKENDS];
+
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1650,11 +1658,50 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     pinned_keys.clear();
     remapped_ids.clear();
 
+    size_t total_remap_bytes[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    int total_remap_nodes[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        struct ggml_backend_sched_split * split = &splits[split_id];
+        int b_id = split->backend_id;
+        for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            struct ggml_tensor * input = split->inputs[input_id];
+            struct ggml_tensor * input_cpy = tensor_copy(input, b_id, sched->cur_copy);
+            ggml_tensor * node = ggml_backend_find_mul_mat_id_node(&split->graph, input_cpy);
+            if (node != NULL && node->src[2] != NULL) {
+                total_remap_bytes[b_id] += GGML_PAD(ggml_nbytes(node->src[2]), 512);
+                total_remap_nodes[b_id]++;
+            }
+        }
+    }
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        auto & rib = sched->remapped_ids_buf[b];
+        rib.offset = 0;
+        if (total_remap_bytes[b] > 0 && (rib.buffer == nullptr || rib.capacity < total_remap_bytes[b])) {
+            if (rib.buffer) {
+                ggml_backend_buffer_free(rib.buffer);
+                rib.buffer = nullptr;
+            }
+            rib.capacity = std::max((size_t)2 * 1024 * 1024, total_remap_bytes[b] * 2);
+            rib.buffer = ggml_backend_alloc_buffer(sched->backends[b], rib.capacity);
+        }
+        rib.tensors.clear();
+        if (total_remap_nodes[b] > 0) {
+            rib.tensors.reserve(total_remap_nodes[b] + 16);
+        }
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
-        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> restored_nodes;
+
+        struct ggml_restored_node {
+            struct ggml_tensor * node;
+            struct ggml_tensor * orig_src0;
+            struct ggml_tensor * orig_src2;
+        };
+        std::vector<ggml_restored_node> restored_nodes;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1755,11 +1802,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         // find the used experts
                         used_ids.assign(ggml_bitset_size(n_expert), 0);
-                        for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
-                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
-                                int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                                GGML_ASSERT(id >= 0 && id < n_expert);
-                                ggml_bitset_set(used_ids.data(), id);
+                        for (int64_t i3 = 0; i3 < ids_tensor->ne[3]; i3++) {
+                            for (int64_t i2 = 0; i2 < ids_tensor->ne[2]; i2++) {
+                                for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+                                    for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                                        const size_t off = (i3 * ids_tensor->nb[3] + i2 * ids_tensor->nb[2] + i1 * ids_tensor->nb[1] + i0 * ids_tensor->nb[0]) / sizeof(int32_t);
+                                        if (off < ids.size()) {
+                                            int32_t id = ids[off];
+                                            if (id >= 0 && id < n_expert) {
+                                                ggml_bitset_set(used_ids.data(), id);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -1775,11 +1830,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         t_host_start = ggml_time_us();
 
                         expert_counts.assign(n_expert, 0);
-                        for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
-                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
-                                int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                                if (id >= 0 && id < n_expert) {
-                                    expert_counts[id]++;
+                        for (int64_t i3 = 0; i3 < ids_tensor->ne[3]; i3++) {
+                            for (int64_t i2 = 0; i2 < ids_tensor->ne[2]; i2++) {
+                                for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+                                    for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                                        const size_t off = (i3 * ids_tensor->nb[3] + i2 * ids_tensor->nb[2] + i1 * ids_tensor->nb[1] + i0 * ids_tensor->nb[0]) / sizeof(int32_t);
+                                        if (off < ids.size()) {
+                                            int32_t id = ids[off];
+                                            if (id >= 0 && id < n_expert) {
+                                                expert_counts[id]++;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1892,14 +1954,49 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 } else {
                                     ggml_backend_expert_cache_record_cpu_id_remap(cache);
                                 }
+
+                                // Promote newly loaded slots to resident state
+                                for (size_t i = 0; i < ids.size(); i++) {
+                                    int32_t exp_id = ids[i];
+                                    int32_t slot = remapped_ids[i];
+                                    if (exp_id >= 0 && slot >= 0) {
+                                        ggml_backend_expert_cache_promote_slot(cache, input, exp_id, slot);
+                                    }
+                                }
+
+                                auto & rib = sched->remapped_ids_buf[split_backend_id];
+                                const size_t node_bytes = ggml_nbytes(ids_tensor);
+                                const size_t alloc_bytes = GGML_PAD(node_bytes, 512);
+
+                                if (rib.buffer == nullptr || rib.offset + alloc_bytes > rib.capacity) {
+                                    const size_t new_cap = std::max((size_t)2 * 1024 * 1024, std::max(rib.capacity * 2, rib.offset + alloc_bytes * 4));
+                                    if (rib.buffer) {
+                                        ggml_backend_buffer_free(rib.buffer);
+                                        rib.buffer = nullptr;
+                                    }
+                                    rib.capacity = new_cap;
+                                    rib.buffer = ggml_backend_alloc_buffer(split_backend, rib.capacity);
+                                    rib.offset = 0;
+                                }
+
+                                rib.tensors.push_back(*ids_tensor);
+                                struct ggml_tensor * remapped_ids_tensor = &rib.tensors.back();
+                                remapped_ids_tensor->data = (uint8_t *)ggml_backend_buffer_get_base(rib.buffer) + rib.offset;
+                                remapped_ids_tensor->buffer = rib.buffer;
+                                remapped_ids_tensor->view_src = NULL;
+                                remapped_ids_tensor->view_offs = 0;
+
                                 ggml_backend_tensor_set_async(split_backend,
-                                    ids_tensor,
+                                    remapped_ids_tensor,
                                     remapped_ids.data(),
                                     0,
                                     remapped_ids.size() * sizeof(int32_t));
 
+                                rib.offset += alloc_bytes;
+
                                 node->src[0] = slot_tensor;
-                                restored_nodes.push_back({ node, input_cpy });
+                                node->src[2] = remapped_ids_tensor;
+                                restored_nodes.push_back({ node, input_cpy, ids_tensor });
                                 used_zero_copy = true;
 
                             }
@@ -2100,9 +2197,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // restore any modified node src[0] pointers for graph idempotency
+        // restore any modified node src[0] and src[2] pointers for graph idempotency
         for (auto & rn : restored_nodes) {
-            rn.first->src[0] = rn.second;
+            rn.node->src[0] = rn.orig_src0;
+            rn.node->src[2] = rn.orig_src2;
         }
 
         // record the event of this copy
@@ -2200,6 +2298,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_expert_cache_free(sched->expert_caches[b]);
             sched->expert_caches[b] = NULL;
         }
+        if (sched->remapped_ids_buf[b].buffer) {
+            ggml_backend_buffer_free(sched->remapped_ids_buf[b].buffer);
+            sched->remapped_ids_buf[b].buffer = nullptr;
+        }
+        sched->remapped_ids_buf[b].tensors.clear();
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);

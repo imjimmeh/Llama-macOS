@@ -1749,6 +1749,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.expert_cache_period = params.expert_cache_period;
     cparams.expert_cache_max_swaps = params.expert_cache_max_swaps;
     cparams.expert_cache_stats  = params.expert_cache_stats;
+    if (params.fit_params && params.expert_cache_size == (size_t)-1) {
+        cparams.expert_cache_auto_reserve = params.fit_params_target[0];
+    } else {
+        cparams.expert_cache_auto_reserve = (size_t)-1;
+    }
 
     return cparams;
 }

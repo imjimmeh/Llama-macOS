@@ -4,6 +4,7 @@
 
 #if defined(GGML_USE_CUDA)
 #include <cuda_runtime.h>
+#include "ggml-cuda/expert-cache-remap.cuh"
 #endif
 
 #include <algorithm>
@@ -54,14 +55,23 @@ struct ggml_expert_cache_pool_key_hash {
     }
 };
 
+struct ggml_expert_cache_gpu_map_info {
+    void *  device_map = nullptr;
+    std::vector<int32_t> host_shadow;
+    bool    dirty = false;
+    ggml_backend_event_t ready_event = nullptr;
+};
+
 struct ggml_expert_cache_slot_entry {
     const struct ggml_tensor * tensor = nullptr;
     int32_t expert_id = -1;
     int32_t layer = -1;
+    enum ggml_expert_cache_slot_state state = GGML_EXPERT_CACHE_SLOT_EMPTY;
     enum ggml_expert_cache_segment segment = GGML_EXPERT_CACHE_SEG_PROBATIONARY;
     uint64_t last_used = 0;
     uint64_t hit_count = 0;
     uint32_t access_in_window = 0;
+    ggml_backend_event_t last_use_event = nullptr;
 };
 
 struct ggml_expert_cache_slot_pool {
@@ -82,6 +92,8 @@ struct ggml_expert_cache_slot_pool {
 
     // Per-tensor slot maps: tensor pointer -> vector of slot indices for each expert_id (P0 fix)
     std::unordered_map<const struct ggml_tensor *, std::vector<int32_t>> slot_maps;
+    // Per-tensor GPU maps: tensor pointer -> device map allocation & shadow
+    std::unordered_map<const struct ggml_tensor *, ggml_expert_cache_gpu_map_info> gpu_maps;
     std::vector<ggml_expert_cache_slot_entry> slots;
 
     // Admission hysteresis & anti-thrashing (Phase 5)
@@ -334,7 +346,25 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
         return;
     }
 
+    ggml_backend_expert_cache_sync_staging(cache);
+
     for (auto & kv : cache->slot_pools) {
+        for (auto & slot : kv.second.slots) {
+            if (slot.last_use_event != NULL) {
+                ggml_backend_event_free(slot.last_use_event);
+                slot.last_use_event = NULL;
+            }
+        }
+        for (auto & gm_kv : kv.second.gpu_maps) {
+            if (gm_kv.second.device_map != NULL) {
+                ggml_backend_expert_cache_gpu_map_free(cache->backend, gm_kv.second.device_map);
+                gm_kv.second.device_map = NULL;
+            }
+            if (gm_kv.second.ready_event != NULL) {
+                ggml_backend_event_free(gm_kv.second.ready_event);
+                gm_kv.second.ready_event = NULL;
+            }
+        }
         if (kv.second.ctx) {
             ggml_free(kv.second.ctx);
         }
@@ -488,11 +518,21 @@ void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache, int 
             }
             if (slot == -1 && evict_idx < slots_to_evict.size()) {
                 slot = slots_to_evict[evict_idx++];
-                const auto & vict = pool.slots[slot];
+                auto & vict = pool.slots[slot];
+                if (vict.last_use_event != NULL) {
+                    ggml_backend_event_synchronize(vict.last_use_event);
+                    ggml_backend_event_free(vict.last_use_event);
+                    vict.last_use_event = NULL;
+                }
                 if (vict.tensor != NULL) {
                     auto vit = pool.slot_maps.find(vict.tensor);
                     if (vit != pool.slot_maps.end() && vict.expert_id >= 0 && (size_t)vict.expert_id < vit->second.size()) {
                         vit->second[vict.expert_id] = -1;
+                    }
+                    auto gmit = pool.gpu_maps.find(vict.tensor);
+                    if (gmit != pool.gpu_maps.end() && vict.expert_id >= 0 && (size_t)vict.expert_id < gmit->second.host_shadow.size()) {
+                        gmit->second.host_shadow[vict.expert_id] = -1;
+                        gmit->second.dirty = true;
                     }
                 }
                 if (vict.layer >= 0) cache->layer_slots[vict.layer]--;
@@ -506,8 +546,8 @@ void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache, int 
 
             if (slot >= 0) {
                 const int32_t layer = ggml_expert_cache_get_tensor_layer(load_cand.key.tensor);
-                pool.slots[slot] = { load_cand.key.tensor, load_cand.key.expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1 };
-                
+                pool.slots[slot] = { load_cand.key.tensor, load_cand.key.expert_id, layer, GGML_EXPERT_CACHE_SLOT_LOADING, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1, nullptr };
+
                 auto & sm = pool.slot_maps[load_cand.key.tensor];
                 if ((size_t)load_cand.key.expert_id >= sm.size()) {
                     sm.resize((size_t)load_cand.key.expert_id + 1, -1);
@@ -529,6 +569,7 @@ void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache, int 
                 } else if (load_cand.key.tensor->data != NULL) {
                     ggml_backend_tensor_set_async(cache->backend, pool.tensor, (const uint8_t *)load_cand.key.tensor->data + src_off, dst_off, expert_size);
                 }
+                ggml_backend_expert_cache_promote_slot(cache, load_cand.key.tensor, load_cand.key.expert_id, slot);
                 swaps_done++;
             }
         }
@@ -773,7 +814,7 @@ int32_t ggml_backend_expert_cache_find_slot(
     auto it = pool->slot_maps.find(tensor);
     if (it != pool->slot_maps.end() && (size_t)expert_id < it->second.size()) {
         int32_t s = it->second[expert_id];
-        if (s >= 0 && s < pool->max_slots && pool->slots[s].tensor == tensor && pool->slots[s].expert_id == expert_id) {
+        if (s >= 0 && s < pool->max_slots && pool->slots[s].tensor == tensor && pool->slots[s].expert_id == expert_id && pool->slots[s].state == GGML_EXPERT_CACHE_SLOT_RESIDENT) {
             return s;
         }
     }
@@ -810,7 +851,7 @@ int32_t ggml_backend_expert_cache_alloc_slot_idx(
     // 1. Look for an empty slot (unconstrained pool)
     for (int32_t s = 0; s < pool->max_slots; s++) {
         if (pool->slots[s].tensor == NULL) {
-            pool->slots[s] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1 };
+            pool->slots[s] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SLOT_LOADING, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1, nullptr };
             auto & sm = pool->slot_maps[tensor];
             if ((size_t)expert_id >= sm.size()) {
                 sm.resize((size_t)expert_id + 1, -1);
@@ -893,12 +934,25 @@ int32_t ggml_backend_expert_cache_alloc_slot_idx(
     }
 
     if (victim_slot != -1) {
-        const auto & vict = pool->slots[victim_slot];
+        auto & vict = pool->slots[victim_slot];
         ggml_expert_cache_key vkey = { vict.tensor, vict.expert_id };
+
+        // in-flight reader protection: synchronize before overwriting slot data
+        if (vict.last_use_event != NULL) {
+            ggml_backend_event_synchronize(vict.last_use_event);
+            ggml_backend_event_free(vict.last_use_event);
+            vict.last_use_event = NULL;
+        }
+
         if (vict.tensor != NULL) {
             auto vit = pool->slot_maps.find(vict.tensor);
             if (vit != pool->slot_maps.end() && vict.expert_id >= 0 && (size_t)vict.expert_id < vit->second.size()) {
                 vit->second[vict.expert_id] = -1;
+            }
+            auto gmit = pool->gpu_maps.find(vict.tensor);
+            if (gmit != pool->gpu_maps.end() && vict.expert_id >= 0 && (size_t)vict.expert_id < gmit->second.host_shadow.size()) {
+                gmit->second.host_shadow[vict.expert_id] = -1;
+                gmit->second.dirty = true;
             }
         }
         if (vict.layer >= 0) cache->layer_slots[vict.layer]--;
@@ -911,7 +965,7 @@ int32_t ggml_backend_expert_cache_alloc_slot_idx(
         pool->eviction_miss_counts[vkey] = 1;
         cache->stats.n_evictions++;
 
-        pool->slots[victim_slot] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1 };
+        pool->slots[victim_slot] = { tensor, expert_id, layer, GGML_EXPERT_CACHE_SLOT_LOADING, GGML_EXPERT_CACHE_SEG_PROBATIONARY, ++cache->clock, 0, 1, nullptr };
         auto & sm = pool->slot_maps[tensor];
         if ((size_t)expert_id >= sm.size()) {
             sm.resize((size_t)expert_id + 1, -1);
@@ -959,7 +1013,7 @@ int32_t ggml_backend_expert_cache_remap_ids(
         int32_t slot = -1;
         if (pool != NULL && p_sm != nullptr && (size_t)id < p_sm->size()) {
             int32_t s = (*p_sm)[id];
-            if (s >= 0 && s < pool->max_slots && pool->slots[s].tensor == tensor && pool->slots[s].expert_id == id) {
+            if (s >= 0 && s < pool->max_slots && pool->slots[s].tensor == tensor && pool->slots[s].expert_id == id && pool->slots[s].state == GGML_EXPERT_CACHE_SLOT_RESIDENT) {
                 slot = s;
             }
         }
@@ -1446,7 +1500,127 @@ bool ggml_backend_expert_cache_seed(
         dst_off,
         expert_size);
 
+    ggml_backend_expert_cache_promote_slot(cache, tensor, expert_id, slot);
+
     return true;
+}
+
+void ggml_backend_expert_cache_sync_staging(ggml_backend_expert_cache_t cache) {
+    if (cache == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < cache->staging_events.size(); i++) {
+        if (cache->staging_in_flight[i] && cache->staging_events[i] != NULL) {
+            ggml_backend_event_synchronize(cache->staging_events[i]);
+            cache->staging_in_flight[i] = false;
+        }
+    }
+}
+
+void ggml_backend_expert_cache_promote_slot(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id,
+        int32_t slot) {
+    if (cache == NULL || tensor == NULL || expert_id < 0 || slot < 0) {
+        return;
+    }
+    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
+    if (pool == NULL || slot >= pool->max_slots) {
+        return;
+    }
+    if (pool->slots[slot].tensor == tensor && pool->slots[slot].expert_id == expert_id) {
+        pool->slots[slot].state = GGML_EXPERT_CACHE_SLOT_RESIDENT;
+        auto & gm = pool->gpu_maps[tensor];
+        if (gm.device_map == nullptr) {
+            const int64_t n_expert = tensor->ne[2] > 0 ? tensor->ne[2] : 256;
+            gm.device_map = ggml_backend_expert_cache_gpu_map_create(cache->backend, (int32_t)n_expert);
+            gm.host_shadow.assign((size_t)n_expert, -1);
+            if (gm.ready_event == nullptr) {
+                gm.ready_event = ggml_backend_event_new(ggml_backend_get_device(cache->backend));
+            }
+        }
+        if ((size_t)expert_id >= gm.host_shadow.size()) {
+            gm.host_shadow.resize((size_t)expert_id + 1, -1);
+        }
+        gm.host_shadow[expert_id] = slot;
+        gm.dirty = true;
+    }
+}
+
+void * ggml_backend_expert_cache_gpu_map_create(ggml_backend_t backend, int32_t n_expert) {
+#if defined(GGML_USE_CUDA)
+    if (backend && ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return ggml_cuda_expert_cache_gpu_map_create(n_expert);
+    }
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(n_expert);
+#endif
+    return NULL;
+}
+
+void ggml_backend_expert_cache_gpu_map_update(ggml_backend_t backend, void * dev_map, const int32_t * host_entries, int32_t n_entries, void * stream) {
+#if defined(GGML_USE_CUDA)
+    if (backend && ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        ggml_cuda_expert_cache_gpu_map_update(dev_map, host_entries, n_entries, stream);
+    }
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(dev_map);
+    GGML_UNUSED(host_entries);
+    GGML_UNUSED(n_entries);
+    GGML_UNUSED(stream);
+#endif
+}
+
+void ggml_backend_expert_cache_gpu_map_free(ggml_backend_t backend, void * dev_map) {
+#if defined(GGML_USE_CUDA)
+    if (backend && ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        ggml_cuda_expert_cache_gpu_map_free(dev_map);
+    }
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(dev_map);
+#endif
+}
+
+void ggml_backend_expert_cache_partition_ids(
+        ggml_backend_t backend,
+        const int32_t * ids_in,
+        int32_t * remapped_ids_out,
+        const int32_t * gpu_slot_map,
+        int32_t * hit_mask_out,
+        struct ggml_expert_cache_miss_desc * miss_descs_out,
+        int32_t * miss_counter_dev,
+        int32_t n_expert_used,
+        int32_t n_tokens,
+        void * stream) {
+#if defined(GGML_USE_CUDA)
+    if (backend && ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        ggml_cuda_expert_cache_partition_ids(
+            ids_in,
+            remapped_ids_out,
+            gpu_slot_map,
+            hit_mask_out,
+            miss_descs_out,
+            miss_counter_dev,
+            n_expert_used,
+            n_tokens,
+            stream);
+    }
+#else
+    GGML_UNUSED(backend);
+    GGML_UNUSED(ids_in);
+    GGML_UNUSED(remapped_ids_out);
+    GGML_UNUSED(gpu_slot_map);
+    GGML_UNUSED(hit_mask_out);
+    GGML_UNUSED(miss_descs_out);
+    GGML_UNUSED(miss_counter_dev);
+    GGML_UNUSED(n_expert_used);
+    GGML_UNUSED(n_tokens);
+    GGML_UNUSED(stream);
+#endif
 }
 
 void ggml_backend_expert_cache_sync(ggml_backend_expert_cache_t cache) {

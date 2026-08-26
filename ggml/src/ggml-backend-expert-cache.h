@@ -29,6 +29,19 @@ enum ggml_expert_cache_segment {
     GGML_EXPERT_CACHE_SEG_PROTECTED    = 1,
 };
 
+// Slot lifecycle states (Phase 2 & 4)
+enum ggml_expert_cache_slot_state {
+    GGML_EXPERT_CACHE_SLOT_EMPTY     = 0,
+    GGML_EXPERT_CACHE_SLOT_LOADING   = 1,
+    GGML_EXPERT_CACHE_SLOT_RESIDENT  = 2,
+};
+
+struct ggml_expert_cache_miss_desc {
+    int32_t token_idx;
+    int32_t route_idx;
+    int32_t expert_id;
+};
+
 
 
 typedef struct ggml_backend_expert_cache * ggml_backend_expert_cache_t;
@@ -279,6 +292,42 @@ GGML_API bool ggml_backend_expert_cache_seed(
     const struct ggml_tensor * tensor,
     int32_t expert_id,
     uint32_t frequency);
+
+GGML_API void ggml_backend_expert_cache_sync_staging(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_promote_slot(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id,
+    int32_t slot);
+
+GGML_API void * ggml_backend_expert_cache_gpu_map_create(
+    ggml_backend_t backend,
+    int32_t n_expert);
+
+GGML_API void ggml_backend_expert_cache_gpu_map_update(
+    ggml_backend_t backend,
+    void * dev_map,
+    const int32_t * host_entries,
+    int32_t n_entries,
+    void * stream);
+
+GGML_API void ggml_backend_expert_cache_gpu_map_free(
+    ggml_backend_t backend,
+    void * dev_map);
+
+GGML_API void ggml_backend_expert_cache_partition_ids(
+    ggml_backend_t backend,
+    const int32_t * ids_in,
+    int32_t * remapped_ids_out,
+    const int32_t * gpu_slot_map,
+    int32_t * hit_mask_out,
+    struct ggml_expert_cache_miss_desc * miss_descs_out,
+    int32_t * miss_counter_dev,
+    int32_t n_expert_used,
+    int32_t n_tokens,
+    void * stream);
 
 GGML_API void ggml_backend_expert_cache_sync(
     ggml_backend_expert_cache_t cache);
