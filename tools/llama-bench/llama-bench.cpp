@@ -1575,6 +1575,7 @@ static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_ba
     EXPERT_CACHE_SUBTRACT(n_route_census_batch_2_8);
     EXPERT_CACHE_SUBTRACT(n_route_census_batch_9_31);
     EXPERT_CACHE_SUBTRACT(n_route_census_batch_32_plus);
+    EXPERT_CACHE_SUBTRACT(n_route_census_plans);
 #undef EXPERT_CACHE_SUBTRACT
     return delta;
 }
@@ -1761,7 +1762,8 @@ struct test {
             "expert_cache_route_census_batch_1",
             "expert_cache_route_census_batch_2_8",
             "expert_cache_route_census_batch_9_31",
-            "expert_cache_route_census_batch_32_plus"
+            "expert_cache_route_census_batch_32_plus",
+            "expert_cache_route_census_plans"
 
         };
         return fields;
@@ -1827,7 +1829,8 @@ struct test {
             field == "expert_cache_route_census_batch_1" ||
             field == "expert_cache_route_census_batch_2_8" ||
             field == "expert_cache_route_census_batch_9_31" ||
-            field == "expert_cache_route_census_batch_32_plus") {
+            field == "expert_cache_route_census_batch_32_plus" ||
+            field == "expert_cache_route_census_plans") {
             return INT;
         }
         return STRING;
@@ -1953,7 +1956,8 @@ struct test {
                                             std::to_string(expert_cache_stats.n_route_census_batch_1),
                                             std::to_string(expert_cache_stats.n_route_census_batch_2_8),
                                             std::to_string(expert_cache_stats.n_route_census_batch_9_31),
-                                            std::to_string(expert_cache_stats.n_route_census_batch_32_plus) };
+                                            std::to_string(expert_cache_stats.n_route_census_batch_32_plus),
+                                            std::to_string(expert_cache_stats.n_route_census_plans) };
         return values;
     }
 

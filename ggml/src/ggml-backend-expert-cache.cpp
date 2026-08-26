@@ -1604,6 +1604,37 @@ void ggml_backend_expert_cache_promote_slot(
         }
     }
 }
+bool ggml_backend_expert_cache_record_slot_use(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor,
+        int32_t expert_id,
+        int32_t slot) {
+    if (cache == NULL || tensor == NULL || expert_id < 0 || slot < 0) {
+        return false;
+    }
+
+    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
+    if (pool == NULL || slot >= pool->max_slots) {
+        return false;
+    }
+
+    auto & slot_entry = pool->slots[slot];
+    if (slot_entry.tensor != tensor || slot_entry.expert_id != expert_id ||
+        !ggml_expert_cache_poll_slot(cache, slot_entry)) {
+        return false;
+    }
+
+    if (slot_entry.last_use_event == nullptr) {
+        slot_entry.last_use_event = ggml_backend_event_new(ggml_backend_get_device(cache->backend));
+    }
+    if (slot_entry.last_use_event == nullptr) {
+        return false;
+    }
+
+    ggml_backend_event_record(slot_entry.last_use_event, cache->backend);
+    return true;
+}
+
 
 
 void ggml_backend_expert_cache_sync(ggml_backend_expert_cache_t cache) {

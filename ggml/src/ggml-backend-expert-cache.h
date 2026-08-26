@@ -317,6 +317,11 @@ GGML_API void ggml_backend_expert_cache_promote_slot(
     const struct ggml_tensor * tensor,
     int32_t expert_id,
     int32_t slot);
+GGML_API bool ggml_backend_expert_cache_record_slot_use(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id,
+    int32_t slot);
 
 GGML_API void ggml_backend_expert_cache_sync(
     ggml_backend_expert_cache_t cache);

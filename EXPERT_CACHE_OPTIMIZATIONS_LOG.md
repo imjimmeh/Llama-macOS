@@ -943,6 +943,8 @@ token-generation cache speedup. The next implementation work must fix route
 identity and execution lifecycle before attempting route-aware dispatch.
 
 
+## Completion-Aware Slot Publication Baseline (2026-08-26)
+
 ### Change
 
 Added an optional nonblocking backend event query and changed slot lookup to
@@ -971,3 +973,115 @@ Retain the lifecycle change as a safety prerequisite. No token-generation
 performance claim is made. Consumer-use event ownership and complete-bundle
 reservation remain unimplemented and must precede background or multistream
 fills.
+
+## Route Plan and Full-Hit Safety Baseline (2026-08-26)
+
+### Change
+
+Added scheduler route-plan grouping for `MUL_MAT_ID` nodes that share a route
+ID tensor. Added consumer-use event recording for resident slot-pool entries.
+Corrected the zero-copy readiness gate so a newly claimed `LOADING` slot cannot
+leave `all_slots_ready` true. A miss therefore uses the existing copied-tensor
+fallback instead of consuming a slot before its DMA completion.
+
+The route-plan structure is metadata-only in this checkpoint. It does not yet
+reschedule CPU-routed operations or implement CPU-on-miss background fills.
+
+### Verification
+
+```text
+cmake --build build --config Release --target test-expert-cache llama-bench
+Result: PASS
+build/bin/Release/test-expert-cache.exe
+Result: PASS - route-plan, loading-state, remapping, and existing cache tests
+build/bin/Release/llama-bench.exe --help
+Result: PASS
+```
+
+### Compact TG benchmark
+
+Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf`; GTX 1080; CUDA; mlock; Q8 K/V;
+Flash Attention; 14 threads; batch 4096; ubatch 2048; fit target 256 MiB;
+`-p 0 -n 32 -r 1`; one fresh process per row.
+
+| Cache | TG tok/s | Route nodes | CPU-host nodes | Cache requests |
+| --- | ---: | ---: | ---: | ---: |
+| `-exc 0` | 23.1564 | 120 | 80 | 0 |
+| `-exc 128 -excp 256` | 24.2997 | 120 | 83 | 0 |
+
+The one-row difference is not a performance claim. Both rows had zero cache
+requests and zero eligible cache operations. The current source still keeps
+normal Compact TG on the CPU route.
+
+### Decision
+
+Retain route grouping and completion-safe full-hit gating. Do not claim general
+route-aware dispatch is implemented. The next step remains a route checkpoint
+or another measured dispatch boundary; global CUDA threshold forcing remains
+rejected.
+
+## General Batch Full-Hit Gate Diagnostic (2026-08-26)
+
+### Change
+
+The zero-copy admission loop now probes the complete requested-expert union
+before claiming slots. If any requested expert is absent or still loading, the
+operation does not issue a current-route slot fill and does not rewrite the
+operation to `slot_tensor`. It uses the existing copied-tensor fallback. This
+removes duplicate current-route transfer and prevents a new `LOADING` slot from
+being consumed by the current kernel.
+
+### Diagnostic forced-placement row
+
+This row deliberately set `GGML_OP_OFFLOAD_MIN_BATCH=1` only to exercise the
+already-eligible cache path. It is not a supported performance policy.
+
+Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf`; GTX 1080; CUDA; mlock; Q8 K/V;
+Flash Attention; 14 threads; batch 4096; ubatch 2048; fit target 256 MiB;
+`GGML_OP_OFFLOAD_MIN_BATCH=1`; `-p 0 -n 8 -exc 128 -excp 0 -r 1`.
+
+```text
+TG:                         16.0383 tok/s
+MUL_MAT_ID inputs:             664
+eligible operations:           664
+requests:                    5,312
+hits:                            0
+misses:                      5,312
+zero-copy hits:                  0
+RAM-to-GPU:              2,613,575,680 bytes
+probe sync:                 8,045 us
+```
+
+### Decision
+
+The full-hit gate is retained for correctness and to avoid duplicate immediate
+slot fills. The forced singleton placement remains rejected: it is still
+materially slower than the CPU-routed Compact control and produces no warm
+zero-copy hits. A future route-aware dispatcher must choose CPU execution for a
+current miss after route discovery; this checkpoint does not yet implement that
+graph-phase transition.
+
+## General Decode Route Capture Smoke (2026-08-26)
+
+### Deterministic control
+
+The fresh-process Compact control completed with 16 generated tokens:
+
+```text
+command: python scripts/expert-cache-determinism.py --exc 0 --n-predict 16
+sha256_tokens: 89974bd92072a35ef6303f63163658e89e7299cecf670c4dcd8bf5c61cb6b0d1
+tok_s: 22.693
+```
+
+The route-capture-enabled row (`-exc 128M --expert-cache-prefetch`) did not
+become healthy within the harness timeout after entering model initialization.
+No enabled throughput or token result was recorded, and no performance claim is
+made from this incomplete pair. The failed health check is retained as a
+benchmark limitation to investigate before enabling host-route capture by
+default.
+
+### Decision
+
+Keep host-route capture disabled by default. It remains an experimental path
+until a full deterministic control/enabled pair completes and confirms that
+prefetch traffic does not change placement or add load-time/runtime stalls.

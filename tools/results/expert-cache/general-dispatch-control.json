@@ -1,0 +1,16 @@
+{
+  "tool": "llama-server",
+  "model": "C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf",
+  "ctx_size": 128000,
+  "exc": "0",
+  "excp": 256,
+  "extra_args": "",
+  "prompt": "Explain how a mixture-of-experts transformer routes tokens through expert layers, in exactly five sentences.",
+  "seed": 42,
+  "n_predict": 16,
+  "n_tokens": 16,
+  "sha256_tokens": "89974bd92072a35ef6303f63163658e89e7299cecf670c4dcd8bf5c61cb6b0d1",
+  "sha256_content": "f8552d7ce3753534628693ba518b7c04ffcbd7b4cd8054f812a029206a5a48f4",
+  "tok_s": 22.693,
+  "wall_s": 1.1
+}

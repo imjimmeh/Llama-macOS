@@ -94,6 +94,51 @@ static void test_route_census_classifies_original_graph() {
     printf("  original-graph route census tests passed\n");
 }
 
+static void test_route_plan_groups_shared_ids() {
+    printf("testing shared route-ID plan discovery...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        &backend, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    require(sched != nullptr);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * experts_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 8, 2);
+    ggml_tensor * experts_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 8, 2);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 2, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+    ggml_tensor * matmul_a = ggml_mul_mat_id(ctx, experts_a, input, ids);
+    ggml_tensor * matmul_b = ggml_mul_mat_id(ctx, experts_b, input, ids);
+    ggml_tensor * output = ggml_add(ctx, matmul_a, matmul_b);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_sched_split_graph(sched, graph);
+
+    ggml_backend_expert_cache_stats stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &stats));
+    require(stats.n_route_census_nodes == 2);
+    require(stats.n_route_census_plans == 1);
+
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  shared route-ID plan discovery tests passed\n");
+}
+
 static void test_event_query_contract() {
     printf("testing nonblocking event query contract...\n");
     require(!ggml_backend_event_query(nullptr));
@@ -205,6 +250,52 @@ static void test_slot_pools_and_remapping() {
     ggml_backend_free(backend);
 
     printf("  slot pools and zero-copy ID remapping tests passed\n");
+}
+
+static void test_multi_token_slot_remapping() {
+    printf("testing multi-token slot remapping...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 8 * 1024);
+    require(cache != nullptr);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
+    ggml_set_name(tensor, "blk.0.ffn_gate_exps.weight");
+
+    const int32_t cached_ids[] = { 1, 4, 7, 11 };
+    int32_t slots[4] = {};
+    for (size_t i = 0; i < 4; ++i) {
+        slots[i] = ggml_backend_expert_cache_alloc_slot_idx(
+            cache, tensor, cached_ids[i], nullptr, 0);
+        require(slots[i] >= 0);
+        ggml_backend_expert_cache_promote_slot(cache, tensor, cached_ids[i], slots[i]);
+    }
+
+    const int32_t route_ids[] = { 1, 7, 4, 11, 7, 1, 11, 4 };
+    int32_t remapped[8] = {};
+    bool is_hit[8] = {};
+    require(ggml_backend_expert_cache_remap_ids(
+        cache, tensor, route_ids, 8, remapped, is_hit) == 8);
+
+    for (size_t i = 0; i < 8; ++i) {
+        require(is_hit[i]);
+        require(remapped[i] == ggml_backend_expert_cache_find_slot(cache, tensor, route_ids[i]));
+    }
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  multi-token slot remapping tests passed\n");
 }
 
 static void test_slru_and_admission_policy() {
@@ -792,7 +883,9 @@ int main() {
 
     test_route_census_classifies_original_graph();
     test_event_query_contract();
+    test_route_plan_groups_shared_ids();
     test_slot_pools_and_remapping();
+    test_multi_token_slot_remapping();
     test_cross_layer_shape_isolation();
     test_pinned_staging_no_overwrite();
 

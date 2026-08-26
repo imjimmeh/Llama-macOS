@@ -415,6 +415,7 @@ extern "C" {
         uint64_t n_route_census_batch_2_8;
         uint64_t n_route_census_batch_9_31;
         uint64_t n_route_census_batch_32_plus;
+        uint64_t n_route_census_plans;
     };
 
     GGML_API void                 ggml_backend_sched_set_expert_cache_prefetch(ggml_backend_sched_t sched, bool enabled);

@@ -851,6 +851,18 @@ struct ggml_backend_sched {
     uint64_t expert_cache_route_step = 0;
     std::vector<ggml_backend_sched_route_snapshot> expert_cache_route_snapshots;
     ggml_backend_expert_cache_stats route_census_stats = {};
+    struct ggml_backend_sched_route_plan {
+        const struct ggml_tensor * route_ids = nullptr;
+        std::vector<struct ggml_tensor *> nodes;
+    };
+    std::vector<ggml_backend_sched_route_plan> route_plans;
+    struct ggml_backend_sched_slot_use {
+        ggml_backend_expert_cache_t cache = nullptr;
+        const struct ggml_tensor * tensor = nullptr;
+        int32_t expert_id = -1;
+        int32_t slot = -1;
+    };
+    std::vector<ggml_backend_sched_slot_use> slot_uses;
     std::vector<int32_t> expert_ids_scratch;
     std::vector<ggml_bitset_t> expert_bitset_scratch;
     std::vector<ggml_bitset_t> expert_miss_bitset_scratch;
@@ -1091,6 +1103,33 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
     }
+}
+
+static void ggml_backend_sched_discover_route_plans(
+        ggml_backend_sched_t sched,
+        struct ggml_cgraph * graph) {
+    sched->route_plans.clear();
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID || node->src[2] == nullptr) {
+            continue;
+        }
+
+        decltype(sched->route_plans)::value_type * plan = nullptr;
+        for (auto & candidate : sched->route_plans) {
+            if (candidate.route_ids == node->src[2]) {
+                plan = &candidate;
+                break;
+            }
+        }
+        if (plan == nullptr) {
+            sched->route_plans.push_back({});
+            plan = &sched->route_plans.back();
+            plan->route_ids = node->src[2];
+        }
+        plan->nodes.push_back(node);
+    }
+    sched->route_census_stats.n_route_census_plans += sched->route_plans.size();
 }
 
 
@@ -1372,6 +1411,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
+    ggml_backend_sched_discover_route_plans(sched, graph);
     ggml_backend_sched_record_route_census(sched, graph);
 
     // pass 5: split graph, find tensors that need to be copied
@@ -1774,6 +1814,79 @@ static void ggml_backend_sched_prefetch_carry_forward(
     sched->expert_cache_route_snapshots.clear();
 }
 
+static void ggml_backend_sched_record_host_route_snapshots(
+        ggml_backend_sched_t sched,
+        const struct ggml_backend_sched_split * split,
+        uint64_t step) {
+    if (!sched->expert_cache_prefetch) {
+        return;
+    }
+
+    int cache_backend_id = -1;
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (sched->expert_caches[b] != nullptr) {
+            cache_backend_id = b;
+            break;
+        }
+    }
+    if (cache_backend_id < 0) {
+        return;
+    }
+
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        struct ggml_tensor * node = split->graph.nodes[i];
+        if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID ||
+            node->src[0] == nullptr || node->src[2] == nullptr) {
+            continue;
+        }
+
+        const struct ggml_tensor * weights = node->src[0];
+        const struct ggml_tensor * ids_tensor = node->src[2];
+        const ggml_backend_buffer_t weights_buffer = weights->view_src != nullptr ?
+            weights->view_src->buffer : weights->buffer;
+        const ggml_backend_buffer_t ids_buffer = ids_tensor->view_src != nullptr ?
+            ids_tensor->view_src->buffer : ids_tensor->buffer;
+        if (weights_buffer == nullptr || ids_buffer == nullptr ||
+            ggml_backend_buffer_get_usage(weights_buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            !ggml_backend_buffer_is_host(weights_buffer) ||
+            !ggml_backend_buffer_is_host(ids_buffer) ||
+            ids_tensor->type != GGML_TYPE_I32 || ids_tensor->data == nullptr) {
+            continue;
+        }
+
+        const int32_t n_expert = (int32_t)weights->ne[2];
+        std::vector<int32_t> route_ids;
+        route_ids.reserve((size_t)ids_tensor->ne[0] * (size_t)ids_tensor->ne[1]);
+        for (int64_t i3 = 0; i3 < ids_tensor->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < ids_tensor->ne[2]; ++i2) {
+                for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; ++i1) {
+                    for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; ++i0) {
+                        const size_t offset = (size_t)(i3 * ids_tensor->nb[3] +
+                            i2 * ids_tensor->nb[2] + i1 * ids_tensor->nb[1] +
+                            i0 * ids_tensor->nb[0]);
+                        const int32_t expert_id = *(const int32_t *)(
+                            (const uint8_t *)ids_tensor->data + offset);
+                        if (expert_id >= 0 && expert_id < n_expert &&
+                            std::find(route_ids.begin(), route_ids.end(), expert_id) ==
+                                route_ids.end()) {
+                            route_ids.push_back(expert_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!route_ids.empty()) {
+            ggml_backend_sched_record_route_snapshot(
+                sched,
+                cache_backend_id,
+                ggml_backend_expert_cache_get_tensor_layer(weights),
+                route_ids,
+                step);
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1806,6 +1919,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     expert_load.clear();
     pinned_keys.clear();
     remapped_ids.clear();
+    sched->slot_uses.clear();
 
     size_t total_remap_bytes[GGML_SCHED_MAX_BACKENDS] = { 0 };
     int total_remap_nodes[GGML_SCHED_MAX_BACKENDS] = { 0 };
@@ -1842,6 +1956,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        const size_t slot_uses_start = sched->slot_uses.size();
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -2043,15 +2158,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             bool all_hit = true;
 
                             for (const int32_t exp_id : requested_experts) {
-                                int32_t slot = ggml_backend_expert_cache_find_slot(cache, input, exp_id);
-                                if (slot >= 0) {
-                                    expert_slots[exp_id] = slot;
-                                    continue;
-                                }
-
-                                bool needs_load = false;
-                                slot = ggml_backend_expert_cache_claim_slot_idx(
-                                    cache, input, exp_id, pinned_keys.data(), pinned_keys.size(), &needs_load);
+                                const int32_t slot = ggml_backend_expert_cache_find_slot(
+                                    cache, input, exp_id);
                                 if (slot < 0) {
                                     all_slots_ready = false;
                                     all_hit = false;
@@ -2059,42 +2167,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 }
 
                                 expert_slots[exp_id] = slot;
-                                all_hit = false;
-                                if (!needs_load) {
-                                    all_slots_ready = false;
-                                    ggml_backend_expert_cache_record_miss(cache, expert_size);
-                                    continue;
-                                }
-
-                                expert_load[exp_id] = 1;
-                                ggml_backend_expert_cache_record_miss(cache, expert_size);
-
-                                const size_t expert_offset = (size_t)exp_id * expert_size;
-                                const size_t dst_offset = (size_t)slot * expert_size;
-                                const void * src_ptr = (const uint8_t *)input->data + expert_offset;
-                                if (ggml_backend_expert_cache_is_host_memory_registered(cache, src_ptr, expert_size)) {
-                                    const int64_t t_upload_start = ggml_time_us();
-
-                                    ggml_backend_tensor_set_async(split_backend,
-                                        slot_tensor, src_ptr, dst_offset, expert_size);
-                                    ggml_backend_expert_cache_record_direct_dma(cache, expert_size);
-                                    ggml_backend_expert_cache_record_probe_upload(cache, ggml_time_us() - t_upload_start);
-                                } else {
-                                    const int64_t t_upload_start = ggml_time_us();
-                                    void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, input, slot, expert_size);
-                                    if (pinned_buf != NULL) {
-                                        memcpy(pinned_buf, src_ptr, expert_size);
-                                        ggml_backend_expert_cache_record_staging_memcpy(cache, expert_size);
-                                        ggml_backend_tensor_set_async(split_backend,
-                                            slot_tensor, pinned_buf, dst_offset, expert_size);
-                                        ggml_backend_expert_cache_stage_commit(cache, input, slot);
-                                    } else {
-                                        ggml_backend_tensor_set_async(
-                                            split_backend, slot_tensor, src_ptr, dst_offset, expert_size);
-                                    }
-                                    ggml_backend_expert_cache_record_probe_upload(cache, ggml_time_us() - t_upload_start);
-                                }
-                                ggml_backend_expert_cache_promote_slot(cache, input, exp_id, slot);
                             }
 
                             for (size_t i = 0; i < ids.size(); i++) {
@@ -2111,6 +2183,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
 
                             if (all_slots_ready) {
+                                for (const int32_t exp_id : requested_experts) {
+                                    sched->slot_uses.push_back({
+                                        cache, input, exp_id, expert_slots[exp_id]
+                                    });
+                                }
                                 if (all_hit) {
                                     ggml_backend_expert_cache_record_all_hit_resolution(cache);
                                 } else {
@@ -2349,6 +2426,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 j0 = j1;
             }
         }
+        ggml_backend_sched_record_host_route_snapshots(sched, split, route_step);
+        for (size_t i = slot_uses_start; i < sched->slot_uses.size(); ++i) {
+            const auto & use = sched->slot_uses[i];
+            ggml_backend_expert_cache_record_slot_use(
+                use.cache, use.tensor, use.expert_id, use.slot);
+        }
+
 
         // restore any modified node src[0] and src[2] pointers for graph idempotency
         for (auto & rn : restored_nodes) {
