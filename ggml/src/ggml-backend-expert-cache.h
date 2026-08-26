@@ -68,6 +68,11 @@ GGML_API void ggml_backend_expert_cache_rebalance(
     ggml_backend_expert_cache_t cache,
     int max_swaps);
 
+enum ggml_expert_cache_phase {
+    GGML_EXPERT_CACHE_PHASE_TG = 0,
+    GGML_EXPERT_CACHE_PHASE_PP = 1,
+};
+
 // Access recording & SLRU touch
 GGML_API void ggml_backend_expert_cache_record_access(
     ggml_backend_expert_cache_t cache,
@@ -78,7 +83,8 @@ GGML_API void ggml_backend_expert_cache_record_access_count(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * tensor,
     int32_t expert_id,
-    uint32_t count);
+    uint32_t count,
+    enum ggml_expert_cache_phase phase);
 
 GGML_API void ggml_backend_expert_cache_process_jit_swaps(
     ggml_backend_expert_cache_t cache,
@@ -188,6 +194,9 @@ GGML_API bool ggml_backend_expert_cache_is_bundle_resident(
     int32_t layer,
     int32_t expert_id);
 
+
+GGML_API void ggml_backend_expert_cache_record_all_hit_resolution(
+    ggml_backend_expert_cache_t cache);
 
 GGML_API void ggml_backend_expert_cache_record_gpu_id_resolution(
     ggml_backend_expert_cache_t cache);

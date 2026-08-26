@@ -409,13 +409,13 @@ static void test_heterogeneous_expert_sizes_rebalance() {
     // Access Tensor A experts and Tensor B experts across alternating steps
     for (int step = 1; step <= 12; step++) {
         if (step % 2 == 1) {
-            ggml_backend_expert_cache_record_access_count(cache, tensorA, 0, 10);
-            ggml_backend_expert_cache_record_access_count(cache, tensorA, 1, 10);
-            ggml_backend_expert_cache_record_access_count(cache, tensorB, 0, 5);
+            ggml_backend_expert_cache_record_access_count(cache, tensorA, 0, 10, GGML_EXPERT_CACHE_PHASE_TG);
+            ggml_backend_expert_cache_record_access_count(cache, tensorA, 1, 10, GGML_EXPERT_CACHE_PHASE_TG);
+            ggml_backend_expert_cache_record_access_count(cache, tensorB, 0, 5, GGML_EXPERT_CACHE_PHASE_TG);
         } else {
-            ggml_backend_expert_cache_record_access_count(cache, tensorB, 1, 20);
-            ggml_backend_expert_cache_record_access_count(cache, tensorB, 2, 20);
-            ggml_backend_expert_cache_record_access_count(cache, tensorA, 2, 5);
+            ggml_backend_expert_cache_record_access_count(cache, tensorB, 1, 20, GGML_EXPERT_CACHE_PHASE_TG);
+            ggml_backend_expert_cache_record_access_count(cache, tensorB, 2, 20, GGML_EXPERT_CACHE_PHASE_TG);
+            ggml_backend_expert_cache_record_access_count(cache, tensorA, 2, 5, GGML_EXPERT_CACHE_PHASE_TG);
         }
         ggml_backend_expert_cache_begin_step(cache);
 

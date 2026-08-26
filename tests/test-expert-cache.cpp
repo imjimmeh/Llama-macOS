@@ -375,6 +375,123 @@ static void test_pinned_staging_no_overwrite() {
     printf("  pinned staging ring tests passed\n");
 }
 
+static void test_cross_layer_shape_isolation() {
+    printf("testing cross-layer same-shape slot isolation...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    const size_t expert_bytes = 512;
+    const size_t cache_capacity = 8 * 512;
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, cache_capacity);
+    assert(cache != nullptr);
+
+    size_t mem_size = 16 * 1024 * 1024;
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ mem_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+
+    // Layer 0 tensor and Layer 1 tensor with identical shape [8, 16, 4]
+    struct ggml_tensor * tensor_l0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 4);
+    ggml_set_name(tensor_l0, "blk.0.ffn_gate_exps.weight");
+    tensor_l0->nb[2] = expert_bytes;
+
+    struct ggml_tensor * tensor_l1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 4);
+    ggml_set_name(tensor_l1, "blk.1.ffn_gate_exps.weight");
+    tensor_l1->nb[2] = expert_bytes;
+
+    // Fill expert 2 of layer 0 with 0x11, and expert 2 of layer 1 with 0x22
+    uint8_t * raw0 = (uint8_t *)tensor_l0->data;
+    uint8_t * raw1 = (uint8_t *)tensor_l1->data;
+    memset(raw0 + 2 * expert_bytes, 0x11, expert_bytes);
+    memset(raw1 + 2 * expert_bytes, 0x22, expert_bytes);
+
+    // Seed both Layer 0 Exp 2 and Layer 1 Exp 2
+    bool ok0 = ggml_backend_expert_cache_seed(cache, tensor_l0, 2, 100);
+    bool ok1 = ggml_backend_expert_cache_seed(cache, tensor_l1, 2, 100);
+    assert(ok0 && ok1);
+
+    // Find slots: they MUST be distinct slots
+    int32_t slot0 = ggml_backend_expert_cache_find_slot(cache, tensor_l0, 2);
+    int32_t slot1 = ggml_backend_expert_cache_find_slot(cache, tensor_l1, 2);
+    assert(slot0 >= 0);
+    assert(slot1 >= 0);
+    assert(slot0 != slot1);
+
+    // Verify data integrity in slot tensor
+    struct ggml_tensor * slot_t = ggml_backend_expert_cache_get_slot_tensor(cache, tensor_l0);
+    assert(slot_t != nullptr);
+    const uint8_t * slot_buf = (const uint8_t *)slot_t->data;
+
+    for (size_t b = 0; b < expert_bytes; b++) {
+        assert(slot_buf[slot0 * expert_bytes + b] == 0x11);
+        assert(slot_buf[slot1 * expert_bytes + b] == 0x22);
+    }
+
+    // Verify that tensor_l0 only finds its own slot and not layer 1
+    assert(ggml_backend_expert_cache_find_slot(cache, tensor_l0, 2) == slot0);
+    assert(ggml_backend_expert_cache_find_slot(cache, tensor_l1, 2) == slot1);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  cross-layer same-shape slot isolation tests passed\n");
+}
+
+static void test_pp_tg_telemetry_isolation() {
+    printf("testing PP and TG telemetry frequency isolation...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 4096);
+    assert(cache != nullptr);
+
+    size_t mem_size = 16 * 1024 * 1024;
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ mem_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+
+    struct ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 4);
+    ggml_set_name(tensor, "blk.0.ffn_gate_exps.weight");
+    tensor->nb[2] = 512;
+
+    // Record access in PP phase for expert 1
+    ggml_backend_expert_cache_record_access_count(cache, tensor, 1, 500, GGML_EXPERT_CACHE_PHASE_PP);
+
+    // Record access in TG phase for expert 0
+    ggml_backend_expert_cache_record_access_count(cache, tensor, 0, 10, GGML_EXPERT_CACHE_PHASE_TG);
+
+    struct ggml_backend_expert_cache_export_entry entries[4];
+    size_t n = ggml_backend_expert_cache_export_entries(cache, entries, 4);
+
+    // Only TG entries drive export/residency
+    assert(n >= 1);
+    bool found_tg_0 = false;
+    bool found_pp_1_in_tg = false;
+    for (size_t i = 0; i < n; i++) {
+        if (entries[i].expert_id == 0 && entries[i].frequency == 10) found_tg_0 = true;
+        if (entries[i].expert_id == 1 && entries[i].frequency == 500) found_pp_1_in_tg = true;
+    }
+    assert(found_tg_0);
+    assert(!found_pp_1_in_tg); // PP accesses must not leak into TG residency frequency
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  PP and TG telemetry isolation tests passed\n");
+}
 
 int main() {
     printf("running test-expert-cache (V2 features)...\n");
@@ -382,12 +499,14 @@ int main() {
     test_cache_node_selection();
     test_cache_capacity_admission();
     test_slot_pools_and_remapping();
+    test_cross_layer_shape_isolation();
     test_pinned_staging_no_overwrite();
 
     test_slru_and_admission_policy();
     test_expert_bundles();
     test_pinned_host_buffer();
     test_prefetch();
+    test_pp_tg_telemetry_isolation();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

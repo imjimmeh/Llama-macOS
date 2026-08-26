@@ -1793,10 +1793,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             if (ggml_bitset_get(used_ids.data(), e)) {
                                 requested_experts.push_back((int32_t)e);
                                 pinned_keys.push_back({ input, (int32_t)e });
+                                const enum ggml_expert_cache_phase phase = (ids_tensor->ne[1] > 8) ?
+                                    GGML_EXPERT_CACHE_PHASE_PP : GGML_EXPERT_CACHE_PHASE_TG;
                                 if (expert_counts[e] > 0) {
-                                    // Scale frequency update proportionally so prefill and decode contribute evenly
-                                    const uint32_t inc = std::max<uint32_t>(1, (uint32_t)(expert_counts[e] / std::max<int64_t>(1, ids_tensor->ne[1])));
-                                    ggml_backend_expert_cache_record_access_count(cache, input, (int32_t)e, inc);
+                                    const uint32_t inc = (phase == GGML_EXPERT_CACHE_PHASE_PP) ?
+                                        (uint32_t)expert_counts[e] :
+                                        std::max<uint32_t>(1, (uint32_t)(expert_counts[e] / std::max<int64_t>(1, ids_tensor->ne[1])));
+                                    ggml_backend_expert_cache_record_access_count(cache, input, (int32_t)e, inc, phase);
                                 }
                             }
                         }
@@ -1885,7 +1888,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                             if (all_slots_ready) {
                                 if (all_hit) {
-                                    ggml_backend_expert_cache_record_gpu_id_resolution(cache);
+                                    ggml_backend_expert_cache_record_all_hit_resolution(cache);
                                 } else {
                                     ggml_backend_expert_cache_record_cpu_id_remap(cache);
                                 }
