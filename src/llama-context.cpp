@@ -610,6 +610,8 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
     size_t eff_expert_cache_size = cparams.expert_cache_size;
     if (eff_expert_cache_size == (size_t)-1) {
         eff_expert_cache_size = 0;
@@ -629,7 +631,7 @@ void llama_context::sched_reserve() {
             }
         }
     }
-    if (eff_expert_cache_size > 0) {
+    if (sched && eff_expert_cache_size > 0) {
         ggml_backend_sched_set_expert_cache(sched.get(), eff_expert_cache_size);
         ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
         ggml_backend_sched_set_expert_cache_max_swaps(sched.get(), cparams.expert_cache_max_swaps);
