@@ -1794,22 +1794,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 requested_experts.push_back((int32_t)e);
                                 pinned_keys.push_back({ input, (int32_t)e });
                                 if (expert_counts[e] > 0) {
-                                    ggml_backend_expert_cache_record_access_count(cache, input, (int32_t)e, expert_counts[e]);
+                                    // Scale frequency update proportionally so prefill and decode contribute evenly
+                                    const uint32_t inc = std::max<uint32_t>(1, (uint32_t)(expert_counts[e] / std::max<int64_t>(1, ids_tensor->ne[1])));
+                                    ggml_backend_expert_cache_record_access_count(cache, input, (int32_t)e, inc);
                                 }
                             }
                         }
 
                         struct ggml_tensor * slot_tensor = ggml_backend_expert_cache_get_slot_tensor(cache, input);
                         bool used_zero_copy = false;
-                        const bool is_single_token_decode = (ids_tensor->ne[1] == 1);
                         ggml_backend_expert_cache_record_probe_host(cache, ggml_time_us() - t_host_start);
 
 
                         // Process any pending JIT expert swaps for this tensor
                         ggml_backend_expert_cache_process_jit_swaps(cache, input, split_backend);
 
-                        // Vector 1 & 6: Zero-Copy Slot Pool execution during single-token decode
-                        if (is_single_token_decode && slot_tensor != NULL && requested_experts.size() <= (size_t)slot_tensor->ne[2]) {
+                        // Universal Zero-Copy Slot Pool execution: activates for ANY token batch size
+                        // as long as the total unique active experts fit within the available slot pool capacity
+                        if (slot_tensor != NULL && requested_experts.size() <= (size_t)slot_tensor->ne[2]) {
                             remapped_ids.assign(ids.size(), -1);
                             bool all_slots_ready = true;
                             bool all_hit = true;

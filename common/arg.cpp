@@ -2741,8 +2741,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
         {"-exc", "--expert-cache"}, "SIZE",
-        "size of VRAM cache for CPU-offloaded MoE experts (e.g. 1024M, 1.5G, 2048MB)",
+        "size of VRAM cache for CPU-offloaded MoE experts (e.g. 1024M, 1.5G, 'auto')",
         [](common_params & params, const std::string & value) {
+            if (value == "auto" || value == "AUTO") {
+                params.expert_cache_size = (size_t)-1;
+                return;
+            }
             size_t idx = 0;
             double val = std::stod(value, &idx);
             std::string unit = value.substr(idx);

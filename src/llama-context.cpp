@@ -610,9 +610,27 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    if (cparams.expert_cache_size > 0) {
-        ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
+    size_t eff_expert_cache_size = cparams.expert_cache_size;
+    if (eff_expert_cache_size == (size_t)-1) {
+        eff_expert_cache_size = 0;
+        for (size_t b = 0; b < backend_ptrs.size(); b++) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[b]);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                size_t free_mem = 0, total_mem = 0;
+                ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+                const size_t safety_margin = 256 * 1024 * 1024;
+                if (free_mem > safety_margin) {
+                    eff_expert_cache_size = free_mem - safety_margin;
+                    LLAMA_LOG_INFO("%s: expert-cache auto: configured %.2f MiB on %s (free: %.2f MiB)\n",
+                        __func__, (double)eff_expert_cache_size / (1024.0 * 1024.0),
+                        ggml_backend_dev_name(dev), (double)free_mem / (1024.0 * 1024.0));
+                }
+                break;
+            }
+        }
+    }
+    if (eff_expert_cache_size > 0) {
+        ggml_backend_sched_set_expert_cache(sched.get(), eff_expert_cache_size);
         ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
         ggml_backend_sched_set_expert_cache_max_swaps(sched.get(), cparams.expert_cache_max_swaps);
         for (int il = 0; il < (int)model.layers.size(); il++) {
@@ -674,8 +692,8 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                if (cparams.expert_cache_size > 0) {
-                    ggml_backend_sched_set_expert_cache(sched.get(), cparams.expert_cache_size);
+                if (eff_expert_cache_size > 0) {
+                    ggml_backend_sched_set_expert_cache(sched.get(), eff_expert_cache_size);
                     ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
                 }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
