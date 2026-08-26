@@ -1329,6 +1329,16 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        if (ctx_tgt) {
+            ggml_backend_sched_t sched = llama_context_get_sched(ctx_tgt);
+            if (sched) {
+                struct ggml_backend_expert_cache_stats ec_stats;
+                if (ggml_backend_sched_get_expert_cache_stats(sched, -1, &ec_stats)) {
+                    SRV_INF("%s", "expert cache: initialized and active on GPU scheduler\n");
+                }
+            }
+        }
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
