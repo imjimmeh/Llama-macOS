@@ -2803,6 +2803,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_EXPERT_CACHE_STATS"));
     add_opt(common_arg(
+        {"--expert-cache-prefetch"},
+        "enable decode-only carry-forward route prefetch (experimental)",
+        [](common_params & params) {
+            params.expert_cache_prefetch = true;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_PREFETCH"));
+    add_opt(common_arg(
         {"-excr", "--expert-cache-profile"}, "NAME",
         "name of expert cache profile for persistent hot-expert caching (e.g. 'coding', 'prose')",
         [](common_params & params, const std::string & value) {

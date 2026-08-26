@@ -142,36 +142,20 @@ The cache can still be useful to fit a model under VRAM pressure. These measurem
 - The 512 MiB server trial emitted EOS after one token. It is excluded from the table.
 - No CPU frequency, GPU clocks, or thermal telemetry was captured. The small differences between nearby rows must be treated as noise until alternating repeated trials capture a confidence interval.
 
-### Code Audit: Profile Seed Does Not Populate the Active Decode Cache
+### Code Audit: Profile Seed - Primary Bug Fixed (2026-08-26)
 
-The cache profile path needs a correctness repair before more throughput tuning:
+`ggml_backend_expert_cache_seed()` now calls `ggml_backend_expert_cache_alloc_slot_idx()` to seed the active decode slot pool. The primary bug is **fixed**.
 
-1. `ggml_backend_expert_cache_seed()` first calls the legacy flat-cache allocator (`ggml-backend-expert-cache.cpp:1405-1419`). It then creates a slot pool and calls `find_slot()` (`1421-1432`), but it never calls `ggml_backend_expert_cache_alloc_slot_idx()`. A newly created slot pool has no key, so `find_slot()` returns `-1` and the zero-copy slot tensor is not seeded.
-2. Single-token decode uses `ggml_backend_expert_cache_find_slot()` and the slot-pool tensor (`ggml-backend.cpp:1736-1819`), not the legacy flat-cache entry seeded above. Therefore a loaded persistent profile can report successful profile loading without making its entries resident in the active zero-copy decode path.
+### Remaining Issue: Profile Seeding Order
+
+`common_expert_cache_sort_entries()` sorts by `(tensor_name, expert_id, frequency)` ascending before merging duplicates. The seeding loop iterates in this order, so lower-frequency entries are seeded first. When capacity is limited, hot entries at the end of the sorted list may not be seeded.
+
+### Original Audit Points (Historical Record)
+
+1. `ggml_backend_expert_cache_seed()` first calls the legacy flat-cache allocator (`ggml-backend-expert-cache.cpp:1405-1419`). It then creates a slot pool and calls `find_slot()` (`1421-1432`), but it never called `ggml_backend_expert_cache_alloc_slot_idx()`. (FIXED)
+2. Single-token decode uses `ggml_backend_expert_cache_find_slot()` and the slot-pool tensor (`ggml-backend.cpp:1736-1819`), not the legacy flat-cache entry seeded above. (FIXED)
 3. Periodic rebalance edits only the legacy `entries` map and flat tensor (`ggml-backend-expert-cache.cpp:404-511`). It does not update slot-pool keys or slot contents. The two representations can diverge after a rebalance.
 4. `tests/test-expert-cache-profile.cpp:66-98` verifies legacy offset lookup and profile export but does not assert that a seeded expert is found through `ggml_backend_expert_cache_find_slot()`.
-
-The low 1.7-3.1% runtime hit rates in the server logs are consistent with a profile that did not seed the decode slot pools, but the cause must be confirmed by a focused regression test before changing production code.
-
-Required fix direction:
-
-- Seed the slot pool through `ggml_backend_expert_cache_alloc_slot_idx()` and upload directly to its slot tensor.
-- Establish one authoritative representation for zero-copy residency. Do not let periodic rebalance mutate legacy entries independently of slot pools.
-- Add a CPU regression test that seeds an expert, synchronizes, and asserts `find_slot()` succeeds before the first decode request. Add a CUDA test that compares seeded slot-pool data with the source expert.
-Additional audit findings:
-
-- `common_expert_cache_load_profile()` sorts seed entries by tensor address and expert ID (`common/expert-cache-profile.cpp:112-117`), not by stored frequency. When capacity is limited, the seed order does not prefer the hot entries that the profile records.
-- Decode records transition data on every zero-copy path (`ggml-backend.cpp:1821-1825`), but `ggml_backend_expert_cache_predict_next()` and bundle prefetch have no production callers. The current transition predictor adds host map updates without starting a prefetch transfer.
-- Bundle registration and `ggml_backend_expert_cache_is_bundle_resident()` are likewise only exercised by unit tests. No runtime admission or eviction policy enforces bundle atomicity.
-
-Further optimization order:
-
-1. Repair and test profile-to-slot-pool seeding, then seed highest-frequency complete bundles first.
-2. Remove or feature-gate the unconsumed transition tracking until a measured prefetch implementation exists.
-3. Add timing counters around selected-ID D2H synchronization, host-side cache decision/remapping, ID upload, and cache DMA. The scheduler currently synchronizes the ID backend before and after every new router-ID tensor (`ggml-backend.cpp:1674-1694`); this can only be optimized after its share of decode time is measured.
-4. If that timing proves the cache decision cost exceeds saved transfer time at low locality, bypass zero-copy lookup/remapping adaptively for the affected tensor or model. Do not attempt asynchronous router overlap before the timing and deterministic-token tests exist.
-
-
 ---
 
 ## Dynamic MTP Offload Correctness Fixes (2026-08-20)
@@ -526,3 +510,380 @@ expert_cache: saved 4096 hot experts to profile
 ### Conclusion
 
 The cache is working correctly (determinism verified, PP boosted 39%). TG performance is fundamentally limited by PCIe transfer speed on this 8 GiB GPU. The new rebalancing strategies are functional but do not change the performance picture for this hardware and workload.
+
+---
+
+## Scheduler Slot Coalescing and Compact Preset Alignment (2026-08-26)
+
+### Scope
+
+- Added a cache slot claim API that reports whether the caller owns a new fill.
+- Deduplicated expert IDs in explicit prefetch and scheduler zero-copy fills.
+- Added per-slot load completion events and wait-before-reuse cleanup.
+- Prevented rebalance and slot admission from evicting slots still in `LOADING`.
+- Counted empty slots populated by rebalance in `used_slots`.
+- Aggregated staging/probe counters in scheduler statistics and exposed them in llama-bench.
+- Removed the inactive CUDA device-map/partition implementation and its CUDA source files. The active path remains CPU ID remapping plus explicit remapped-ID upload.
+- Updated `scripts/expert-cache-determinism.py` to use the compact model and the shared preset values where supported.
+
+### Red-Green Verification
+
+The new duplicate-prefetch test initially failed before implementation:
+
+```text
+test requirement failed
+Command: cmake --build build --config Release --target test-expert-cache && build/bin/Release/test-expert-cache.exe
+Result: FAIL, duplicate IDs incremented speculative prefetch count once per occurrence
+```
+
+After the implementation, the focused test passed:
+
+```text
+Command: cmake --build build --config Release --target test-expert-cache
+        build/bin/Release/test-expert-cache.exe
+Result: PASS, all test-expert-cache tests passed successfully
+```
+
+The profile test also passed before the remap cleanup:
+
+```text
+Command: build/bin/Release/test-expert-cache-profile.exe
+Result: PASS, all test-expert-cache-profile tests passed successfully
+```
+
+### Compact Preset Determinism Runs
+
+Model:
+`C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf`
+
+The harness now uses the preset's 128K context, parallel 1, batch 4096,
+ubatch 2048, 14 threads, q8_0 K/V, Flash Attention, mlock, no-mmap,
+no-context-shift, unified KV, cram 1024, fit target 256 MiB, no-mmproj,
+max swaps 4, per-request rebalance, stats, and `coder` profile.
+
+The first control attempt failed because the requested result directory did not
+exist. The directory was created and the run was repeated successfully.
+
+```text
+Control: -exc 0 -excp 256
+sha256_tokens: 7e87a12fbd522e4c83c51e41ea1c526c41d8d8f1febf1e683e46cb95a3f4524e
+tok_s: 22.008
+wall_s: 12.0
+
+Enabled: -exc 128M -excp 256
+sha256_tokens: 8e1e8ee45a12e390bfb5beae237d98793e216b408ed43929130e6c1c0f0c93e6
+tok_s: 18.812
+wall_s: 14.1
+```
+
+The token hashes differ because the enabled run loaded the `coder` profile and
+changed model placement. This is not a valid cache correctness or throughput
+comparison. No speedup claim is made. Result records are:
+
+- `tools/results/expert-cache/phase2-compact-control.json`
+- `tools/results/expert-cache/phase2-compact-enabled.json`
+
+### Build Status
+
+The initial post-deletion build used a stale CUDA project manifest and failed
+because it still referenced the deleted `expert-cache-remap.cu`. CMake was
+reconfigured. A subsequent full CUDA rebuild was cancelled after the compiler
+stalled during the broad generated CUDA rebuild; the cleanup requires a fresh
+focused build before the deletion can be retained.
+
+### Decision
+
+Slot coalescing, event cleanup, telemetry aggregation, and compact preset
+alignment are retained pending the fresh post-cleanup build. The enabled
+determinism row is rejected as a comparison because profile seeding changed
+placement. The inactive CUDA map removal is not considered verified until the
+reconfigured CUDA target builds and the focused tests pass.
+
+### Post-Cleanup Verification and Prefetch Smoke Test (2026-08-26)
+
+The CUDA target was rebuilt after reconfiguring CMake with MSBuild parallelism:
+
+```text
+cmake --build build --config Release --target ggml-cuda -- /m:8
+Result: PASS
+cmake --build build --config Release --target test-expert-cache llama-bench llama-server -- /m:8
+Result: PASS
+```
+
+Both cache test binaries passed after the inactive device-map removal and the
+route-prefetch telemetry additions. The isolation test now covers per-tensor
+slot isolation; it no longer advertises a device-map implementation.
+
+The first compact cache-enabled control used the existing persisted profile and
+was rejected because profile loading changed placement and therefore changed
+the token hash. The determinism harness was corrected to use
+`--no-expert-cache-persist` and no implicit profile for controlled experiments.
+One transient fit retry failed with `vector too long` and then loaded at a
+degraded placement; the next fresh run loaded normally and is the valid result.
+
+Valid same-placement cache-mode comparison:
+
+```text
+Model: C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf
+Preset: 128K context, parallel 1, batch 4096, ubatch 2048, 14 threads,
+        q8_0 K/V, Flash Attention, mlock, no-mmap, no-context-shift,
+        unified KV, cram 1024, fit target 256 MiB, no-mmproj
+Cache: 128M, period 256, no profile, persistence disabled
+
+Without carry-forward:
+sha256_tokens: 8e1e8ee45a12e390bfb5beae237d98793e216b408ed43929130e6c1c0f0c93e6
+tok_s: 22.611
+wall_s: 11.7
+
+With --expert-cache-prefetch:
+sha256_tokens: 8e1e8ee45a12e390bfb5beae237d98793e216b408ed43929130e6c1c0f0c93e6
+tok_s: 22.371
+wall_s: 11.8
+expert cache: no requests (0 MUL_MAT_ID inputs, 0 eligible ops,
+              0 capacity bypasses, 0 CPU backend bypasses, 0 non-host bypasses)
+```
+
+The hashes match. Compact TG still has zero eligible cache operations, so the
+carry-forward option observed no routes and submitted no prefetch. This is a
+correctness-preserving no-op on the current compact graph, not a throughput
+claim.
+
+The corrected harness now disables persistence for controlled cache
+experiments. The preset's `coder` profile remains available to deployment
+configuration but is intentionally excluded from this controlled comparison.
+
+---
+
+## Compact Five-Pair Benchmark After Cache Lifecycle and Prefetch Changes (2026-08-26)
+
+### Reproducibility
+
+- Model SHA-256: `a2f6c7fdbe82113a2e48e2c38022b55bdcc4308a8002da96cf6d48dab67bb77d`
+- Model: `C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf`
+- Hardware: AMD Ryzen 7 5700X, NVIDIA GeForce GTX 1080, CUDA backend
+- Binary: `build/bin/Release/llama-bench.exe`, build `4b62e78d4`, build number `10483`
+- Settings: 128K context, parallel 1, batch 4096, ubatch 2048, 14 threads,
+  q8_0 K/V, Flash Attention, mlock, fit target 256 MiB, no-mmap,
+  no-context-shift, unified KV, `-excp 256`
+- Each row used one fresh process and one repetition.
+- Cache rows used `-exc 128`; cache-off rows used `-exc 0`.
+
+### Five Alternating Fresh-Process Pairs
+
+| Pair | Cache-off PP512 | Cache-on PP512 | Cache-off TG128 | Cache-on TG128 |
+|---:|---:|---:|---:|---:|
+| 1 | 354.838 | 464.061 | 22.399 | 24.463 |
+| 2 | 354.433 | 469.317 | 24.302 | 14.886 |
+| 3 | 354.900 | 461.876 | 23.902 | 21.535 |
+| 4 | 353.107 | 454.855 | 13.403 | 21.401 |
+| 5 | 350.597 | 455.284 | 19.245 | 19.909 |
+| Mean | 353.575 | 461.079 | 20.650 | 20.439 |
+| Stddev | 1.815 | 6.118 | 4.513 | 3.515 |
+| Median | 354.433 | 461.876 | 22.399 | 21.401 |
+
+Raw JSONL records:
+
+- Cache-off: `tools/results/expert-cache/phase-final-compact-off-{1..5}.jsonl`
+- Cache-on: `tools/results/expert-cache/phase-final-compact-on-{1..5}.jsonl`
+
+The PP cache rows completed 85 eligible operations, 11,092 requests, and
+11,092 misses per fresh process, with 5,398,790,144 bytes transferred from RAM
+to GPU. TG reported zero eligible operations and zero requests for every row.
+The cache is therefore active for PP but absent from normal Compact TG.
+
+The PP mean increased from 353.575 to 461.079 tok/s in this five-pair sample.
+The TG means are statistically dominated by run variance and do not show a
+cache benefit: 20.650 versus 20.439 tok/s. This is not a claim that the cache
+accelerates Compact decode.
+
+### Carry-Forward Determinism Matrix
+
+Cache-only and `--expert-cache-prefetch` each ran five fresh server processes
+using the compact preset, `-exc 128M`, period 256, persistence disabled, and a
+fixed greedy completion. All ten records emitted the same token hash:
+
+`8e1e8ee45a12e390bfb5beae237d98793e216b408ed43929130e6c1c0f0c93e6`
+
+| Mode | Raw tok/s | Mean | Stddev | Median |
+|---|---|---:|---:|---:|
+| Cache-only | 22.611, 16.049, 18.293, 18.197, 16.872 | 18.404 | 2.532 | 18.197 |
+| Carry-forward | 22.371, 14.710, 16.263, 15.359, 18.554 | 17.451 | 3.111 | 16.263 |
+
+Control records:
+
+- `tools/results/expert-cache/phase4-compact-control-clean2.json`
+- `tools/results/expert-cache/phase4-compact-control-2.json`
+- `tools/results/expert-cache/phase4-compact-control-3.json`
+- `tools/results/expert-cache/phase4-compact-control-4.json`
+- `tools/results/expert-cache/phase4-compact-control-5.json`
+
+Carry-forward records:
+
+- `tools/results/expert-cache/phase4-compact-prefetch.json`
+- `tools/results/expert-cache/phase4-compact-prefetch-2.json`
+- `tools/results/expert-cache/phase4-compact-prefetch-3.json`
+- `tools/results/expert-cache/phase4-compact-prefetch-4.json`
+- `tools/results/expert-cache/phase4-compact-prefetch-5.json`
+
+Every carry-forward server log reported zero cache requests, zero
+`MUL_MAT_ID` inputs, and zero eligible operations for TG. The option is
+correctness-preserving but a no-op for the current Compact decode graph. The
+mean difference is not actionable because no route was submitted and TG
+variance is high.
+
+### Decision
+
+Retain the lifecycle, deduplication, telemetry, inactive-map cleanup, compact
+preset alignment, and opt-in carry-forward plumbing. Do not add deadline-aware
+admission or canonical tensor lineage yet: the focused Compact workload does
+not expose a usable TG route or reproduce an alias mismatch. The next
+performance experiment must first expose route information before normal
+Compact decode reaches `compute_splits()` without forcing host MoE operations
+onto CUDA.
+
+### Final Verification (2026-08-26)
+
+```text
+cmake --build build --config Release --target test-expert-cache test-expert-cache-profile llama-bench llama-server -- /m:8
+Result: PASS
+
+build/bin/Release/test-expert-cache.exe
+Result: PASS, all test-expert-cache tests passed successfully
+
+build/bin/Release/test-expert-cache-profile.exe
+Result: PASS, all test-expert-cache-profile tests passed successfully
+
+python -m py_compile scripts/expert-cache-determinism.py
+Result: PASS
+
+git diff --check
+Result: PASS
+```
+
+### Final Preset-Alignment Prefetch Smoke (2026-08-26)
+
+The determinism harness was rebuilt and rerun after restoring the compact
+preset's `--expert-cache-max-swaps 4` flag. It also uses
+`--no-expert-cache-persist` so prior profile files cannot change placement.
+
+```text
+Command:
+python scripts/expert-cache-determinism.py --exc 128M \
+    --extra-args=--expert-cache-prefetch \
+    --json-out tools/results/expert-cache/phase4-compact-prefetch-final.json
+Result: PASS
+sha256_tokens: 8e1e8ee45a12e390bfb5beae237d98793e216b408ed43929130e6c1c0f0c93e6
+tok_s: 10.146
+wall_s: 25.8
+expert cache: no requests (0 MUL_MAT_ID inputs, 0 eligible ops,
+              0 capacity bypasses, 0 CPU backend bypasses, 0 non-host bypasses)
+```
+
+The hash matches the previous cache-only matrix. The unusually low TG rate is
+not attributed to carry-forward because the Compact graph submitted zero route
+snapshots and zero prefetches. The result is logged as a correctness pass and
+performance no-op.
+
+### Verification After Final Source State (2026-08-26)
+
+The final source state was rebuilt and checked after the last telemetry and
+test edits:
+
+```text
+cmake --build build --config Release --target test-expert-cache test-expert-cache-profile llama-bench llama-server -- /m:8
+Result: PASS
+build/bin/Release/test-expert-cache.exe
+Result: PASS
+build/bin/Release/test-expert-cache-profile.exe
+Result: PASS
+python -m py_compile scripts/expert-cache-determinism.py
+Result: PASS
+git diff --check
+Result: PASS
+```
+
+### Final Route Snapshot Helper Cleanup Verification (2026-08-26)
+
+The final scheduler cleanup removed an unused tensor pointer from the
+carry-forward snapshot key and restored scratch-counter clearing:
+
+```text
+cmake --build build --config Release --target test-expert-cache llama-bench llama-server -- /m:8
+Result: PASS
+build/bin/Release/test-expert-cache.exe
+Result: PASS
+build/bin/Release/test-expert-cache-profile.exe
+Result: PASS
+python -m py_compile scripts/expert-cache-determinism.py
+Result: PASS
+git diff --check
+Result: PASS
+```
+
+### Final Decode-Only Guard Verification (2026-08-26)
+
+The carry-forward capture condition is restricted to single-token route IDs,
+avoiding speculative capture during small prompt batches. The unused
+GPU-resolution telemetry API was removed with the inactive device-map path.
+
+```text
+cmake --build build --config Release --target test-expert-cache test-expert-cache-profile llama-bench llama-server -- /m:8
+Result: PASS
+build/bin/Release/test-expert-cache.exe
+Result: PASS
+build/bin/Release/test-expert-cache-profile.exe
+Result: PASS
+python -m py_compile scripts/expert-cache-determinism.py
+Result: PASS
+git diff --check
+Result: PASS
+```
+
+### Excluded Invocation (2026-08-26)
+
+One manual `llama-bench` invocation used a truncated model path and failed
+before model load. It produced no measurement and is excluded from all
+summaries:
+
+```text
+llama_bench: error: failed to load model
+C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-Compact.gguf
+```
+
+### Current-Source Compact Prefetch Smoke (2026-08-26)
+
+After the final source cleanup, the exact preset-aligned opt-in command still
+produced a deterministic output:
+
+```text
+python scripts/expert-cache-determinism.py --exc 128M \
+    --extra-args=--expert-cache-prefetch \
+    --json-out tools/results/expert-cache/phase-final-compact-prefetch-current.json
+Result: PASS
+sha256_tokens: 8e1e8ee45a12e390bfb5beae237d98793e216b408ed43929130e6c1c0f0c93e6
+tok_s: 18.398
+wall_s: 14.3
+expert cache: no requests (0 MUL_MAT_ID inputs, 0 eligible ops,
+              0 capacity bypasses, 0 CPU backend bypasses, 0 non-host bypasses)
+```
+
+The current Compact TG graph still exposes no cache-eligible operation, so
+this remains a correctness pass and performance no-op.
+
+### Final Slot-Wait Helper Cleanup (2026-08-26)
+
+The slot wait helper was simplified to accept only the slot it synchronizes.
+This changed no behavior; the final build and tests remained green:
+
+```text
+cmake --build build --config Release --target test-expert-cache test-expert-cache-profile llama-bench llama-server -- /m:8
+Result: PASS
+build/bin/Release/test-expert-cache.exe
+Result: PASS
+build/bin/Release/test-expert-cache-profile.exe
+Result: PASS
+python -m py_compile scripts/expert-cache-determinism.py
+Result: PASS
+git diff --check
+Result: PASS
+```

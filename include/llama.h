@@ -417,6 +417,7 @@ extern "C" {
         int32_t expert_cache_max_swaps; // max experts to swap per rebalance (-1 = unlimited, default: -1)
         bool   expert_cache_stats;  // print expert cache performance stats on exit
         size_t expert_cache_auto_reserve; // VRAM margin to preserve when auto-sizing expert cache (bytes, SIZE_MAX = use default 512 MiB)
+        bool   expert_cache_prefetch; // enable decode carry-forward route prefetch
     };
 
     struct llama_model_tensor_override {

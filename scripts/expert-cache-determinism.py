@@ -2,9 +2,9 @@
 
 # Deterministic single-request token-hash check for the expert cache.
 #
-# Starts llama-server with a fixed set of preset performance args (from
-# G:/qwen3.6-35b-a3b-presets-exc.ini, [*] block + [qwen3.6-35B-mtp] section,
-# which targets the MTP-Quality model), streams the server log live so the
+# Starts llama-server with the shared [*] and
+# [qwen3.6-35B-apex-compact] settings from
+# G:/qwen3.6-35b-a3b-presets-exc.ini, streams the server log live so the
 # slow model load is visible, waits for HTTP readiness, then issues ONE
 # /completion request with deterministic sampling (temperature 0, top_k 1,
 # fixed seed, ignore_eos, fixed token count) and records SHA-256 hashes of
@@ -22,14 +22,10 @@
 # --exc / --excp / --extra-args arguments on the command line.
 #
 # Usage (single run):
-#   python scripts/expert-cache-determinism.py --exc 0
-#   python scripts/expert-cache-determinism.py --exc 64M --excp 64
-#   python scripts/expert-cache-determinism.py --exc 64M --excp 64 \
-#       --extra-args "--mtp-dynamic-offload --spec-draft-n-max 2"
+#   python scripts/expert-cache-determinism.py --exc 128M --excp 256
 #
 # Row A: --exc 0
-# Row B: --exc 64M --excp 64            (must hash-identical to A)
-# Row E: --exc 64M --excp 64 --extra-args "--spec-type draft-mtp --spec-draft-n-max 2 --mtp-dynamic-offload"
+# Row B: --exc 128M --excp 256        (compare hashes only with fixed placement)
 
 import argparse
 import hashlib
@@ -45,16 +41,13 @@ import urllib.request
 import urllib.error
 from typing import Dict, List
 
-MODEL_PATH = "G:/ai/models/Qwen3.6-35B-A3B-APEX-MTP-Quality.gguf"
+MODEL_PATH = "C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf"
 SERVER_EXE = "build/bin/Release/llama-server.exe"
 DEFAULT_PORT = 8099
 
-# Performance args from the preset file (G:/qwen3.6-35b-a3b-presets-exc.ini).
-# [*] block plus [qwen3.6-35B-mtp]. ctx 128000 is part of the MTP preset.
-# Sampling defaults are NOT here: the deterministic sampler flags are applied
-# in the /completion payload instead.
 PRESET_BASE_ARGS = [
     "--jinja",
+    "--chat-template-file", "G:/llama.cpp/build/bin/Release/qwen.jinja",
     "-t", "14",
     "-b", "4096",
     "-ub", "2048",
@@ -64,10 +57,16 @@ PRESET_BASE_ARGS = [
     "--mlock",
     "--no-mmap",
     "--no-context-shift",
+    "--kv-unified",
     "-cram", "1024",
     "--fit", "on",
     "--fit-target", "256",
     "--parallel", "1",
+    "--no-mmproj",
+    "--expert-cache-max-swaps", "4",
+    "--expert-cache-rebalance-per-request",
+    "--expert-cache-stats",
+    "--no-expert-cache-persist",
 ]
 
 DEFAULT_PROMPT = (
@@ -175,11 +174,11 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help="server port (default: %(default)s)")
     parser.add_argument("--exc", default="",
-                        help="expert cache size, e.g. 0 or 64M (empty = default)")
-    parser.add_argument("--excp", type=int, default=0,
-                        help="expert cache period, e.g. 64 (0 = on-demand)")
+                        help="expert cache size, e.g. 0 or 128M (empty = default)")
+    parser.add_argument("--excp", type=int, default=256,
+                        help="expert cache period (default: 256)")
     parser.add_argument("--extra-args", default="",
-                        help="extra llama-server args, e.g. MTP draft flags")
+                        help="extra llama-server args for the selected compact-model run")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT,
                         help="fixed prompt (default: built-in 5-sentence prompt)")
     parser.add_argument("--n-predict", type=int, default=DEFAULT_N_PREDICT,

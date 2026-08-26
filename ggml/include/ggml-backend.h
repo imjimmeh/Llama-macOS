@@ -384,13 +384,18 @@ extern "C" {
         uint64_t n_gpu_id_resolutions;
         size_t   staging_memcpy_bytes;
         size_t   direct_pinned_dma_bytes;
-        uint64_t n_map_updates;
-        size_t   map_update_bytes;
         uint64_t dma_ns;
         uint64_t dma_wait_ns;
         // V2.3 Pinned staging: number of times a staging ring entry had to wait
         // for a still-in-flight DMA before being reused
         uint64_t n_staging_waits;
+
+        // Decode carry-forward route prefetch telemetry
+        uint64_t n_route_prefetch_snapshots;
+        uint64_t n_route_prefetch_submitted;
+        uint64_t n_route_prefetch_duplicates;
+        uint64_t n_route_prefetch_stale;
+        uint64_t n_route_prefetch_rejected;
 
         // V2.3 Probe: per-layer host-time breakdown when a cache intercepts a split
         uint64_t probe_n_layers;
@@ -400,6 +405,7 @@ extern "C" {
 
     };
 
+    GGML_API void                 ggml_backend_sched_set_expert_cache_prefetch(ggml_backend_sched_t sched, bool enabled);
     GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size);
     GGML_API void                 ggml_backend_sched_set_expert_cache_period(ggml_backend_sched_t sched, int32_t period);
     GGML_API void                 ggml_backend_sched_set_expert_cache_max_swaps(ggml_backend_sched_t sched, int32_t max_swaps);

@@ -145,6 +145,7 @@ llama_context::llama_context(
     cparams.expert_cache_max_swaps = params.expert_cache_max_swaps;
     cparams.expert_cache_stats  = params.expert_cache_stats;
     cparams.expert_cache_auto_reserve = params.expert_cache_auto_reserve;
+    cparams.expert_cache_prefetch = params.expert_cache_prefetch;
 
     cparams.ctx_other = nullptr;
 
@@ -646,6 +647,7 @@ void llama_context::sched_reserve() {
         ggml_backend_sched_set_expert_cache(sched.get(), size);
         ggml_backend_sched_set_expert_cache_period(sched.get(), cparams.expert_cache_period);
         ggml_backend_sched_set_expert_cache_max_swaps(sched.get(), cparams.expert_cache_max_swaps);
+        ggml_backend_sched_set_expert_cache_prefetch(sched.get(), cparams.expert_cache_prefetch);
         register_expert_cache_metadata();
     };
 
@@ -3642,6 +3644,7 @@ llama_context_params llama_context_default_params() {
         /*.expert_cache_max_swaps      =*/ -1,
         /*.expert_cache_stats          =*/ false,
         /*.expert_cache_auto_reserve   =*/ (size_t)-1,
+        /*.expert_cache_prefetch       =*/ false,
     };
 
     return result;

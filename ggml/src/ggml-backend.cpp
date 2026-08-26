@@ -773,6 +773,13 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_route_snapshot {
+    int backend_id = -1;
+    int32_t layer = -1;
+    uint64_t step = 0;
+    std::vector<int32_t> expert_ids;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -833,11 +840,16 @@ struct ggml_backend_sched {
     int32_t expert_cache_period;
     int32_t expert_cache_max_swaps;
     ggml_backend_expert_cache_t expert_caches[GGML_SCHED_MAX_BACKENDS];
+    bool expert_cache_prefetch = false;
+    uint64_t expert_cache_route_step = 0;
+    std::vector<ggml_backend_sched_route_snapshot> expert_cache_route_snapshots;
     std::vector<int32_t> expert_ids_scratch;
     std::vector<ggml_bitset_t> expert_bitset_scratch;
     std::vector<ggml_bitset_t> expert_miss_bitset_scratch;
     std::vector<uint32_t> expert_counts_scratch;
     std::vector<int32_t> requested_experts_scratch;
+    std::vector<int32_t> expert_slots_scratch;
+    std::vector<uint8_t> expert_load_scratch;
     std::vector<ggml_expert_cache_key> pinned_keys_scratch;
     std::vector<int32_t> remapped_ids_scratch;
 
@@ -1631,9 +1643,86 @@ struct ggml_tensor * ggml_backend_find_mul_mat_id_node(
     return NULL;
 }
 
+static void ggml_backend_sched_record_route_snapshot(
+        ggml_backend_sched_t sched,
+        int backend_id,
+        int32_t layer,
+        const std::vector<int32_t> & expert_ids,
+        uint64_t step) {
+    if (!sched->expert_cache_prefetch || backend_id < 0 ||
+        backend_id >= sched->n_backends || layer < 0 || expert_ids.empty()) {
+        return;
+    }
+
+    for (auto & snapshot : sched->expert_cache_route_snapshots) {
+        if (snapshot.backend_id == backend_id && snapshot.layer == layer) {
+            for (const int32_t expert_id : expert_ids) {
+                if (std::find(snapshot.expert_ids.begin(), snapshot.expert_ids.end(), expert_id) ==
+                    snapshot.expert_ids.end()) {
+                    snapshot.expert_ids.push_back(expert_id);
+                }
+            }
+            if (sched->expert_caches[backend_id] != nullptr) {
+                ggml_backend_expert_cache_record_route_prefetch_duplicate(
+                    sched->expert_caches[backend_id]);
+            }
+            return;
+        }
+    }
+
+    ggml_backend_sched_route_snapshot snapshot;
+    snapshot.backend_id = backend_id;
+    snapshot.layer = layer;
+    snapshot.step = step;
+    snapshot.expert_ids = expert_ids;
+    sched->expert_cache_route_snapshots.push_back(std::move(snapshot));
+    if (sched->expert_caches[backend_id] != nullptr) {
+        ggml_backend_expert_cache_record_route_snapshot(sched->expert_caches[backend_id]);
+    }
+}
+
+static void ggml_backend_sched_prefetch_carry_forward(
+        ggml_backend_sched_t sched,
+        uint64_t step) {
+    if (!sched->expert_cache_prefetch || sched->expert_cache_route_snapshots.empty()) {
+        return;
+    }
+
+    bool submitted = false;
+    for (const auto & snapshot : sched->expert_cache_route_snapshots) {
+        ggml_backend_expert_cache_t cache =
+            (snapshot.backend_id >= 0 && snapshot.backend_id < sched->n_backends) ?
+            sched->expert_caches[snapshot.backend_id] : nullptr;
+
+        if (snapshot.step + 1 != step) {
+            if (cache != nullptr) {
+                ggml_backend_expert_cache_record_route_prefetch_stale(cache);
+            }
+            continue;
+        }
+        if (submitted || cache == nullptr || snapshot.layer < 0 || snapshot.expert_ids.empty()) {
+            if (cache != nullptr) {
+                ggml_backend_expert_cache_record_route_prefetch_rejected(cache);
+            }
+            continue;
+        }
+
+        ggml_backend_expert_cache_prefetch_layer(
+            cache,
+            snapshot.layer,
+            snapshot.expert_ids.data(),
+            (int32_t)snapshot.expert_ids.size());
+        ggml_backend_expert_cache_record_route_prefetch_submitted(cache);
+        submitted = true;
+    }
+    sched->expert_cache_route_snapshots.clear();
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    const uint64_t route_step = ++sched->expert_cache_route_step;
+    ggml_backend_sched_prefetch_carry_forward(sched, route_step);
 
     for (int b = 0; b < sched->n_backends; b++) {
         if (sched->expert_caches[b]) {
@@ -1647,6 +1736,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     auto & miss_bitset      = sched->expert_miss_bitset_scratch;
     auto & expert_counts     = sched->expert_counts_scratch;
     auto & requested_experts = sched->requested_experts_scratch;
+    auto & expert_slots      = sched->expert_slots_scratch;
+    auto & expert_load       = sched->expert_load_scratch;
     auto & pinned_keys       = sched->pinned_keys_scratch;
     auto & remapped_ids      = sched->remapped_ids_scratch;
 
@@ -1655,6 +1746,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     miss_bitset.clear();
     expert_counts.clear();
     requested_experts.clear();
+    expert_slots.clear();
+    expert_load.clear();
     pinned_keys.clear();
     remapped_ids.clear();
 
@@ -1866,6 +1959,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
+                        if (ids_tensor->ne[1] == 1) {
+                            ggml_backend_sched_record_route_snapshot(
+                                sched,
+                                split_backend_id,
+                                ggml_backend_expert_cache_get_tensor_layer(input),
+                                requested_experts,
+                                route_step);
+                        }
+
                         struct ggml_tensor * slot_tensor = ggml_backend_expert_cache_get_slot_tensor(cache, input);
                         bool used_zero_copy = false;
                         ggml_backend_expert_cache_record_probe_host(cache, ggml_time_us() - t_host_start);
@@ -1878,72 +1980,75 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // as long as the total unique active experts fit within the available slot pool capacity
                         if (slot_tensor != NULL && requested_experts.size() <= (size_t)slot_tensor->ne[2]) {
                             remapped_ids.assign(ids.size(), -1);
+                            expert_slots.assign((size_t)n_expert, -1);
+                            expert_load.assign((size_t)n_expert, 0);
                             bool all_slots_ready = true;
                             bool all_hit = true;
 
-                            for (size_t i = 0; i < ids.size(); i++) {
-                                int32_t exp_id = ids[i];
-                                if (exp_id < 0 || exp_id >= n_expert) {
-                                    remapped_ids[i] = -1;
+                            for (const int32_t exp_id : requested_experts) {
+                                int32_t slot = ggml_backend_expert_cache_find_slot(cache, input, exp_id);
+                                if (slot >= 0) {
+                                    expert_slots[exp_id] = slot;
                                     continue;
                                 }
 
-                                int32_t slot = ggml_backend_expert_cache_find_slot(cache, input, exp_id);
-                                if (slot >= 0) {
-                                    remapped_ids[i] = slot;
-                                    ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
-                                } else {
+                                bool needs_load = false;
+                                slot = ggml_backend_expert_cache_claim_slot_idx(
+                                    cache, input, exp_id, pinned_keys.data(), pinned_keys.size(), &needs_load);
+                                if (slot < 0) {
+                                    all_slots_ready = false;
                                     all_hit = false;
-                                    slot = ggml_backend_expert_cache_alloc_slot_idx(
-                                        cache, input, exp_id, pinned_keys.data(), pinned_keys.size());
-                                    if (slot >= 0) {
-                                        remapped_ids[i] = slot;
-                                        ggml_backend_expert_cache_record_miss(cache, expert_size);
+                                    continue;
+                                }
 
-                                        const size_t expert_offset = (size_t)exp_id * expert_size;
-                                        const size_t dst_offset = (size_t)slot * expert_size;
+                                expert_slots[exp_id] = slot;
+                                all_hit = false;
+                                if (!needs_load) {
+                                    all_slots_ready = false;
+                                    ggml_backend_expert_cache_record_miss(cache, expert_size);
+                                    continue;
+                                }
 
-                                        // V2.2: Bounded Direct Registered Host DMA or Isolated Pinned DMA Staging
-                                        const void * src_ptr = (const uint8_t *)input->data + expert_offset;
-                                        if (ggml_backend_expert_cache_is_host_memory_registered(cache, src_ptr, expert_size)) {
-                                            const int64_t t_upload_start = ggml_time_us();
+                                expert_load[exp_id] = 1;
+                                ggml_backend_expert_cache_record_miss(cache, expert_size);
 
-                                            ggml_backend_tensor_set_async(split_backend,
-                                                slot_tensor,
-                                                src_ptr,
-                                                dst_offset,
-                                                expert_size);
-                                            ggml_backend_expert_cache_record_direct_dma(cache, expert_size);
-                                            ggml_backend_expert_cache_record_probe_upload(cache, ggml_time_us() - t_upload_start);
+                                const size_t expert_offset = (size_t)exp_id * expert_size;
+                                const size_t dst_offset = (size_t)slot * expert_size;
+                                const void * src_ptr = (const uint8_t *)input->data + expert_offset;
+                                if (ggml_backend_expert_cache_is_host_memory_registered(cache, src_ptr, expert_size)) {
+                                    const int64_t t_upload_start = ggml_time_us();
 
-                                        } else {
-                                            const int64_t t_upload_start = ggml_time_us();
-
-                                            void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, input, slot, expert_size);
-
-                                            if (pinned_buf != NULL) {
-                                                memcpy(pinned_buf, src_ptr, expert_size);
-                                                ggml_backend_expert_cache_record_staging_memcpy(cache, expert_size);
-                                                ggml_backend_tensor_set_async(split_backend,
-                                                    slot_tensor,
-                                                    pinned_buf,
-                                                    dst_offset,
-                                                    expert_size);
-                                                ggml_backend_expert_cache_stage_commit(cache, input, slot);
-
-                                            } else {
-                                                ggml_backend_tensor_set_async(split_backend,
-                                                    slot_tensor,
-                                                    src_ptr,
-                                                    dst_offset,
-                                                    expert_size);
-                                            }
-                                            ggml_backend_expert_cache_record_probe_upload(cache, ggml_time_us() - t_upload_start);
-
-                                        }
+                                    ggml_backend_tensor_set_async(split_backend,
+                                        slot_tensor, src_ptr, dst_offset, expert_size);
+                                    ggml_backend_expert_cache_record_direct_dma(cache, expert_size);
+                                    ggml_backend_expert_cache_record_probe_upload(cache, ggml_time_us() - t_upload_start);
+                                } else {
+                                    const int64_t t_upload_start = ggml_time_us();
+                                    void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, input, slot, expert_size);
+                                    if (pinned_buf != NULL) {
+                                        memcpy(pinned_buf, src_ptr, expert_size);
+                                        ggml_backend_expert_cache_record_staging_memcpy(cache, expert_size);
+                                        ggml_backend_tensor_set_async(split_backend,
+                                            slot_tensor, pinned_buf, dst_offset, expert_size);
+                                        ggml_backend_expert_cache_stage_commit(cache, input, slot);
                                     } else {
+                                        ggml_backend_tensor_set_async(
+                                            split_backend, slot_tensor, src_ptr, dst_offset, expert_size);
+                                    }
+                                    ggml_backend_expert_cache_record_probe_upload(cache, ggml_time_us() - t_upload_start);
+                                }
+                                ggml_backend_expert_cache_promote_slot(cache, input, exp_id, slot);
+                            }
+
+                            for (size_t i = 0; i < ids.size(); i++) {
+                                const int32_t exp_id = ids[i];
+                                if (exp_id >= 0 && exp_id < n_expert) {
+                                    remapped_ids[i] = expert_slots[exp_id];
+                                    if (remapped_ids[i] < 0) {
                                         all_slots_ready = false;
-                                        break;
+                                    } else if (expert_load[exp_id] == 0) {
+                                        ggml_backend_expert_cache_record_zero_copy_hit(
+                                            cache, input, exp_id, expert_size);
                                     }
                                 }
                             }
@@ -1953,15 +2058,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     ggml_backend_expert_cache_record_all_hit_resolution(cache);
                                 } else {
                                     ggml_backend_expert_cache_record_cpu_id_remap(cache);
-                                }
-
-                                // Promote newly loaded slots to resident state
-                                for (size_t i = 0; i < ids.size(); i++) {
-                                    int32_t exp_id = ids[i];
-                                    int32_t slot = remapped_ids[i];
-                                    if (exp_id >= 0 && slot >= 0) {
-                                        ggml_backend_expert_cache_promote_slot(cache, input, exp_id, slot);
-                                    }
                                 }
 
                                 auto & rib = sched->remapped_ids_buf[split_backend_id];
@@ -2331,6 +2427,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
         memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        sched->expert_cache_route_snapshots.clear();
         sched->is_reset = true;
     }
     sched->is_alloc = false;
@@ -2426,8 +2523,21 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     sched->callback_eval_user_data = user_data;
 }
 
+void ggml_backend_sched_set_expert_cache_prefetch(
+        ggml_backend_sched_t sched,
+        bool enabled) {
+    if (sched == NULL) {
+        return;
+    }
+    sched->expert_cache_prefetch = enabled;
+    if (!enabled) {
+        sched->expert_cache_route_snapshots.clear();
+    }
+}
+
 void ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size) {
     GGML_ASSERT(sched);
+    sched->expert_cache_route_snapshots.clear();
     sched->expert_cache_size = size;
     for (int b = 0; b < sched->n_backends; b++) {
         if (sched->expert_caches[b]) {
@@ -2514,11 +2624,19 @@ bool ggml_backend_sched_get_expert_cache_stats(
             out_stats->n_gpu_id_resolutions += s.n_gpu_id_resolutions;
             out_stats->staging_memcpy_bytes += s.staging_memcpy_bytes;
             out_stats->direct_pinned_dma_bytes += s.direct_pinned_dma_bytes;
-            out_stats->n_map_updates += s.n_map_updates;
-            out_stats->map_update_bytes += s.map_update_bytes;
             out_stats->dma_ns += s.dma_ns;
             out_stats->dma_wait_ns += s.dma_wait_ns;
             found = true;
+            out_stats->n_staging_waits += s.n_staging_waits;
+            out_stats->probe_n_layers += s.probe_n_layers;
+            out_stats->probe_sync_us += s.probe_sync_us;
+            out_stats->probe_host_us += s.probe_host_us;
+            out_stats->probe_upload_us += s.probe_upload_us;
+            out_stats->n_route_prefetch_snapshots += s.n_route_prefetch_snapshots;
+            out_stats->n_route_prefetch_submitted += s.n_route_prefetch_submitted;
+            out_stats->n_route_prefetch_duplicates += s.n_route_prefetch_duplicates;
+            out_stats->n_route_prefetch_stale += s.n_route_prefetch_stale;
+            out_stats->n_route_prefetch_rejected += s.n_route_prefetch_rejected;
         }
     }
     return found;
@@ -2635,11 +2753,10 @@ void ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched) {
     }
     for (int b = 0; b < sched->n_backends; b++) {
         if (sched->expert_caches[b]) {
-            ggml_backend_synchronize(sched->backends[b]);
+            ggml_backend_expert_cache_sync(sched->expert_caches[b]);
         }
     }
 }
-
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);

@@ -1554,10 +1554,18 @@ static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_ba
     EXPERT_CACHE_SUBTRACT(n_gpu_id_resolutions);
     EXPERT_CACHE_SUBTRACT(staging_memcpy_bytes);
     EXPERT_CACHE_SUBTRACT(direct_pinned_dma_bytes);
-    EXPERT_CACHE_SUBTRACT(n_map_updates);
-    EXPERT_CACHE_SUBTRACT(map_update_bytes);
     EXPERT_CACHE_SUBTRACT(dma_ns);
     EXPERT_CACHE_SUBTRACT(dma_wait_ns);
+    EXPERT_CACHE_SUBTRACT(n_staging_waits);
+    EXPERT_CACHE_SUBTRACT(probe_n_layers);
+    EXPERT_CACHE_SUBTRACT(probe_sync_us);
+    EXPERT_CACHE_SUBTRACT(probe_host_us);
+    EXPERT_CACHE_SUBTRACT(probe_upload_us);
+    EXPERT_CACHE_SUBTRACT(n_route_prefetch_snapshots);
+    EXPERT_CACHE_SUBTRACT(n_route_prefetch_submitted);
+    EXPERT_CACHE_SUBTRACT(n_route_prefetch_duplicates);
+    EXPERT_CACHE_SUBTRACT(n_route_prefetch_stale);
+    EXPERT_CACHE_SUBTRACT(n_route_prefetch_rejected);
 #undef EXPERT_CACHE_SUBTRACT
     return delta;
 }
@@ -1724,11 +1732,18 @@ struct test {
             "expert_cache_gpu_id_resolutions",
             "expert_cache_staging_memcpy_bytes",
             "expert_cache_direct_pinned_dma_bytes",
-            "expert_cache_map_updates",
-            "expert_cache_map_update_bytes",
             "expert_cache_dma_ns",
-            "expert_cache_dma_wait_ns"
-
+            "expert_cache_dma_wait_ns",
+            "expert_cache_staging_waits",
+            "expert_cache_probe_layers",
+            "expert_cache_probe_sync_us",
+            "expert_cache_probe_host_us",
+            "expert_cache_probe_upload_us",
+            "expert_cache_route_prefetch_snapshots",
+            "expert_cache_route_prefetch_submitted",
+            "expert_cache_route_prefetch_duplicates",
+            "expert_cache_route_prefetch_stale",
+            "expert_cache_route_prefetch_rejected"
 
         };
         return fields;
@@ -1774,10 +1789,18 @@ struct test {
             field == "expert_cache_gpu_id_resolutions" ||
             field == "expert_cache_staging_memcpy_bytes" ||
             field == "expert_cache_direct_pinned_dma_bytes" ||
-            field == "expert_cache_map_updates" ||
-            field == "expert_cache_map_update_bytes" ||
             field == "expert_cache_dma_ns" ||
-            field == "expert_cache_dma_wait_ns") {
+            field == "expert_cache_dma_wait_ns" ||
+            field == "expert_cache_staging_waits" ||
+            field == "expert_cache_probe_layers" ||
+            field == "expert_cache_probe_sync_us" ||
+            field == "expert_cache_probe_host_us" ||
+            field == "expert_cache_probe_upload_us" ||
+            field == "expert_cache_route_prefetch_snapshots" ||
+            field == "expert_cache_route_prefetch_submitted" ||
+            field == "expert_cache_route_prefetch_duplicates" ||
+            field == "expert_cache_route_prefetch_stale" ||
+            field == "expert_cache_route_prefetch_rejected") {
             return INT;
         }
         return STRING;
@@ -1883,10 +1906,18 @@ struct test {
                                             std::to_string(expert_cache_stats.n_gpu_id_resolutions),
                                             std::to_string(expert_cache_stats.staging_memcpy_bytes),
                                             std::to_string(expert_cache_stats.direct_pinned_dma_bytes),
-                                            std::to_string(expert_cache_stats.n_map_updates),
-                                            std::to_string(expert_cache_stats.map_update_bytes),
                                             std::to_string(expert_cache_stats.dma_ns),
-                                            std::to_string(expert_cache_stats.dma_wait_ns) };
+                                            std::to_string(expert_cache_stats.dma_wait_ns),
+                                            std::to_string(expert_cache_stats.n_staging_waits),
+                                            std::to_string(expert_cache_stats.probe_n_layers),
+                                            std::to_string(expert_cache_stats.probe_sync_us),
+                                            std::to_string(expert_cache_stats.probe_host_us),
+                                            std::to_string(expert_cache_stats.probe_upload_us),
+                                            std::to_string(expert_cache_stats.n_route_prefetch_snapshots),
+                                            std::to_string(expert_cache_stats.n_route_prefetch_submitted),
+                                            std::to_string(expert_cache_stats.n_route_prefetch_duplicates),
+                                            std::to_string(expert_cache_stats.n_route_prefetch_stale),
+                                            std::to_string(expert_cache_stats.n_route_prefetch_rejected) };
         return values;
     }
 

@@ -320,6 +320,73 @@ static void test_prefetch() {
 
     printf("  prefetch tests passed\n");
 }
+
+static void test_prefetch_deduplicates_expert_ids() {
+    printf("testing duplicate expert prefetch coalescing...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+
+    const size_t expert_bytes = 512;
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 8 * expert_bytes);
+    require(cache != nullptr);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    struct ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 8);
+    require(tensor != nullptr);
+    ggml_set_name(tensor, "blk.4.ffn_gate_exps.weight");
+    tensor->nb[2] = expert_bytes;
+    memset(tensor->data, 0xCD, ggml_nbytes(tensor));
+
+    const int32_t expert_ids[] = { 2, 2, 2, 6, 6 };
+    ggml_backend_expert_cache_prefetch(cache, tensor, expert_ids, 5);
+
+    struct ggml_backend_expert_cache_stats stats;
+    ggml_backend_expert_cache_get_stats(cache, &stats);
+    require(stats.n_speculative_prefetches == 2);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  duplicate expert prefetch coalescing tests passed\n");
+}
+
+static void test_route_prefetch_telemetry() {
+    printf("testing route prefetch telemetry...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 4096);
+    require(cache != nullptr);
+
+    ggml_backend_expert_cache_record_route_snapshot(cache);
+    ggml_backend_expert_cache_record_route_prefetch_submitted(cache);
+    ggml_backend_expert_cache_record_route_prefetch_duplicate(cache);
+    ggml_backend_expert_cache_record_route_prefetch_stale(cache);
+    ggml_backend_expert_cache_record_route_prefetch_rejected(cache);
+
+    struct ggml_backend_expert_cache_stats stats;
+    ggml_backend_expert_cache_get_stats(cache, &stats);
+    require(stats.n_route_prefetch_snapshots == 1);
+    require(stats.n_route_prefetch_submitted == 1);
+    require(stats.n_route_prefetch_duplicates == 1);
+    require(stats.n_route_prefetch_stale == 1);
+    require(stats.n_route_prefetch_rejected == 1);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_free(backend);
+
+    printf("  route prefetch telemetry tests passed\n");
+}
+
 static void test_pinned_staging_no_overwrite() {
     printf("testing pinned staging ring acquire/commit discipline...\n");
 
@@ -517,32 +584,38 @@ static void test_slot_loading_lifecycle() {
     ggml_set_name(tensor, "blk.0.ffn_gate_exps.weight");
     tensor->nb[2] = expert_bytes;
 
-    // 1. Newly allocated slot starts in LOADING state
-    int32_t slot = ggml_backend_expert_cache_alloc_slot_idx(cache, tensor, 5, NULL, 0);
-    assert(slot >= 0);
+    // 1. A new claim owns the fill and starts in LOADING state.
+    bool needs_load = false;
+    int32_t slot = ggml_backend_expert_cache_claim_slot_idx(
+        cache, tensor, 5, NULL, 0, &needs_load);
+    require(slot >= 0);
+    require(needs_load);
 
-    // LOADING slot must NOT return hit in find_slot
+    // A duplicate claim attaches to the existing fill.
+    bool duplicate_needs_load = true;
+    require(ggml_backend_expert_cache_claim_slot_idx(
+        cache, tensor, 5, NULL, 0, &duplicate_needs_load) == slot);
+    require(!duplicate_needs_load);
+
+    // LOADING must not return a hit.
     int32_t found = ggml_backend_expert_cache_find_slot(cache, tensor, 5);
-    assert(found == -1);
+    require(found == -1);
 
-    // LOADING slot must NOT count as hit in remap_ids
     int32_t orig_ids[1] = { 5 };
     int32_t remapped[1] = { -1 };
     bool is_hit[1] = { false };
     int32_t n_hits = ggml_backend_expert_cache_remap_ids(cache, tensor, orig_ids, 1, remapped, is_hit);
-    assert(n_hits == 0);
-    assert(!is_hit[0]);
+    require(n_hits == 0);
+    require(!is_hit[0]);
 
-    // 2. Promoting to RESIDENT enables cache hits
+    // Promotion makes the completed fill visible.
     ggml_backend_expert_cache_promote_slot(cache, tensor, 5, slot);
-
-    found = ggml_backend_expert_cache_find_slot(cache, tensor, 5);
-    assert(found == slot);
+    require(ggml_backend_expert_cache_find_slot(cache, tensor, 5) == slot);
 
     n_hits = ggml_backend_expert_cache_remap_ids(cache, tensor, orig_ids, 1, remapped, is_hit);
-    assert(n_hits == 1);
-    assert(is_hit[0]);
-    assert(remapped[0] == slot);
+    require(n_hits == 1);
+    require(is_hit[0]);
+    require(remapped[0] == slot);
 
     ggml_backend_expert_cache_free(cache);
     ggml_free(ctx);
@@ -551,8 +624,8 @@ static void test_slot_loading_lifecycle() {
     printf("  slot LOADING -> RESIDENT state machine tests passed\n");
 }
 
-static void test_per_tensor_gpu_map_isolation() {
-    printf("testing per-tensor GPU map isolation across layers...\n");
+static void test_per_tensor_slot_isolation() {
+    printf("testing per-tensor slot isolation across layers...\n");
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     assert(backend != nullptr);
@@ -600,7 +673,7 @@ static void test_per_tensor_gpu_map_isolation() {
     ggml_free(ctx);
     ggml_backend_free(backend);
 
-    printf("  per-tensor GPU map isolation tests passed\n");
+    printf("  per-tensor slot isolation tests passed\n");
 }
 
 static void test_staging_sync_teardown() {
@@ -673,10 +746,12 @@ int main() {
     test_expert_bundles();
     test_pinned_host_buffer();
     test_prefetch();
+    test_prefetch_deduplicates_expert_ids();
+    test_route_prefetch_telemetry();
     test_pp_tg_telemetry_isolation();
 
     test_slot_loading_lifecycle();
-    test_per_tensor_gpu_map_isolation();
+    test_per_tensor_slot_isolation();
     test_staging_sync_teardown();
     test_auto_reserve_sentinel();
 

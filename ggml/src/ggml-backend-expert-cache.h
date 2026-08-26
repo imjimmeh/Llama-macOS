@@ -36,12 +36,6 @@ enum ggml_expert_cache_slot_state {
     GGML_EXPERT_CACHE_SLOT_RESIDENT  = 2,
 };
 
-struct ggml_expert_cache_miss_desc {
-    int32_t token_idx;
-    int32_t route_idx;
-    int32_t expert_id;
-};
-
 
 
 typedef struct ggml_backend_expert_cache * ggml_backend_expert_cache_t;
@@ -185,6 +179,15 @@ GGML_API void ggml_backend_expert_cache_record_direct_dma(
     ggml_backend_expert_cache_t cache,
     size_t bytes);
 
+// Claim a slot and report whether the caller owns a new fill.
+GGML_API int32_t ggml_backend_expert_cache_claim_slot_idx(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor,
+    int32_t expert_id,
+    const struct ggml_expert_cache_key * pinned_keys,
+    size_t n_pinned,
+    bool * out_needs_load);
+
 // Legacy byte-based slot allocation
 GGML_API size_t ggml_backend_expert_cache_alloc_slot(
     ggml_backend_expert_cache_t cache,
@@ -211,8 +214,6 @@ GGML_API bool ggml_backend_expert_cache_is_bundle_resident(
 GGML_API void ggml_backend_expert_cache_record_all_hit_resolution(
     ggml_backend_expert_cache_t cache);
 
-GGML_API void ggml_backend_expert_cache_record_gpu_id_resolution(
-    ggml_backend_expert_cache_t cache);
 
 GGML_API void ggml_backend_expert_cache_record_probe_layer(
     ggml_backend_expert_cache_t cache);
@@ -224,6 +225,21 @@ GGML_API void ggml_backend_expert_cache_record_probe_sync(
 GGML_API void ggml_backend_expert_cache_record_probe_host(
     ggml_backend_expert_cache_t cache,
     uint64_t us);
+
+GGML_API void ggml_backend_expert_cache_record_route_snapshot(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_record_route_prefetch_submitted(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_record_route_prefetch_duplicate(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_record_route_prefetch_stale(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API void ggml_backend_expert_cache_record_route_prefetch_rejected(
+    ggml_backend_expert_cache_t cache);
 
 GGML_API void ggml_backend_expert_cache_record_probe_upload(
     ggml_backend_expert_cache_t cache,
@@ -301,33 +317,6 @@ GGML_API void ggml_backend_expert_cache_promote_slot(
     const struct ggml_tensor * tensor,
     int32_t expert_id,
     int32_t slot);
-
-GGML_API void * ggml_backend_expert_cache_gpu_map_create(
-    ggml_backend_t backend,
-    int32_t n_expert);
-
-GGML_API void ggml_backend_expert_cache_gpu_map_update(
-    ggml_backend_t backend,
-    void * dev_map,
-    const int32_t * host_entries,
-    int32_t n_entries,
-    void * stream);
-
-GGML_API void ggml_backend_expert_cache_gpu_map_free(
-    ggml_backend_t backend,
-    void * dev_map);
-
-GGML_API void ggml_backend_expert_cache_partition_ids(
-    ggml_backend_t backend,
-    const int32_t * ids_in,
-    int32_t * remapped_ids_out,
-    const int32_t * gpu_slot_map,
-    int32_t * hit_mask_out,
-    struct ggml_expert_cache_miss_desc * miss_descs_out,
-    int32_t * miss_counter_dev,
-    int32_t n_expert_used,
-    int32_t n_tokens,
-    void * stream);
 
 GGML_API void ggml_backend_expert_cache_sync(
     ggml_backend_expert_cache_t cache);

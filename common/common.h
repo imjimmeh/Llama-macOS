@@ -483,6 +483,7 @@ struct common_params {
     std::string expert_cache_profile = "";    // expert cache profile name (e.g. 'coding', 'prose')
     std::string expert_cache_file    = "";    // explicit path to expert cache JSON file
     bool        expert_cache_persist = true;  // enable auto-loading and persisting to disk
+    bool        expert_cache_prefetch = false; // enable decode carry-forward route prefetch
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
