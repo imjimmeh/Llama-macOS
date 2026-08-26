@@ -7,6 +7,8 @@
 **Architecture:** Preserve the current scheduler-owned, per-accelerator cache and its fixed-capacity slot pools. First make slot lifecycle publication event-backed and observable. Then move route observation across decode graph boundaries so prefetch has lead time, keeping the current reactive miss path authoritative. Admission is optional, deadline-aware, and fail-closed: a late or uncertain prefetch must leave resident cache state unchanged.
 
 **Tech Stack:** C++17, GGML scheduler/backend APIs, CUDA backend events and async tensor copies, CMake/CTest, llama-bench, llama-server, Python deterministic token-hash harness.
+> **Status (2026-08-26):** This is the dated single-token carry-forward and lifecycle plan. Retained and partial work remains useful history, but it does not define general decode-time route-aware dispatch. New decode performance work follows `docs/superpowers/specs/2026-08-26-general-decode-moe-dispatch-design.md` and `docs/superpowers/plans/2026-08-26-general-decode-moe-dispatch.md`.
+
 
 ## Global Constraints
 

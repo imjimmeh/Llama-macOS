@@ -35,46 +35,46 @@ To address both bottlenecks, `llama.cpp` implements two complementary, decoupled
 
 ## 2. Dynamic MoE Expert Cache
 
-### 2.1 Principle of Operation
+### 2.1 Current Operation and Scope
 
-Expert routing in MoE models exhibits significant **temporal locality**: across consecutive decode tokens, 60% to 75% of activated experts are typically reused.
+The expert cache is a scheduler-level optimization for a routed `GGML_OP_MUL_MAT_ID` operation that already has a host-weight input copied into a non-CPU backend split. It is not a general CPU/GPU MoE dispatcher.
 
-Rather than permanently pinning whole layers to VRAM or streaming all CPU experts over PCIe repeatedly, the **Expert Cache** dynamically maintains the most active expert weight slices in an accelerator-resident buffer.
-
-### 2.2 Execution Flow & Selective Transfers
-
-The cache is implemented at the scheduler level (`ggml_backend_sched`) around `GGML_OP_MUL_MAT_ID`:
+The active slot-pool path can execute an eligible route union directly from a persistent accelerator buffer:
 
 ```text
-                         GGML_OP_MUL_MAT_ID
-                                 │
-                                 ▼
-                     Extract Selected Expert IDs
-                                 │
-                     ┌───────────┴───────────┐
-                     ▼                       ▼
-               Cache Hits               Cache Misses
-                     │                       │
-                     │                 Group Contiguous
-                     │                  RAM -> GPU Copy
-                     │                       │
-                     ▼                       ▼
-              GPU -> GPU Copy         Populate Cache
-             (Into input_cpy)        (Async Eviction)
-                     │                       │
-                     └───────────┬───────────┘
-                                 ▼
-                          Execute Matmul
+eligible host-weight MUL_MAT_ID in non-CPU split
+                  |
+                  v
+read selected IDs and form unique union
+                  |
+        +---------+----------+
+        |                    |
+union fits ready slots   union cannot use slots
+        |                    |
+        v                    v
+explicit ID remap      legacy copied-tensor fallback
+slot_tensor source     D2D hit copies plus host-to-device misses
+        |                    |
+        +---------+----------+
+                  |
+                  v
+            Execute MUL_MAT_ID
 ```
 
-1. **Discovery & Interception**: When `ggml_backend_sched` prepares an offloaded `MUL_MAT_ID` node whose source weights reside in host RAM, it reads the active expert IDs from the router output (`node->src[2]`).
-2. **Hit/Miss Classification**: Each requested `(tensor, expert_id)` key is queried in the backend's expert cache registry.
-3. **Contiguous Batching of Misses**: Missed experts are grouped into contiguous ranges to minimize PCIe transfer launch overhead.
-4. **Fast GPU->GPU Transfer for Hits**: Hit slices are copied directly from the persistent cache arena into the temporary computation tensor (`input_cpy`).
-5. **LRU / Periodic JIT Swapping**:
-   - In on-demand mode (`--expert-cache-period 0`), LRU eviction makes space for new misses while protecting currently pinned active experts.
-   - In periodic JIT mode (`--expert-cache-period N`), expert access frequencies are tracked over $N$ tokens, and hot experts are pre-swapped just in time ahead of the layer's execution.
+The slot-pool full-hit path avoids in-band D2D reconstruction. It is available for any eligible batch whose unique expert union fits slots. It does not make a CPU-routed decode operation cache-eligible, and it does not provide CPU-on-miss or mixed CPU/GPU expert execution.
 
+Current miss handling can fill slots immediately for a cache-eligible operation. The cache has full-pool ghost admission and eviction cooldown, but does not have a bounded fill-job queue or an atomic complete-bundle dispatch contract.
+
+The proposed general design moves the CPU/GPU decision until after current route IDs are ready:
+
+```text
+current route ready
+  -> complete resident bundle: GPU slot-pool execution
+  -> any missing or loading member: unchanged CPU execution
+                                  + optional bounded fill for later work
+```
+
+This design is not implemented. See `superpowers/specs/2026-08-26-general-decode-moe-dispatch-design.md` and `superpowers/plans/2026-08-26-general-decode-moe-dispatch.md`.
 ---
 
 ## 3. Dense FFN Heterogeneous Channel Partitioning

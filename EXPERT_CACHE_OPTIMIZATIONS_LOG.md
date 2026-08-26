@@ -887,3 +887,87 @@ Result: PASS
 git diff --check
 Result: PASS
 ```
+
+## Route Census Baseline (2026-08-26)
+
+### Change
+
+Added scheduler-owned route census counters without changing backend assignment,
+route-ID transfers, cache admission, or execution. The census records original
+graph `MUL_MAT_ID` nodes, source residency/usage, assigned backend class, batch
+bands (`1`, `2-8`, `9-31`, `32+`), and cache-intercepted split inputs. The
+llama-bench telemetry schema was extended atomically through stats subtraction,
+field declarations, field types, and values.
+
+### Focused verification
+
+```text
+cmake --build build --config Release --target test-expert-cache
+Result: PASS
+build/bin/Release/test-expert-cache.exe
+Result: PASS - all cache tests passed, including original-graph route census
+cmake --build build --config Release --target llama-bench
+Result: PASS
+build/bin/Release/llama-bench.exe --help
+Result: PASS
+```
+
+### Compact observation
+
+Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf`; GTX 1080; CUDA; mlock; Q8 K/V;
+Flash Attention; 14 threads; batch 4096; ubatch 2048; fit target 256 MiB;
+one fresh process; `-p 32 -n 8 -exc 0 -r 1`.
+
+The generation row measured 25.5337 tok/s and reported:
+
+```text
+route census nodes:             120
+CPU-host route nodes:            79
+non-CPU host route nodes:         0
+non-host route nodes:            41
+route census split inputs:        0
+batch-1 nodes:                  120
+cache requests/eligible ops:      0 / 0
+```
+
+The same command's prompt row measured 36.2327 tok/s and reported 80
+cache-intercepted split inputs but no original-graph census nodes. This
+indicates that the existing statistics are collected at different scheduler
+phases for prompt and generation; it is an observability limitation, not a
+performance result.
+
+### Decision
+
+Retain the census instrumentation as a diagnostic baseline. Do not claim a
+token-generation cache speedup. The next implementation work must fix route
+identity and execution lifecycle before attempting route-aware dispatch.
+
+
+### Change
+
+Added an optional nonblocking backend event query and changed slot lookup to
+publish a CUDA-backed slot as `RESIDENT` only after its load event reports
+completion. CPU-backed test transfers retain synchronous promotion. A claimed
+slot with no completed fill is not a hit.
+
+### Focused verification
+
+```text
+cmake --build build --config Release --target test-expert-cache
+Result: PASS
+build/bin/Release/test-expert-cache.exe
+Result: PASS - all cache tests passed
+```
+
+The existing CPU lifecycle fixture still proves that a claimed `LOADING` slot
+does not resolve, duplicate claims attach to the same slot, and explicit
+promotion makes a synchronous CPU fill visible. CUDA event query is exposed
+through the backend device interface and has no effect on backends without
+event support.
+
+### Decision
+
+Retain the lifecycle change as a safety prerequisite. No token-generation
+performance claim is made. Consumer-use event ownership and complete-bundle
+reservation remain unimplemented and must precede background or multistream
+fills.

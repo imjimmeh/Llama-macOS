@@ -549,6 +549,13 @@ void ggml_backend_event_synchronize(ggml_backend_event_t event) {
 
     event->device->iface.event_synchronize(event->device, event);
 }
+bool ggml_backend_event_query(ggml_backend_event_t event) {
+    if (event == NULL || event->device == NULL || event->device->iface.event_query == NULL) {
+        return false;
+    }
+    return event->device->iface.event_query(event->device, event);
+}
+
 
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     GGML_ASSERT(backend);
@@ -843,6 +850,7 @@ struct ggml_backend_sched {
     bool expert_cache_prefetch = false;
     uint64_t expert_cache_route_step = 0;
     std::vector<ggml_backend_sched_route_snapshot> expert_cache_route_snapshots;
+    ggml_backend_expert_cache_stats route_census_stats = {};
     std::vector<int32_t> expert_ids_scratch;
     std::vector<ggml_bitset_t> expert_bitset_scratch;
     std::vector<ggml_bitset_t> expert_miss_bitset_scratch;
@@ -1086,6 +1094,52 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 }
 
 
+static void ggml_backend_sched_record_route_census(
+        ggml_backend_sched_t sched,
+        const struct ggml_cgraph * graph) {
+    ggml_backend_expert_cache_stats & stats = sched->route_census_stats;
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+
+        stats.n_route_census_nodes++;
+
+        const struct ggml_tensor * source = node->src[0];
+        const ggml_backend_buffer_t buffer = source != nullptr ?
+            (source->view_src != nullptr ? source->view_src->buffer : source->buffer) : nullptr;
+        const bool is_host = buffer != nullptr && ggml_backend_buffer_is_host(buffer);
+        const bool is_weight = buffer != nullptr &&
+            ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+
+        if (is_weight && !is_host) {
+            stats.n_route_census_non_host_nodes++;
+        } else if (is_weight && is_host) {
+            const int backend_id = tensor_backend_id(node);
+            if (backend_id >= 0 && backend_id < sched->n_backends &&
+                ggml_backend_dev_type(ggml_backend_get_device(sched->backends[backend_id])) ==
+                    GGML_BACKEND_DEVICE_TYPE_CPU) {
+                stats.n_route_census_cpu_host_nodes++;
+            } else {
+                stats.n_route_census_non_cpu_host_nodes++;
+            }
+        }
+
+        const int64_t batch_size = node->ne[2];
+        if (batch_size == 1) {
+            stats.n_route_census_batch_1++;
+        } else if (batch_size <= 8) {
+            stats.n_route_census_batch_2_8++;
+        } else if (batch_size < 32) {
+            stats.n_route_census_batch_9_31++;
+        } else {
+            stats.n_route_census_batch_32_plus++;
+        }
+    }
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1317,6 +1371,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         GGML_ASSERT(*cur_backend_id != -1);
     }
+
+    ggml_backend_sched_record_route_census(sched, graph);
 
     // pass 5: split graph, find tensors that need to be copied
     {
@@ -1759,8 +1815,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, b_id, sched->cur_copy);
-            ggml_tensor * node = ggml_backend_find_mul_mat_id_node(&split->graph, input_cpy);
+            struct ggml_tensor * node = ggml_backend_find_mul_mat_id_node(&split->graph, input_cpy);
             if (node != NULL && node->src[2] != NULL) {
+                sched->route_census_stats.n_route_census_split_inputs++;
                 total_remap_bytes[b_id] += GGML_PAD(ggml_nbytes(node->src[2]), 512);
                 total_remap_nodes[b_id]++;
             }
@@ -2598,8 +2655,9 @@ bool ggml_backend_sched_get_expert_cache_stats(
         }
         return false;
     }
-    memset(out_stats, 0, sizeof(*out_stats));
-    bool found = false;
+    *out_stats = sched->route_census_stats;
+    bool found = sched->route_census_stats.n_route_census_nodes > 0 ||
+        sched->route_census_stats.n_route_census_split_inputs > 0;
     for (int b = 0; b < sched->n_backends; b++) {
         if (sched->expert_caches[b]) {
             struct ggml_backend_expert_cache_stats s;
@@ -2636,6 +2694,15 @@ bool ggml_backend_sched_get_expert_cache_stats(
             out_stats->n_route_prefetch_submitted += s.n_route_prefetch_submitted;
             out_stats->n_route_prefetch_duplicates += s.n_route_prefetch_duplicates;
             out_stats->n_route_prefetch_stale += s.n_route_prefetch_stale;
+            out_stats->n_route_census_nodes += s.n_route_census_nodes;
+            out_stats->n_route_census_cpu_host_nodes += s.n_route_census_cpu_host_nodes;
+            out_stats->n_route_census_non_cpu_host_nodes += s.n_route_census_non_cpu_host_nodes;
+            out_stats->n_route_census_non_host_nodes += s.n_route_census_non_host_nodes;
+            out_stats->n_route_census_split_inputs += s.n_route_census_split_inputs;
+            out_stats->n_route_census_batch_1 += s.n_route_census_batch_1;
+            out_stats->n_route_census_batch_2_8 += s.n_route_census_batch_2_8;
+            out_stats->n_route_census_batch_9_31 += s.n_route_census_batch_9_31;
+            out_stats->n_route_census_batch_32_plus += s.n_route_census_batch_32_plus;
             out_stats->n_route_prefetch_rejected += s.n_route_prefetch_rejected;
         }
     }

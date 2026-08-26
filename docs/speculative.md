@@ -125,7 +125,7 @@ and dynamically promote MTP weights to GPU via high-speed DMA once token generat
 llama-cli -m Qwen3.5-35B-A3B-MoE.gguf --draft-mtp --mtp-dynamic-offload -ngl 33 -p "Prompt here"
 ```
 
-For detailed architectural documentation and benchmarks, see [EXPERT_CACHE.md](file:///G:/code/AI/llamacpptuned/llama.cpp/EXPERT_CACHE.md#7-dynamic-mtp-offload-and-phase-aware-residency).
+For MTP dynamic-offload behavior and expert-cache limitations, see [EXPERT_CACHE.md](../EXPERT_CACHE.md). General route-aware dispatch across normal decode, speculative verification, and MTP is proposed in [the general decode MoE dispatch design](superpowers/specs/2026-08-26-general-decode-moe-dispatch-design.md).
 
 ### n-gram Cache (`ngram-cache`)
 

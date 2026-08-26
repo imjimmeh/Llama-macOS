@@ -1566,6 +1566,15 @@ static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_ba
     EXPERT_CACHE_SUBTRACT(n_route_prefetch_duplicates);
     EXPERT_CACHE_SUBTRACT(n_route_prefetch_stale);
     EXPERT_CACHE_SUBTRACT(n_route_prefetch_rejected);
+    EXPERT_CACHE_SUBTRACT(n_route_census_nodes);
+    EXPERT_CACHE_SUBTRACT(n_route_census_cpu_host_nodes);
+    EXPERT_CACHE_SUBTRACT(n_route_census_non_cpu_host_nodes);
+    EXPERT_CACHE_SUBTRACT(n_route_census_non_host_nodes);
+    EXPERT_CACHE_SUBTRACT(n_route_census_split_inputs);
+    EXPERT_CACHE_SUBTRACT(n_route_census_batch_1);
+    EXPERT_CACHE_SUBTRACT(n_route_census_batch_2_8);
+    EXPERT_CACHE_SUBTRACT(n_route_census_batch_9_31);
+    EXPERT_CACHE_SUBTRACT(n_route_census_batch_32_plus);
 #undef EXPERT_CACHE_SUBTRACT
     return delta;
 }
@@ -1743,7 +1752,16 @@ struct test {
             "expert_cache_route_prefetch_submitted",
             "expert_cache_route_prefetch_duplicates",
             "expert_cache_route_prefetch_stale",
-            "expert_cache_route_prefetch_rejected"
+            "expert_cache_route_prefetch_rejected",
+            "expert_cache_route_census_nodes",
+            "expert_cache_route_census_cpu_host_nodes",
+            "expert_cache_route_census_non_cpu_host_nodes",
+            "expert_cache_route_census_non_host_nodes",
+            "expert_cache_route_census_split_inputs",
+            "expert_cache_route_census_batch_1",
+            "expert_cache_route_census_batch_2_8",
+            "expert_cache_route_census_batch_9_31",
+            "expert_cache_route_census_batch_32_plus"
 
         };
         return fields;
@@ -1800,7 +1818,16 @@ struct test {
             field == "expert_cache_route_prefetch_submitted" ||
             field == "expert_cache_route_prefetch_duplicates" ||
             field == "expert_cache_route_prefetch_stale" ||
-            field == "expert_cache_route_prefetch_rejected") {
+            field == "expert_cache_route_prefetch_rejected" ||
+            field == "expert_cache_route_census_nodes" ||
+            field == "expert_cache_route_census_cpu_host_nodes" ||
+            field == "expert_cache_route_census_non_cpu_host_nodes" ||
+            field == "expert_cache_route_census_non_host_nodes" ||
+            field == "expert_cache_route_census_split_inputs" ||
+            field == "expert_cache_route_census_batch_1" ||
+            field == "expert_cache_route_census_batch_2_8" ||
+            field == "expert_cache_route_census_batch_9_31" ||
+            field == "expert_cache_route_census_batch_32_plus") {
             return INT;
         }
         return STRING;
@@ -1917,7 +1944,16 @@ struct test {
                                             std::to_string(expert_cache_stats.n_route_prefetch_submitted),
                                             std::to_string(expert_cache_stats.n_route_prefetch_duplicates),
                                             std::to_string(expert_cache_stats.n_route_prefetch_stale),
-                                            std::to_string(expert_cache_stats.n_route_prefetch_rejected) };
+                                            std::to_string(expert_cache_stats.n_route_prefetch_rejected),
+                                            std::to_string(expert_cache_stats.n_route_census_nodes),
+                                            std::to_string(expert_cache_stats.n_route_census_cpu_host_nodes),
+                                            std::to_string(expert_cache_stats.n_route_census_non_cpu_host_nodes),
+                                            std::to_string(expert_cache_stats.n_route_census_non_host_nodes),
+                                            std::to_string(expert_cache_stats.n_route_census_split_inputs),
+                                            std::to_string(expert_cache_stats.n_route_census_batch_1),
+                                            std::to_string(expert_cache_stats.n_route_census_batch_2_8),
+                                            std::to_string(expert_cache_stats.n_route_census_batch_9_31),
+                                            std::to_string(expert_cache_stats.n_route_census_batch_32_plus) };
         return values;
     }
 

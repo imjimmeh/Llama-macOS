@@ -337,6 +337,30 @@ static void ggml_expert_cache_wait_slot(ggml_expert_cache_slot_entry & slot) {
     }
 }
 
+static bool ggml_expert_cache_poll_slot(
+        ggml_backend_expert_cache_t cache,
+        ggml_expert_cache_slot_entry & slot) {
+    if (slot.state == GGML_EXPERT_CACHE_SLOT_RESIDENT) {
+        return true;
+    }
+    if (slot.state != GGML_EXPERT_CACHE_SLOT_LOADING) {
+        return false;
+    }
+
+    if (slot.load_event == nullptr) {
+        return false;
+    }
+
+    if (!ggml_backend_event_query(slot.load_event)) {
+        return false;
+    }
+
+    ggml_backend_event_free(slot.load_event);
+    slot.load_event = nullptr;
+    slot.state = GGML_EXPERT_CACHE_SLOT_RESIDENT;
+    return true;
+}
+
 bool ggml_backend_expert_cache_can_store(
         ggml_backend_expert_cache_t cache,
         size_t expert_size) {
@@ -797,10 +821,13 @@ int32_t ggml_backend_expert_cache_find_slot(
         return -1;
     }
     auto it = pool->slot_maps.find(tensor);
-    if (it != pool->slot_maps.end() && (size_t)expert_id < it->second.size()) {
-        int32_t s = it->second[expert_id];
-        if (s >= 0 && s < pool->max_slots && pool->slots[s].tensor == tensor && pool->slots[s].expert_id == expert_id && pool->slots[s].state == GGML_EXPERT_CACHE_SLOT_RESIDENT) {
-            return s;
+    if (it != pool->slot_maps.end() && (size_t) expert_id < it->second.size()) {
+        const int32_t slot = it->second[expert_id];
+        if (slot >= 0 && slot < pool->max_slots &&
+            pool->slots[slot].tensor == tensor &&
+            pool->slots[slot].expert_id == expert_id &&
+            ggml_expert_cache_poll_slot(cache, pool->slots[slot])) {
+            return slot;
         }
     }
     return -1;
@@ -1563,15 +1590,17 @@ void ggml_backend_expert_cache_promote_slot(
     if (pool == NULL || slot >= pool->max_slots) {
         return;
     }
-    if (pool->slots[slot].tensor == tensor && pool->slots[slot].expert_id == expert_id) {
-        if (pool->slots[slot].state == GGML_EXPERT_CACHE_SLOT_LOADING) {
-            if (pool->slots[slot].load_event == nullptr) {
-                pool->slots[slot].load_event = ggml_backend_event_new(ggml_backend_get_device(cache->backend));
-            }
-            if (pool->slots[slot].load_event != nullptr) {
-                ggml_backend_event_record(pool->slots[slot].load_event, cache->backend);
-            }
-            pool->slots[slot].state = GGML_EXPERT_CACHE_SLOT_RESIDENT;
+    auto & slot_entry = pool->slots[slot];
+    if (slot_entry.tensor == tensor && slot_entry.expert_id == expert_id &&
+        slot_entry.state == GGML_EXPERT_CACHE_SLOT_LOADING) {
+        if (slot_entry.load_event == nullptr) {
+            slot_entry.load_event = ggml_backend_event_new(ggml_backend_get_device(cache->backend));
+        }
+        if (slot_entry.load_event != nullptr) {
+            ggml_backend_event_record(slot_entry.load_event, cache->backend);
+        } else if (ggml_backend_dev_type(ggml_backend_get_device(cache->backend)) ==
+                GGML_BACKEND_DEVICE_TYPE_CPU) {
+            slot_entry.state = GGML_EXPERT_CACHE_SLOT_RESIDENT;
         }
     }
 }

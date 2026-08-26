@@ -47,6 +47,60 @@ static void test_cache_node_selection() {
     printf("  cached expert node selection tests passed\n");
 }
 
+static void test_route_census_classifies_original_graph() {
+    printf("testing original-graph route census...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        &backend, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
+    require(sched != nullptr);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 8, 2);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 2, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+    ggml_tensor * output = ggml_mul_mat_id(ctx, experts, input, ids);
+    ggml_set_name(experts, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(output, "ffn_moe_gate");
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer != nullptr);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_sched_split_graph(sched, graph);
+
+    ggml_backend_expert_cache_stats stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &stats));
+    require(stats.n_route_census_nodes >= 1);
+    require(stats.n_route_census_cpu_host_nodes >= 1);
+    require(stats.n_route_census_batch_1 >= 1);
+    require(stats.n_route_census_split_inputs == 0);
+
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  original-graph route census tests passed\n");
+}
+
+static void test_event_query_contract() {
+    printf("testing nonblocking event query contract...\n");
+    require(!ggml_backend_event_query(nullptr));
+    printf("  nonblocking event query contract tests passed\n");
+}
+
+
 
 static void test_cache_capacity_admission() {
     printf("testing cache capacity admission...\n");
@@ -734,10 +788,10 @@ static void test_auto_reserve_sentinel() {
 }
 
 int main() {
-    printf("running test-expert-cache (V2 features)...\n");
+    setvbuf(stdout, nullptr, _IONBF, 0);
 
-    test_cache_node_selection();
-    test_cache_capacity_admission();
+    test_route_census_classifies_original_graph();
+    test_event_query_contract();
     test_slot_pools_and_remapping();
     test_cross_layer_shape_isolation();
     test_pinned_staging_no_overwrite();

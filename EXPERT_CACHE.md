@@ -6,15 +6,16 @@ The **Expert Cache** provides high-performance heterogeneous inference for Mixtu
 
 # Current Implementation Status (2026-08-26)
 
-This document describes the expert cache subsystem as implemented on the `feat/expert-cache-only` branch. The subsystem is functional but performance on GTX 1080 / Compact models shows no credible decode speedup over cache-disabled operation. The cache is recommended for VRAM-pressure fitting, not throughput acceleration, on this hardware profile.
+This document describes the current expert-cache source. The subsystem is functional for cache-eligible accelerator splits, but GTX 1080 / Compact measurements show no credible decode speedup over cache-disabled operation. The cache remains useful for VRAM-pressure fitting; throughput requires workload-specific evidence.
 
 **Key decisions:**
 - Cache disabled (`-exc 0`) is the throughput control for Qwen3.6-35B-A3B-APEX-Compact on GTX 1080.
-- Device slot map (`d_expert_to_slot`) removed 2026-08-20; graph consumes explicit `ids_tensor` remap upload.
+- Device slot map (`d_expert_to_slot`) was removed; graph execution uses an explicit `ids_tensor` remap upload.
 - Unified slot pools replace legacy flat-cache entries as the authoritative residency representation.
-- Profile seeding bug (seed not populating slot pool) fixed: `ggml_backend_expert_cache_seed()` now calls `alloc_slot_idx()`.
-- Compact decode forced to CUDA was tested and rejected: PCIe transfer cost dominates, TG drops from ~26 to ~9 tok/s.
-- MTP dynamic offload correctness fixes verified in commit `380f9af17`.
+- Profile seeding populates slot pools through `alloc_slot_idx()`.
+- Forced host-MoE CUDA routing was rejected: Compact forced-cache runs reached 14.68-15.99 TG tok/s against an approximately 26.5 tok/s CPU-routed control, and an MTP Quality forced run reached 9.19 TG tok/s with 169.7 GiB RAM-to-GPU traffic.
+- The current carry-forward prefetch is opt-in and a no-op for Compact normal decode because no cache-eligible operation reaches it.
+- General decode-time route-aware CPU/GPU dispatch is proposed, not implemented. See `docs/superpowers/specs/2026-08-26-general-decode-moe-dispatch-design.md` and `docs/superpowers/plans/2026-08-26-general-decode-moe-dispatch.md`.
 
 ---
 
@@ -56,48 +57,50 @@ The Expert Cache maintains a dedicated, persistent accelerator-side buffer to ho
 
 **Status: IMPLEMENTED** (commit `367ea5347`)
 
-In traditional caching architectures, hits in the device cache are copied via D2D memory transfers into a temporary execution tensor (`input_cpy`). In 64-layer models with 3 projections (`gate`, `up`, `down`) and 8 active experts, this incurs ~1,536 D2D transfers on every token.
+Current legacy fallback handling can copy cache-hit slices into `input_cpy`. The slot-pool path avoids those in-band D2D copies only after an operation is already assigned to a cache-capable non-CPU backend.
 
-**Zero-Copy Execution** eliminates D2D transfers completely:
-1. Sub-allocates 3D slot pool tensors (`[ne0, ne1, max_slots]`) directly within a single pre-allocated device buffer.
-2. Intercepts `GGML_OP_MUL_MAT_ID` nodes in `ggml_backend_sched_compute_splits()`.
-3. Maps router IDs in `ids_tensor` (node `src[2]`) directly to slot indices (`0 .. max_slots - 1`).
-4. Replaces node `src[0]` with `slot_tensor`. The backend matrix multiplication kernel (`MUL_MAT_ID`) indexes directly into `vx + ids[i] * nb[2]`, computing the exact same result with **zero in-band memory copies**.
+**Zero-Copy Execution** for an eligible full route union:
+1. Sub-allocates 3D slot pool tensors (`[ne0, ne1, max_slots]`) within a pre-allocated device buffer.
+2. Intercepts a host-weight `GGML_OP_MUL_MAT_ID` split input in `ggml_backend_sched_compute_splits()`.
+3. Maps router IDs in `ids_tensor` (`node->src[2]`) to slot indices (`0 .. max_slots - 1`).
+4. Replaces `node->src[0]` with `slot_tensor`. The backend `MUL_MAT_ID` indexes the resident slot tensor without an in-band D2D copy.
 
-### 2.2 Vector 2: Universal Batch Execution
+### 2.2 Vector 2: Universal Slot-Pool Batch Execution
 
-**Status: IMPLEMENTED**
+**Status: IMPLEMENTED, SUBJECT TO PLACEMENT**
 
-- **Batch-Independent Zero-Copy**: Zero-copy slot pool execution activates for any token batch size (single-token decode, speculative verification, or MTP draft batches) as long as the unique requested experts fit within available slot capacity.
-- **Bulk Miss Fallback**: When requested distinct experts exceed slot capacity (e.g. large prompt prefill activating all 64 experts simultaneously), the cache automatically routes through bulk contiguous transfers, preserving full prompt processing throughput.
+- **Batch-Independent Slot Remapping**: Once a host-weight `MUL_MAT_ID` is assigned to a non-CPU cache backend, zero-copy slot-pool execution can handle any token batch whose unique requested-expert union fits available slots.
+- **Not General Decode Dispatch**: CPU-routed MoE operations are not cache-eligible, regardless of batch capacity. The current implementation does not decide CPU versus GPU after current route IDs are known.
+- **Legacy Fallback**: A union that cannot be made slot-ready uses the existing copied-tensor fallback. It does not use CPU-on-miss or mixed CPU/GPU expert execution.
 
 ### 2.3 Vector 3: True Pinned Host DMA Staging Ring
 
 **Status: IMPLEMENTED** (commit `65e52abe6`)
 
-When unpinned host memory is passed to asynchronous device copy APIs (`cudaMemcpyAsync`), drivers must either perform synchronous staging or serialize transfers.
-- The Expert Cache allocates a 32-slot, 512-byte aligned page-locked host buffer (`cudaHostAlloc` with write-combining under CUDA).
-- Cache misses copy slice payloads into an isolated staging slot at memory bus speeds (~40-60 GB/s) via CPU L1/L2 cache.
-- The accelerator driver then performs asynchronous DMA over PCIe (14-16 GB/s) without blocking CPU execution or risking race conditions across concurrent layer transfers.
+When unpinned host memory is passed to asynchronous device copy APIs (`cudaMemcpyAsync`), drivers can stage or serialize the transfer.
+- The CUDA cache path allocates a 32-slot, 512-byte aligned page-locked host buffer with `cudaHostAlloc` when available.
+- Cache misses can copy slice payloads into isolated staging slots before device DMA.
+- Reuse of an occupied staging slot waits for its recorded event. This protects staging memory lifetime; it is not a bounded fill-job queue or a proof that asynchronous slot publication is safe.
 
-### 2.4 Vector 4: Admission Hysteresis & Anti-Thrashing Guard
+### 2.4 Vector 4: Admission Hysteresis and Anti-Thrashing Guard
 
-**Status: IMPLEMENTED**
+**Status: IMPLEMENTED FOR FULL POOLS**
 
-To prevent cache pollution from transient one-off expert activations:
-- **Two-Strike Ghost Filter**: When the cache is fully utilized, the first sighting of a missing expert is recorded in a lightweight ghost table without evicting an existing slot. Only if the expert is requested again within a 128-token window is it admitted to the probationary cache segment.
-- **Eviction Readmission Cooldown**: Evicted experts require 8 fresh misses before being allowed to evict an existing resident slot, eliminating ping-pong oscillation.
+The cache mitigates transient admissions when a pool is full:
+- **Two-Strike Ghost Filter**: The first missing expert is recorded in a ghost table. A second sighting within a 128-token window may enter probationary cache storage.
+- **Eviction Readmission Cooldown**: An evicted expert requires eight fresh misses before it can evict a resident again.
+- **Scope**: Empty pools still admit immediately. There is no bounded fill-job count, in-flight byte budget, or per-route fill budget.
 
-### 2.5 Vector 5: Coordinated Atomic Layer Bundling (`{gate, up, down}`)
+### 2.5 Vector 5: Registered Expert Bundles
 
-**Status: IMPLEMENTED**
+**Status: IMPLEMENTED REGISTRATION; ATOMIC DISPATCH PROPOSED**
 
-In SwiGLU architectures, each expert consists of three interdependent projections:
+SwiGLU expert projections can include:
 - `ffn_gate_exps`
 - `ffn_up_exps`
 - `ffn_down_exps`
 
-During context initialization, all model layers register their triple projections via `ggml_backend_sched_register_expert_bundle()`. When checking residency or prefetching, operations are coordinated across `{gate, up, down}` to guarantee synchronized layer execution.
+Context initialization registers related tensors through `ggml_backend_sched_register_expert_bundle()`. Current residency and prefetch helpers can query or request registered members. CUDA-backed slot publication now uses a completion event before lookup reports a hit. Atomic complete-bundle admission, consumer-use ownership, CPU-on-miss fallback, and route-aware GPU dispatch remain proposed in the general decode route-aware dispatch design.
 
 ---
 
@@ -177,26 +180,21 @@ Expert cache instances are allocated per accelerator backend:
 
 | Vector | Description | Status | Notes |
 | :--- | :--- | :--- | :--- |
-| **Vector 1** | Zero-Copy Slot Pool Execution | **IMPLEMENTED** | commit `367ea5347` - unified slot pools |
-| **Vector 2** | Universal Batch Execution | **IMPLEMENTED** | Any batch size where experts fit capacity |
-| **Vector 3** | Pinned Host DMA Staging Ring | **IMPLEMENTED** | commit `65e52abe6` - `cudaHostAlloc` staging |
-| **Vector 4** | Admission Hysteresis & Anti-Thrashing | **IMPLEMENTED** | `ghost_sightings` + `eviction_miss_counts` in slot pool |
-| **Vector 5** | Coordinated Atomic Layer Bundling | **IMPLEMENTED** | `bundle_registrations` map in cache struct |
-| **V2: Device Slot Map** | `d_expert_to_slot` GPU-resident lookup table | **REMOVED** | Removed 2026-08-20; graph consumes explicit `ids_tensor` |
-| **V2: Direct Page DMA** | `cudaHostRegister` for direct host-to-GPU DMA | **IMPLEMENTED** | `registered_host_ranges` with 1 GiB budget cap |
-| **V2: Value-per-Byte Rebalancing** | Dynamic slot allocation by expert size | **IMPLEMENTED** | `target_pool_bytes` in `get_or_create_pool` |
-| **V2: Partial Rebalance** | `-excm` per-layer swap limiting | **IMPLEMENTED** | commit `1f1ac6ad5` |
-| **V2: Per-Request Rebalance** | Per-request rebalance flag | **IMPLEMENTED** | commit `1f1ac6ad5` |
+| **Vector 1** | Zero-Copy Slot Pool Execution | **IMPLEMENTED** | Applies after host-weight `MUL_MAT_ID` reaches a non-CPU cache backend |
+| **Vector 2** | Universal Slot-Pool Batch Execution | **IMPLEMENTED** | Any eligible route union that fits slots; not general CPU/GPU dispatch |
+| **Vector 3** | Pinned Host DMA Staging Ring | **IMPLEMENTED** | CUDA pinned staging when available; staging safety is not a fill queue |
+| **Vector 4** | Admission Hysteresis | **IMPLEMENTED** | Full-pool `ghost_sightings` plus `eviction_miss_counts` |
+| **Vector 5** | Registered Expert Bundles | **IMPLEMENTED** | Registration/residency helpers exist; atomic route dispatch is proposed |
+| **V2: Device Slot Map** | `d_expert_to_slot` GPU-resident lookup table | **REMOVED** | Explicit remapped IDs are active |
+| **V2: Direct Page DMA** | Host registration for direct host-to-GPU DMA | **IMPLEMENTED** | `registered_host_ranges` has a 1 GiB registration cap |
+| **General Decode Route Dispatch** | Current-route CPU/GPU choice for all decode microbatches | **PROPOSED** | See the dated design and implementation plan |
 
 
 ### 5.1 Carry-Forward Route Prefetch (Experimental)
 
-`--expert-cache-prefetch` stores the previous single-token decode graph's
-deduplicated route IDs and prefetches at most one layer's bundle before the
-next decode graph.
-Snapshots are discarded on graph reset or step mismatch. The current reactive
-miss path remains authoritative. The option does not force host-resident MoE
-operations onto CUDA.
+`--expert-cache-prefetch` stores prior single-token route snapshots and prefetches at most one valid layer bundle on a later scheduler call. Snapshots are discarded on graph reset or step mismatch. It remains disabled by default, does not force host-resident MoE operations to CUDA, and is currently a correctness-preserving no-op for Compact normal decode.
+
+The option is not the general route-aware dispatch design. It has no complete-bundle CPU-on-miss fallback, current-route decision boundary, bounded fill queue, route-generation identity, consumer-use ownership, or useful-after-fill admission policy. CUDA slot lookup now waits for load-event completion when the backend provides event queries.
 ---
 
 ## 6. Known Issues
@@ -219,3 +217,12 @@ The Compact model's normal decode graph currently reports zero cache-eligible
 operations, so carry-forward has no route data to submit on the GTX 1080.
 The option is correctness-preserving but currently a no-op for this model.
 See the dated measurements in `EXPERT_CACHE_OPTIMIZATIONS_LOG.md`.
+
+### 6.5 General Decode Route-Aware Dispatch: Proposed
+
+The next performance design targets all decode-time MoE microbatches, including normal parallel generation, speculative verification, MTP target/draft graphs, and future batch forms. It will execute a complete current-route bundle from GPU slots only on a proven full hit; every incomplete route remains on the CPU path and may request a bounded background fill for later work.
+
+This is not implemented. The design, invariants, telemetry, decision gates, and implementation order are documented in:
+
+- `docs/superpowers/specs/2026-08-26-general-decode-moe-dispatch-design.md`
+- `docs/superpowers/plans/2026-08-26-general-decode-moe-dispatch.md`

@@ -126,6 +126,7 @@ extern "C" {
     GGML_API void                 ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend);
     GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
+    GGML_API bool                 ggml_backend_event_query(ggml_backend_event_t event);
 
     //
     // Backend device
@@ -403,6 +404,17 @@ extern "C" {
         uint64_t probe_host_us;
         uint64_t probe_upload_us;
 
+        // Decode route census. These counters are collected from graph metadata
+        // without reading route IDs or synchronizing a backend.
+        uint64_t n_route_census_nodes;
+        uint64_t n_route_census_cpu_host_nodes;
+        uint64_t n_route_census_non_cpu_host_nodes;
+        uint64_t n_route_census_non_host_nodes;
+        uint64_t n_route_census_split_inputs;
+        uint64_t n_route_census_batch_1;
+        uint64_t n_route_census_batch_2_8;
+        uint64_t n_route_census_batch_9_31;
+        uint64_t n_route_census_batch_32_plus;
     };
 
     GGML_API void                 ggml_backend_sched_set_expert_cache_prefetch(ggml_backend_sched_t sched, bool enabled);
