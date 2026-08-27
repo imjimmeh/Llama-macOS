@@ -1158,3 +1158,50 @@ with Slot Resident providing lower P95 jitter (830 us vs 1159 us).
 The optimization path proceeds to **Epic 2 (TG Latency Breakdown Profiling)**,
 **Epic 3 (Static Hot-Expert Residency)**, and **Epic 4 (Heterogeneous Route
 Execution: GPU Hits || CPU Misses with zero synchronous miss uploads)**.
+
+## TG Decode Profiling and Static Residency Ranking (2026-08-27)
+
+### Change
+
+Added `tests/test-moe-tg-profiler.cpp` to profile exact decode execution on
+`Qwen3.6-35B-A3B-APEX-Compact.gguf` with 14-thread CPU, GTX 1080 GPU, Flash
+Attention, and 256 MiB fit target. Evaluated per-op breakdown, per-layer MoE
+stages, routing distribution across all 40 layers, and global value-per-byte
+ranking across all 10,240 candidate expert bundles.
+
+### Epic 2: Per-Op Decode Latency Breakdown
+
+| Op Classification | Count | Total (ms) | Mean (us) | Median (us) | % Decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `GET_ROWS (CUDA0)` | 10,304 | 5,181.4 ms | 502.9 us | 30.0 us | 24.2% |
+| `MUL_MAT (CUDA0)` | 25,024 | 4,839.4 ms | 193.4 us | 103.0 us | 22.6% |
+| `MUL_MAT_ID (CUDA0)` | 7,680 | 3,096.8 ms | 403.2 us | 407.0 us | 14.5% |
+| `GATED_DELTA_NET (CUDA0)` | 1,920 | 3,028.8 ms | 1577.5 us | 1516.0 us | 14.2% |
+| `MUL (CUDA0)` | 17,984 | 1,435.3 ms | 79.8 us | 37.0 us | 6.7% |
+| `ADD (CUDA0)` | 27,520 | 792.0 ms | 28.8 us | 22.0 us | 3.7% |
+| `CPY (CUDA0)` | 7,680 | 655.0 ms | 85.3 us | 34.0 us | 3.1% |
+| `ARGSORT (CUDA0)` | 2,560 | 596.8 ms | 233.1 us | 227.0 us | 2.8% |
+| `UNARY (CUDA0)` | 10,880 | 297.5 ms | 27.3 us | 21.0 us | 1.4% |
+| `RMS_NORM (CUDA0)` | 8,384 | 271.8 ms | 32.4 us | 25.0 us | 1.3% |
+| `GLU (CUDA0)` | 5,120 | 173.8 ms | 33.9 us | 33.0 us | 0.8% |
+| `ROPE (CUDA0)` | 1,280 | 131.3 ms | 102.6 us | 122.0 us | 0.6% |
+| `FLASH_ATTN_EXT (CUDA0)` | 640 | 62.0 ms | 96.9 us | 92.0 us | 0.3% |
+
+### Epic 3: Static Hot-Expert Route Distribution & Cumulative Coverage
+
+Across the 40 layers of `Qwen3.6-35B-A3B`:
+- **Strong locality in early and deep layers**:
+  - Layer 0: Top 1 expert = 12.3%, Top 8 experts = **93.0%** of all routes.
+  - Layer 39: Top 1 expert = 12.5%, Top 16 experts = **90.4%** of all routes.
+- **Static Pinned Memory Tiers Generated**:
+  - **64 MiB tier** (33 pinned bundles, ~62.9 MiB): Covers **9.8%** of all decode routes (`pinned_experts_64mb.json`).
+  - **128 MiB tier** (67 pinned bundles, ~127.7 MiB): Covers **18.7%** of all decode routes (`pinned_experts_128mb.json`).
+  - **256 MiB tier** (134 pinned bundles, ~255.4 MiB): Covers **32.6%** of all decode routes (`pinned_experts_256mb.json`).
+  - **512 MiB tier** (268 pinned bundles, ~510.9 MiB): Covers **50.9%** of all decode routes (`pinned_experts_512mb.json`).
+  - **1024 MiB tier** (537 pinned bundles, ~1023.7 MiB): Covers **71.7%** of all decode routes (`pinned_experts_1024mb.json`).
+
+### Decision
+
+Static hot expert ranking provides substantial route coverage (over 50% at 512 MiB,
+over 71% at 1024 MiB). Proceed to implement heterogeneous route execution (GPU
+Hits || CPU Misses with zero synchronous miss uploads) and benchmark the pinned tiers.
