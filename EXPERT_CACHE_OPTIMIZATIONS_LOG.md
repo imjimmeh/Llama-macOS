@@ -1105,3 +1105,56 @@ The operation matrix covers `MUL_MAT_ID` token dimensions including one, four,
 five, seventeen, thirty-two, and one hundred twenty-nine rows across supported
 types. This verifies backend numerical support across batch bands; it does not
 claim route-aware dispatch or cache throughput.
+
+## Pre-Resident Expert Oracle and Gate A Decision (2026-08-27)
+
+### Change
+
+Added `tests/test-moe-oracle-bench.cpp` to isolate pure GPU resident compute vs.
+14-thread CPU compute on exact Qwen3.6-35B-A3B dimensions (`n_embd=2048`,
+`n_ff_exp=512`, `n_expert=256`, `top-k=8`, `Q4_K` Gate/Up, `Q6_K` Down).
+Evaluated raw `MUL_MAT_ID` operations and end-to-end full MoE layers across
+batch sizes TG1, TG2, TG4, and TG8 (100 warmup, 500 timed iterations).
+
+### Benchmark Results
+
+#### 1. Raw MUL_MAT_ID Operation Median Latency (us)
+
+| Batch | Variant | Gate (Q4_K) | Up (Q4_K) | Down (Q6_K) | Total Ops |
+| --- | --- | ---: | ---: | ---: | ---: |
+| **TG1** | CPU (14 threads) | 92.0 us | 73.0 us | 99.0 us | 264.0 us |
+| **TG1** | GPU Full Resident (256 exp) | 52.0 us | 68.0 us | 72.0 us | 192.0 us |
+| **TG1** | GPU Slot Resident (16 slot) | 51.0 us | 51.0 us | 72.0 us | 174.0 us |
+| **TG2** | CPU (14 threads) | 145.0 us | 110.5 us | 147.0 us | 402.5 us |
+| **TG2** | GPU Slot Resident (16 slot) | 53.0 us | 53.0 us | 80.0 us | 186.0 us |
+| **TG4** | CPU (14 threads) | 256.0 us | 239.5 us | 248.0 us | 743.5 us |
+| **TG4** | GPU Slot Resident (16 slot) | 72.0 us | 72.0 us | 132.0 us | 276.0 us |
+| **TG8** | CPU (14 threads) | 499.5 us | 537.0 us | 712.5 us | 1749.0 us |
+| **TG8** | GPU Slot Resident (16 slot) | 73.0 us | 73.0 us | 81.0 us | 227.0 us |
+
+#### 2. Full MoE Layer End-to-End Latency (us)
+
+| Batch | Variant | Median | Mean | P95 | Stddev | Speedup vs CPU |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| **TG1** | CPU (14 threads) | 297.0 us | 380.8 us | 764.0 us | 450.3 us | control |
+| **TG1** | GPU Full Resident (256 exp) | 185.0 us | 255.2 us | 1159.0 us | 246.9 us | **1.61x (+60.5%)** |
+| **TG1** | GPU Slot Resident (16 slot) | 185.0 us | 240.1 us | 830.0 us | 188.5 us | **1.61x (+60.5%)** |
+| **TG2** | CPU (14 threads) | 529.0 us | 630.3 us | 1137.0 us | 406.7 us | control |
+| **TG2** | GPU Slot Resident (16 slot) | 201.0 us | 212.1 us | 248.0 us | 41.0 us | **2.63x (+163.2%)** |
+| **TG4** | CPU (14 threads) | 847.5 us | 921.8 us | 1386.0 us | 390.9 us | control |
+| **TG4** | GPU Slot Resident (16 slot) | 329.0 us | 336.4 us | 373.0 us | 71.7 us | **2.58x (+157.6%)** |
+| **TG8** | CPU (14 threads) | 1082.0 us | 1283.8 us | 2021.0 us | 479.6 us | control |
+| **TG8** | GPU Slot Resident (16 slot) | 319.0 us | 332.4 us | 361.0 us | 84.4 us | **3.39x (+239.2%)** |
+
+### Decision: Gate A Passed (Outcome A)
+
+The pre-resident oracle confirms that executing resident MoE experts on GTX 1080
+(SM61) provides a **+60.5% speedup (1.61x, 297 us -> 185 us)** over 14-thread CPU
+execution for single-token decode (TG1), and **2.6x to 3.4x speedup** for TG2-TG8.
+
+GPU Full Resident and GPU Slot Resident show identical median latency (185 us),
+with Slot Resident providing lower P95 jitter (830 us vs 1159 us).
+
+The optimization path proceeds to **Epic 2 (TG Latency Breakdown Profiling)**,
+**Epic 3 (Static Hot-Expert Residency)**, and **Epic 4 (Heterogeneous Route
+Execution: GPU Hits || CPU Misses with zero synchronous miss uploads)**.
