@@ -2319,6 +2319,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             const int32_t n_expert_used = (int32_t)ids_tensor->ne[0];
                             const int32_t n_tokens = (int32_t)ids_tensor->ne[1];
 
+                            bool all_slots_ready = true;
                             for (int32_t tok = 0; tok < n_tokens; ++tok) {
                                 for (int32_t r = 0; r < n_expert_used; ++r) {
                                     const size_t idx = (size_t)tok * n_expert_used + r;
@@ -2326,15 +2327,70 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     const int32_t exp_id = ids[idx];
                                     if (exp_id >= 0 && exp_id < n_expert) {
                                         int32_t s = expert_slots[exp_id];
-                                        GGML_ASSERT(s >= 0 && s < n_slots);
-                                        remapped_ids[idx] = s;
-                                        if (expert_load[exp_id] == 0) {
-                                            ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
-                                            expert_load[exp_id] = 1;
+                                        if (s < 0 || s >= n_slots) {
+                                            all_slots_ready = false;
+                                        } else {
+                                            remapped_ids[idx] = s;
+                                            if (expert_load[exp_id] == 0) {
+                                                ggml_backend_expert_cache_record_zero_copy_hit(cache, input, exp_id, expert_size);
+                                                expert_load[exp_id] = 1;
+                                            }
                                         }
                                     }
                                 }
                             }
+
+                            if (!all_slots_ready) {
+                                // partition said all-hit but find_slot returned -1 for some
+                                // expert on this tensor (e.g. fused gate_up vs separate).
+                                // Fall back to CPU execution for the whole node.
+                                int cpu_backend_id = -1;
+                                for (int b = 0; b < sched->n_backends; b++) {
+                                    if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                        cpu_backend_id = b;
+                                        break;
+                                    }
+                                }
+                                if (cpu_backend_id >= 0 && ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                    const size_t in_bytes  = ggml_nbytes(node->src[1]);
+                                    const size_t out_bytes = ggml_nbytes(node);
+                                    if (sched->cpu_sched_act_x.size() < in_bytes) sched->cpu_sched_act_x.resize(in_bytes);
+                                    if (sched->cpu_sched_down_out.size() < out_bytes) sched->cpu_sched_down_out.resize(out_bytes);
+                                    ggml_backend_tensor_get_async(split_backend, node->src[1], sched->cpu_sched_act_x.data(), 0, in_bytes);
+                                    ggml_backend_synchronize(split_backend);
+                                    struct ggml_tensor cpu_src1 = *(node->src[1]);
+                                    cpu_src1.data = sched->cpu_sched_act_x.data();
+                                    cpu_src1.buffer = nullptr;
+                                    cpu_src1.view_src = nullptr;
+                                    struct ggml_tensor cpu_ids = *ids_tensor;
+                                    cpu_ids.data = ids.data();
+                                    cpu_ids.buffer = nullptr;
+                                    cpu_ids.view_src = nullptr;
+                                    struct ggml_tensor cpu_out = *node;
+                                    cpu_out.data = sched->cpu_sched_down_out.data();
+                                    cpu_out.buffer = nullptr;
+                                    cpu_out.view_src = nullptr;
+                                    cpu_out.src[0] = input;
+                                    cpu_out.src[1] = &cpu_src1;
+                                    cpu_out.src[2] = &cpu_ids;
+                                    struct ggml_tensor * cpu_nodes[1] = { &cpu_out };
+                                    struct ggml_tensor * cpu_leafs[3] = { input, &cpu_src1, &cpu_ids };
+                                    struct ggml_cgraph cpu_graph = {};
+                                    cpu_graph.n_nodes = 1;
+                                    cpu_graph.nodes = cpu_nodes;
+                                    cpu_graph.n_leafs = 3;
+                                    cpu_graph.leafs = cpu_leafs;
+                                    ggml_backend_graph_compute(sched->backends[cpu_backend_id], &cpu_graph);
+                                    ggml_backend_tensor_set_async(split_backend, node, sched->cpu_sched_down_out.data(), 0, out_bytes);
+                                    ggml_backend_synchronize(split_backend);
+                                    node->op = GGML_OP_NONE;
+                                    restored_nodes.push_back({ node, input_cpy, ids_tensor, node->op });
+                                } else {
+                                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                                        ggml_backend_tensor_copy(input, input_cpy);
+                                    }
+                                }
+                            } else {
 
                             for (const int32_t exp_id : requested_experts) {
                                 if (expert_slots[exp_id] >= 0) {
@@ -2398,6 +2454,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             node->src[2] = remapped_ids_tensor;
                             restored_nodes.push_back({ node, input_cpy, ids_tensor, node->op });
                             used_zero_copy = true;
+                        }
                         } else {
                             if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                                 ggml_backend_tensor_copy(input, input_cpy);
