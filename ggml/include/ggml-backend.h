@@ -433,6 +433,7 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_expert_cache_rebalance_partial(ggml_backend_sched_t sched, int max_swaps);
     GGML_API void                 ggml_backend_sched_register_host_memory(ggml_backend_sched_t sched, const struct ggml_tensor * tensor);
     GGML_API void                 ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched);
+    GGML_API bool                 ggml_backend_sched_load_pinned_manifest(ggml_backend_sched_t sched, const char * manifest_path);
 
     //
     // Meta backend

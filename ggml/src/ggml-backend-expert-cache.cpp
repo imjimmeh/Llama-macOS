@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -61,6 +63,7 @@ struct ggml_expert_cache_slot_entry {
     uint64_t last_used = 0;
     uint64_t hit_count = 0;
     uint32_t access_in_window = 0;
+    bool is_pinned = false;
     ggml_backend_event_t last_use_event = nullptr;
     ggml_backend_event_t load_event = nullptr;
 };
@@ -147,6 +150,11 @@ struct ggml_backend_expert_cache {
     std::vector<std::pair<uintptr_t, size_t>> registered_host_ranges;
     size_t registered_host_bytes = 0;
     size_t max_registered_host_bytes = 1024 * 1024 * 1024; // 1 GiB safety cap
+
+    // Epic 4: Static Pinned Expert Manifests & Heterogeneous Routing
+    std::set<std::pair<int32_t, int32_t>> pinned_bundles;
+    bool is_static_manifest_loaded = false;
+    bool zero_miss_upload = true;
 
     struct ggml_backend_expert_cache_stats stats;
 };
@@ -907,7 +915,7 @@ int32_t ggml_backend_expert_cache_claim_slot_idx(
 
     for (int32_t s = 0; s < pool->max_slots; s++) {
         const auto & slot = pool->slots[s];
-        if (slot.tensor == NULL || slot.state == GGML_EXPERT_CACHE_SLOT_LOADING) continue;
+        if (slot.tensor == NULL || slot.state == GGML_EXPERT_CACHE_SLOT_LOADING || slot.is_pinned) continue;
 
         bool is_pinned = false;
         if (pinned_keys != NULL && n_pinned > 0) {
@@ -929,7 +937,7 @@ int32_t ggml_backend_expert_cache_claim_slot_idx(
     if (victim_slot == -1) {
         for (int32_t s = 0; s < pool->max_slots; s++) {
             const auto & slot = pool->slots[s];
-            if (slot.tensor == NULL || slot.state == GGML_EXPERT_CACHE_SLOT_LOADING) continue;
+            if (slot.tensor == NULL || slot.state == GGML_EXPERT_CACHE_SLOT_LOADING || slot.is_pinned) continue;
 
             bool is_pinned = false;
             if (pinned_keys != NULL && n_pinned > 0) {
@@ -1188,6 +1196,38 @@ void ggml_backend_expert_cache_register_bundle(
         return;
     }
     cache->bundle_registrations[layer] = { gate_tensor, up_tensor, down_tensor };
+
+    if (cache->is_static_manifest_loaded) {
+        for (const auto & entry : cache->pinned_bundles) {
+            if (entry.first == layer) {
+                int32_t expert_id = entry.second;
+                if (gate_tensor && gate_tensor->data != NULL) {
+                    ggml_backend_expert_cache_seed(cache, gate_tensor, expert_id, 1000);
+                    int32_t s = ggml_backend_expert_cache_find_slot(cache, gate_tensor, expert_id);
+                    if (s >= 0) {
+                        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, gate_tensor);
+                        if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                    }
+                }
+                if (up_tensor && up_tensor->data != NULL) {
+                    ggml_backend_expert_cache_seed(cache, up_tensor, expert_id, 1000);
+                    int32_t s = ggml_backend_expert_cache_find_slot(cache, up_tensor, expert_id);
+                    if (s >= 0) {
+                        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, up_tensor);
+                        if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                    }
+                }
+                if (down_tensor && down_tensor->data != NULL) {
+                    ggml_backend_expert_cache_seed(cache, down_tensor, expert_id, 1000);
+                    int32_t s = ggml_backend_expert_cache_find_slot(cache, down_tensor, expert_id);
+                    if (s >= 0) {
+                        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, down_tensor);
+                        if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                    }
+                }
+            }
+        }
+    }
 }
 
 bool ggml_backend_expert_cache_is_bundle_resident(
@@ -1642,4 +1682,102 @@ void ggml_backend_expert_cache_sync(ggml_backend_expert_cache_t cache) {
         return;
     }
     ggml_backend_synchronize(cache->backend);
+}
+
+bool ggml_backend_expert_cache_load_pinned_manifest(
+        ggml_backend_expert_cache_t cache,
+        const char * manifest_json_path) {
+    if (cache == NULL || manifest_json_path == NULL || manifest_json_path[0] == '\0') {
+        return false;
+    }
+
+    std::ifstream ifs(manifest_json_path);
+    if (!ifs.is_open()) {
+        fprintf(stderr, "%s: failed to open manifest '%s'\n", __func__, manifest_json_path);
+        return false;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(ifs)),
+                         std::istreambuf_iterator<char>());
+    ifs.close();
+
+    cache->pinned_bundles.clear();
+
+    size_t pos = 0;
+    while ((pos = content.find("\"layer\"", pos)) != std::string::npos) {
+        size_t colon = content.find(':', pos);
+        if (colon == std::string::npos) break;
+        int layer = atoi(content.c_str() + colon + 1);
+
+        size_t exp_pos = content.find("\"expert_id\"", colon);
+        if (exp_pos == std::string::npos) break;
+        size_t exp_colon = content.find(':', exp_pos);
+        if (exp_colon == std::string::npos) break;
+        int expert_id = atoi(content.c_str() + exp_colon + 1);
+
+        cache->pinned_bundles.insert({ layer, expert_id });
+        pos = exp_colon + 1;
+    }
+
+    cache->is_static_manifest_loaded = true;
+    cache->zero_miss_upload = true;
+
+    fprintf(stderr, "%s: loaded %zu static pinned experts from '%s'\n",
+        __func__, cache->pinned_bundles.size(), manifest_json_path);
+
+    for (const auto & entry : cache->pinned_bundles) {
+        int32_t layer = entry.first;
+        int32_t expert_id = entry.second;
+
+        auto reg_it = cache->bundle_registrations.find(layer);
+        if (reg_it != cache->bundle_registrations.end()) {
+            if (reg_it->second.gate && reg_it->second.gate->data != NULL) {
+                ggml_backend_expert_cache_seed(cache, reg_it->second.gate, expert_id, 1000);
+                int32_t s = ggml_backend_expert_cache_find_slot(cache, reg_it->second.gate, expert_id);
+                if (s >= 0) {
+                    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg_it->second.gate);
+                    if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                }
+            }
+            if (reg_it->second.up && reg_it->second.up->data != NULL) {
+                ggml_backend_expert_cache_seed(cache, reg_it->second.up, expert_id, 1000);
+                int32_t s = ggml_backend_expert_cache_find_slot(cache, reg_it->second.up, expert_id);
+                if (s >= 0) {
+                    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg_it->second.up);
+                    if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                }
+            }
+            if (reg_it->second.down && reg_it->second.down->data != NULL) {
+                ggml_backend_expert_cache_seed(cache, reg_it->second.down, expert_id, 1000);
+                int32_t s = ggml_backend_expert_cache_find_slot(cache, reg_it->second.down, expert_id);
+                if (s >= 0) {
+                    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg_it->second.down);
+                    if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+bool ggml_backend_expert_cache_is_pinned(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        int32_t expert_id) {
+    if (cache == NULL) return false;
+    return cache->pinned_bundles.count({ layer, expert_id }) > 0;
+}
+
+void ggml_backend_expert_cache_set_zero_miss_upload(
+        ggml_backend_expert_cache_t cache,
+        bool enabled) {
+    if (cache != NULL) {
+        cache->zero_miss_upload = enabled;
+    }
+}
+
+bool ggml_backend_expert_cache_get_zero_miss_upload(
+        ggml_backend_expert_cache_t cache) {
+    return cache != NULL ? cache->zero_miss_upload : true;
 }

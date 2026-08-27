@@ -2839,6 +2839,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.expert_cache_persist = false;
         }
     ));
+    add_opt(common_arg(
+        {"-pe", "--pinned-experts"}, "PATH",
+        "path to static pinned experts JSON manifest (Epic 4)",
+        [](common_params & params, const std::string & value) {
+            params.pinned_experts_manifest = value;
+        }
+    ).set_env("LLAMA_ARG_PINNED_EXPERTS"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

@@ -326,6 +326,23 @@ GGML_API bool ggml_backend_expert_cache_record_slot_use(
 GGML_API void ggml_backend_expert_cache_sync(
     ggml_backend_expert_cache_t cache);
 
+// Epic 4: Static Pinned Expert Manifests & Heterogeneous Routing
+GGML_API bool ggml_backend_expert_cache_load_pinned_manifest(
+    ggml_backend_expert_cache_t cache,
+    const char * manifest_json_path);
+
+GGML_API bool ggml_backend_expert_cache_is_pinned(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    int32_t expert_id);
+
+GGML_API void ggml_backend_expert_cache_set_zero_miss_upload(
+    ggml_backend_expert_cache_t cache,
+    bool enabled);
+
+GGML_API bool ggml_backend_expert_cache_get_zero_miss_upload(
+    ggml_backend_expert_cache_t cache);
+
 #ifdef __cplusplus
 }
 #endif

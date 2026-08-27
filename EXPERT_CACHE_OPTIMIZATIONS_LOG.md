@@ -1205,3 +1205,39 @@ Across the 40 layers of `Qwen3.6-35B-A3B`:
 Static hot expert ranking provides substantial route coverage (over 50% at 512 MiB,
 over 71% at 1024 MiB). Proceed to implement heterogeneous route execution (GPU
 Hits || CPU Misses with zero synchronous miss uploads) and benchmark the pinned tiers.
+
+## Heterogeneous Route Execution and Gate B Decision (2026-08-27)
+
+### Change
+
+Implemented Epic 4 true heterogeneous routing:
+- Added static pinned manifest loader `ggml_backend_expert_cache_load_pinned_manifest`
+  and scheduler wrapper `ggml_backend_sched_load_pinned_manifest`.
+- Added `--pinned-experts` / `-pe` CLI parameter in `common/arg.cpp` and wired
+  into `common_init_from_params`.
+- Implemented **zero-miss-upload discipline**: missing experts are never uploaded
+  across PCIe during timed decode.
+- Built `tests/test-moe-heterogeneous-bench.cpp` to evaluate the 64, 128, 256, 512,
+  and 1024 MiB pinned tiers against the pure CPU MoE control baseline on
+  `Qwen3.6-35B-A3B-APEX-Compact.gguf` (14 CPU threads, GTX 1080 GPU, Flash Attention,
+  256 MiB fit target).
+
+### Benchmark Results (Gate B Comparative Sweep)
+
+| Configuration | Model Load (s) | TG Speed (tok/s) | TG Latency (ms/tok) | PCIe RAM->GPU Bytes | Speedup vs Control |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **CPU Baseline (Control)** | 42.69 s | 2.39 tok/s | 418.73 ms | **0 B** | **1.00x** (control) |
+| **Pinned 64 MiB** | 52.56 s | 2.42 tok/s | 412.37 ms | **0 B** | **1.02x** (+1.3%) |
+| **Pinned 128 MiB** | 40.69 s | 2.39 tok/s | 417.84 ms | **0 B** | **1.00x** (+0.2%) |
+| **Pinned 256 MiB** | 54.03 s | 2.48 tok/s | 403.06 ms | **0 B** | **1.04x** (+3.7%) |
+| **Pinned 512 MiB** | 59.60 s | 2.51 tok/s | 398.62 ms | **0 B** | **1.05x** (+5.0%) |
+| **Pinned 1024 MiB** | 51.11 s | **3.78 tok/s** | **264.33 ms** | **0 B** | **1.58x (+58.4%)** |
+
+### Decision: Gate B Passed (Outcome A)
+
+The static heterogeneous hybrid achieves **+58.4% speedup (1.58x, 2.39 tok/s -> 3.78 tok/s)**
+on the 1024 MiB pinned tier with **EXACTLY 0 bytes of in-band PCIe miss uploads**.
+Prompt processing speed also increased from 29.7 tok/s to 110.8 tok/s (3.73x speedup).
+
+The optimization roadmap proceeds to **Epic 5 (Non-blocking Background Promotion)**
+and **Epic 6 (GPU-Side Zero-Sync Route Remapping)**.

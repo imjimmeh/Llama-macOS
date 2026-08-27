@@ -1438,6 +1438,13 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_expert_cache_load_profile(lctx, model, profile_path);
     }
 
+    if (!params.pinned_experts_manifest.empty()) {
+        ggml_backend_sched_t sched = llama_context_get_sched(lctx);
+        if (sched) {
+            ggml_backend_sched_load_pinned_manifest(sched, params.pinned_experts_manifest.c_str());
+        }
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {

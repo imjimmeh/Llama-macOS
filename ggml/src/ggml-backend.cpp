@@ -2289,86 +2289,89 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         // 2. Process misses: copy PCIe to input_cpy (+ populate cache if on-demand LRU mode)
-                        const bool is_periodic = ggml_backend_expert_cache_get_period(cache) > 0;
-                        const bool allow_lru_insert = !is_periodic && (ids_tensor->ne[1] == 1);
+                        const bool zero_miss_upload = ggml_backend_expert_cache_get_zero_miss_upload(cache);
+                        if (!zero_miss_upload) {
+                            const bool is_periodic = ggml_backend_expert_cache_get_period(cache) > 0;
+                            const bool allow_lru_insert = !is_periodic && (ids_tensor->ne[1] == 1);
 
-                        auto copy_miss_range = [&](int32_t first_id, int32_t last_id) {
-                            const size_t expert_offset = (size_t)first_id * expert_size;
-                            const size_t expert_size_copy = (size_t)(last_id - first_id + 1) * expert_size;
-                            const size_t padding = std::min<size_t>(expert_size, (size_t)512);
-                            const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                            auto copy_miss_range = [&](int32_t first_id, int32_t last_id) {
+                                const size_t expert_offset = (size_t)first_id * expert_size;
+                                const size_t expert_size_copy = (size_t)(last_id - first_id + 1) * expert_size;
+                                const size_t padding = std::min<size_t>(expert_size, (size_t)512);
+                                const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
-                            ggml_backend_tensor_set_async(split_backend,
-                                input_cpy,
-                                (const uint8_t *)input->data + expert_offset, expert_offset,
-                                expert_size_copy + padding_end);
+                                ggml_backend_tensor_set_async(split_backend,
+                                    input_cpy,
+                                    (const uint8_t *)input->data + expert_offset, expert_offset,
+                                    expert_size_copy + padding_end);
 
-                            if (allow_lru_insert) {
-                                for (int32_t mid = first_id; mid <= last_id; mid++) {
-                                    size_t slot_offset = ggml_backend_expert_cache_alloc_slot(
-                                        cache, input, mid, expert_size,
-                                        pinned_keys.data(), pinned_keys.size());
+                                if (allow_lru_insert) {
+                                    for (int32_t mid = first_id; mid <= last_id; mid++) {
+                                        size_t slot_offset = ggml_backend_expert_cache_alloc_slot(
+                                            cache, input, mid, expert_size,
+                                            pinned_keys.data(), pinned_keys.size());
 
-                                    if (slot_offset != SIZE_MAX) {
-                                        const size_t src_off = (size_t)mid * expert_size;
-                                        const size_t copy_size = expert_size;
+                                        if (slot_offset != SIZE_MAX) {
+                                            const size_t src_off = (size_t)mid * expert_size;
+                                            const size_t copy_size = expert_size;
 
-                                        struct ggml_tensor src_view = *input_cpy;
-                                        src_view.type = GGML_TYPE_I8;
-                                        src_view.data = (uint8_t *)input_cpy->data + src_off;
-                                        src_view.ne[0] = copy_size;
-                                        src_view.ne[1] = 1;
-                                        src_view.ne[2] = 1;
-                                        src_view.ne[3] = 1;
-                                        src_view.nb[0] = 1;
-                                        src_view.nb[1] = copy_size;
-                                        src_view.nb[2] = copy_size;
-                                        src_view.nb[3] = copy_size;
-                                        src_view.view_src = input_cpy;
+                                            struct ggml_tensor src_view = *input_cpy;
+                                            src_view.type = GGML_TYPE_I8;
+                                            src_view.data = (uint8_t *)input_cpy->data + src_off;
+                                            src_view.ne[0] = copy_size;
+                                            src_view.ne[1] = 1;
+                                            src_view.ne[2] = 1;
+                                            src_view.ne[3] = 1;
+                                            src_view.nb[0] = 1;
+                                            src_view.nb[1] = copy_size;
+                                            src_view.nb[2] = copy_size;
+                                            src_view.nb[3] = copy_size;
+                                            src_view.view_src = input_cpy;
 
-                                        struct ggml_tensor dst_view = *cache_tensor;
-                                        dst_view.type = GGML_TYPE_I8;
-                                        dst_view.data = (uint8_t *)cache_tensor->data + slot_offset;
-                                        dst_view.ne[0] = copy_size;
-                                        dst_view.ne[1] = 1;
-                                        dst_view.ne[2] = 1;
-                                        dst_view.ne[3] = 1;
-                                        dst_view.nb[0] = 1;
-                                        dst_view.nb[1] = copy_size;
-                                        dst_view.nb[2] = copy_size;
-                                        dst_view.nb[3] = copy_size;
-                                        dst_view.view_src = cache_tensor;
+                                            struct ggml_tensor dst_view = *cache_tensor;
+                                            dst_view.type = GGML_TYPE_I8;
+                                            dst_view.data = (uint8_t *)cache_tensor->data + slot_offset;
+                                            dst_view.ne[0] = copy_size;
+                                            dst_view.ne[1] = 1;
+                                            dst_view.ne[2] = 1;
+                                            dst_view.ne[3] = 1;
+                                            dst_view.nb[0] = 1;
+                                            dst_view.nb[1] = copy_size;
+                                            dst_view.nb[2] = copy_size;
+                                            dst_view.nb[3] = copy_size;
+                                            dst_view.view_src = cache_tensor;
 
-                                        ggml_backend_tensor_copy_async(split_backend, split_backend, &src_view, &dst_view);
+                                            ggml_backend_tensor_copy_async(split_backend, split_backend, &src_view, &dst_view);
+                                        }
                                     }
                                 }
+                            };
+
+                            int mid = 0;
+                            while (mid < n_expert && !ggml_bitset_get(miss_bitset.data(), mid)) {
+                                mid++;
                             }
-                        };
+                            if (mid < n_expert) {
+                                int32_t first_id = mid;
+                                int32_t last_id = first_id;
 
-                        int mid = 0;
-                        while (mid < n_expert && !ggml_bitset_get(miss_bitset.data(), mid)) {
-                            mid++;
-                        }
-                        if (mid < n_expert) {
-                            int32_t first_id = mid;
-                            int32_t last_id = first_id;
+                                for (++mid; mid < n_expert; ++mid) {
+                                    if (!ggml_bitset_get(miss_bitset.data(), mid)) {
+                                        continue;
+                                    }
 
-                            for (++mid; mid < n_expert; ++mid) {
-                                if (!ggml_bitset_get(miss_bitset.data(), mid)) {
-                                    continue;
-                                }
+                                    if (mid == last_id + 1) {
+                                        last_id = mid;
+                                        continue;
+                                    }
 
-                                if (mid == last_id + 1) {
+                                    copy_miss_range(first_id, last_id);
+
+                                    first_id = mid;
                                     last_id = mid;
-                                    continue;
                                 }
-
                                 copy_miss_range(first_id, last_id);
-
-                                first_id = mid;
-                                last_id = mid;
                             }
-                            copy_miss_range(first_id, last_id);
                         }
                         }
                     }
@@ -2907,6 +2910,23 @@ void ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched) {
             ggml_backend_expert_cache_sync(sched->expert_caches[b]);
         }
     }
+}
+
+bool ggml_backend_sched_load_pinned_manifest(
+        ggml_backend_sched_t sched,
+        const char * manifest_path) {
+    if (sched == NULL || manifest_path == NULL) {
+        return false;
+    }
+    bool any_success = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b]) {
+            if (ggml_backend_expert_cache_load_pinned_manifest(sched->expert_caches[b], manifest_path)) {
+                any_success = true;
+            }
+        }
+    }
+    return any_success;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

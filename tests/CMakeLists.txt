@@ -358,4 +358,5 @@ llama_build_and_test(test-mtp-dynamic-offload.cpp)
 llama_build(test-benchmark-mtp.cpp)
 llama_build(test-moe-oracle-bench.cpp)
 llama_build(test-moe-tg-profiler.cpp)
+llama_build(test-moe-heterogeneous-bench.cpp)
 
