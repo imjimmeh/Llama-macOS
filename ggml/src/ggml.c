@@ -547,11 +547,13 @@ void ggml_time_init(void) {
     InitOnceExecuteOnce(&once, ggml_time_init_once, NULL, NULL);
 }
 int64_t ggml_time_ms(void) {
+    ggml_time_init();
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
     return ((t.QuadPart-timer_start) * 1000) / timer_freq;
 }
 int64_t ggml_time_us(void) {
+    ggml_time_init();
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
     return ((t.QuadPart-timer_start) * 1000000) / timer_freq;

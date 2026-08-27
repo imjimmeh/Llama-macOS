@@ -1,0 +1,10 @@
+{
+  "model": "qwen3.6-35B-apex-compact",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello! What is 2 + 2?"
+    }
+  ],
+  "max_tokens": 50
+}

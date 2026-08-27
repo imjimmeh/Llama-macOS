@@ -184,8 +184,9 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    const int64_t ids_alloc_size = ne_get_rows + 256;
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ids_alloc_size);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ids_alloc_size);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and

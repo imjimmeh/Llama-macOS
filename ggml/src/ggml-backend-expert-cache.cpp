@@ -1463,7 +1463,10 @@ int32_t ggml_backend_expert_cache_partition_bundle_routes(
     const int32_t top_k = n_tokens > 0 ? (n_routes / n_tokens) : n_routes;
 
     auto bit = cache->bundle_registrations.find(layer);
-    const bool has_bundle = (bit != cache->bundle_registrations.end());
+    if (bit == cache->bundle_registrations.end()) {
+        return 0;
+    }
+    const bool has_bundle = true;
 
     for (int32_t i = 0; i < n_routes; i++) {
         const int32_t exp_id = router_ids[i];
@@ -1540,6 +1543,22 @@ bool ggml_backend_expert_cache_get_bundle_tensors(
     if (out_down)    *out_down    = it->second.down;
     if (out_gate_up) *out_gate_up = it->second.gate_up;
     return true;
+}
+
+bool ggml_backend_expert_cache_has_tensor(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor) {
+    if (cache == nullptr || tensor == nullptr) {
+        return false;
+    }
+    int32_t layer = ggml_backend_expert_cache_get_tensor_layer(tensor);
+    if (layer >= 0) {
+        auto bit = cache->bundle_registrations.find(layer);
+        if (bit != cache->bundle_registrations.end()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 struct ggml_tensor * ggml_backend_expert_cache_get_device_slot_map(ggml_backend_expert_cache_t cache) {

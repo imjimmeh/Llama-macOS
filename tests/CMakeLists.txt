@@ -360,4 +360,5 @@ llama_build(test-moe-oracle-bench.cpp)
 llama_build(test-moe-tg-profiler.cpp)
 llama_build(test-moe-heterogeneous-bench.cpp)
 llama_build(test-moe-dynamic-drift-bench.cpp)
+llama_build(test-fit-debug.cpp)
 

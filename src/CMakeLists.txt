@@ -68,3 +68,8 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
+
+if (MSVC)
+    target_compile_options(llama PRIVATE /Zi)
+    target_link_options(llama PRIVATE /DEBUG)
+endif()

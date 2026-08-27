@@ -241,6 +241,11 @@ if (GGML_OPENMP_ENABLED)
     target_link_libraries(ggml-base PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 endif()
 
+if (MSVC)
+    target_compile_options(ggml-base PRIVATE /Zi)
+    target_link_options(ggml-base PRIVATE /DEBUG)
+endif()
+
 add_library(ggml
             ggml-backend-dl.cpp
             ggml-backend-reg.cpp)

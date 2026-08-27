@@ -266,6 +266,10 @@ GGML_API bool ggml_backend_expert_cache_get_bundle_tensors(
     const struct ggml_tensor ** out_down,
     const struct ggml_tensor ** out_gate_up);
 
+GGML_API bool ggml_backend_expert_cache_has_tensor(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor);
+
 
 GGML_API void ggml_backend_expert_cache_record_all_hit_resolution(
     ggml_backend_expert_cache_t cache);

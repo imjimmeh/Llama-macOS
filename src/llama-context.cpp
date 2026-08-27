@@ -277,7 +277,7 @@ llama_context::llama_context(
         }
     }
 
-    cparams.op_offload = params.op_offload;
+    cparams.op_offload = params.op_offload || (params.expert_cache_size > 0);
     cparams.kv_unified = params.kv_unified;
 
     // initialized later
@@ -622,6 +622,10 @@ void llama_context::sched_reserve() {
                 continue;
             }
             const auto & layer = model.layers[il];
+            const struct ggml_tensor * ref_tensor = layer.attn_norm ? layer.attn_norm : (layer.wo ? layer.wo : layer.ffn_gate_inp);
+            if (ref_tensor && ggml_backend_buffer_is_host(ref_tensor->buffer)) {
+                continue; // layer executes on CPU, skip GPU expert cache registration
+            }
             const struct ggml_tensor * gate = layer.ffn_gate_exps ? layer.ffn_gate_exps : layer.ffn_gate_up_exps;
             const struct ggml_tensor * up   = layer.ffn_up_exps;
             const struct ggml_tensor * down = layer.ffn_down_exps;

@@ -220,7 +220,11 @@ static void common_params_fit_impl(
         margins.push_back(margins_s[0]);
     } else {
         for (size_t id = 0; id < nd; id++) {
-            margins.push_back(margins_s[id]);
+            int64_t margin = margins_s[id];
+            if (id == 0 && cparams != nullptr && cparams->expert_cache_size > 0 && cparams->expert_cache_size != (size_t)-1) {
+                margin += (int64_t)cparams->expert_cache_size;
+            }
+            margins.push_back(margin);
         }
     }
 
@@ -340,7 +344,8 @@ static void common_params_fit_impl(
                         //   - for MoE models only whole tensors can be assigned to devices, which we estimate to be <= 1/3 of a layer
                         //   - on average we expect a waste of 0.5 layers/tensors per device
                         //   - use slightly more than the expected average for nd devices to be safe
-                        const int64_t model_per_layer = sum_projected_model / std::min(uint32_t(mparams->n_gpu_layers), hp_ngl);
+                        const uint32_t divisor_layers = std::max(uint32_t(1), std::min(uint32_t(mparams->n_gpu_layers), hp_ngl));
+                        const int64_t model_per_layer = sum_projected_model / divisor_layers;
                         sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6);
                     }
 
@@ -356,11 +361,13 @@ static void common_params_fit_impl(
                     }
                     if (sum_used_target > sum_projected_used_min_ctx) {
                         // linear interpolation between minimum and maximum context size:
-                        cparams->n_ctx += (hp_nct - n_ctx_min) * (sum_used_target - sum_projected_used_min_ctx)
-                            / (sum_projected_used - sum_projected_used_min_ctx);
+                        const int64_t ctx_diff = sum_projected_used - sum_projected_used_min_ctx;
+                        if (ctx_diff > 0) {
+                            cparams->n_ctx += (hp_nct - n_ctx_min) * (sum_used_target - sum_projected_used_min_ctx) / ctx_diff;
+                        }
                         cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % 256, n_ctx_min); // round down context for CUDA backend
 
-                        const int64_t bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) / (hp_nct - n_ctx_min);
+                        const int64_t bytes_per_ctx = (hp_nct > n_ctx_min) ? (ctx_diff / (hp_nct - n_ctx_min)) : 0;
                         const int64_t memory_reduction = (hp_nct - cparams->n_ctx) * bytes_per_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
@@ -620,7 +627,8 @@ static void common_params_fit_impl(
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
                 while (delta > 1) {
-                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                    const int64_t mem_diff = mem_high[id] - mem[id];
+                    uint32_t step_size = (mem_diff > 0) ? (uint32_t)(int64_t(delta) * (targets[id] - mem[id]) / mem_diff) : 1;
                     step_size = std::max(step_size, uint32_t(1));
                     step_size = std::min(step_size, delta - 1);
 
@@ -656,7 +664,7 @@ static void common_params_fit_impl(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
-    if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
+    if (hp_nex == 0 || global_surplus_cpu_moe <= 0 || (cparams != nullptr && cparams->expert_cache_size > 0)) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }
@@ -692,7 +700,8 @@ static void common_params_fit_impl(
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
             while (delta > 1) {
-                uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                const int64_t mem_diff = mem_high[id] - mem[id];
+                uint32_t step_size = (mem_diff > 0) ? (uint32_t)(int64_t(delta) * (targets[id] - mem[id]) / mem_diff) : 1;
                 step_size = std::max(step_size, uint32_t(1));
                 step_size = std::min(step_size, delta - 1);
 
@@ -736,8 +745,9 @@ static void common_params_fit_impl(
                 __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
         }
 
-        // try to fit at least part of one more layer
-        if (ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
+        // try to fit at least part of one more layer (disabled for expert cache to keep MoE layers atomic)
+        const bool allow_split_moe_layers = (cparams == nullptr || cparams->expert_cache_size == 0);
+        if (allow_split_moe_layers && ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
             std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
             size_t id_dense_start_test = id_dense_start;
             ngl_per_device_test[id_dense_start_test].n_layer--;

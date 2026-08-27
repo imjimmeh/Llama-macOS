@@ -573,14 +573,16 @@ struct ggml_state {
 static struct ggml_state g_state = {0};
 
 void ggml_barrier(struct ggml_threadpool * tp) {
-    int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
-    if (n_threads == 1) {
-        return;
-    }
-
 #ifdef GGML_USE_OPENMP
     #pragma omp barrier
 #else
+    if (tp == NULL) {
+        return;
+    }
+    int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
+    if (n_threads <= 1) {
+        return;
+    }
     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
 
     // enter barrier (full seq-cst fence)
@@ -611,10 +613,16 @@ void ggml_barrier(struct ggml_threadpool * tp) {
 }
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
+    if (tp == NULL) {
+        return;
+    }
     atomic_store_explicit(&tp->current_chunk, value, memory_order_relaxed);
 }
 
 int ggml_threadpool_chunk_add(struct ggml_threadpool * tp, int value) {
+    if (tp == NULL) {
+        return 0;
+    }
     return atomic_fetch_add_explicit(&tp->current_chunk, value, memory_order_relaxed);
 }
 
@@ -1628,7 +1636,9 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                if (i02 < 0 || i02 >= n_as) {
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;

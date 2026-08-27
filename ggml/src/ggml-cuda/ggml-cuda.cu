@@ -1927,6 +1927,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            static int debug_count = 0;
+            if (debug_count++ < 5) {
+                int32_t host_ids[16] = {0};
+                cudaMemcpy(host_ids, ids->data, std::min((size_t)16 * sizeof(int32_t), (size_t)ggml_nbytes(ids)), cudaMemcpyDeviceToHost);
+                fprintf(stderr, "[DEBUG MUL_MAT_Q] dst=%s, ne0=[%lld,%lld,%lld], ne1=[%lld,%lld,%lld], ids_ne=[%lld,%lld], ids[0..7]=[%d,%d,%d,%d,%d,%d,%d,%d]\n",
+                    dst->name ? dst->name : "unnamed",
+                    (long long)src0->ne[0], (long long)src0->ne[1], (long long)src0->ne[2],
+                    (long long)src1->ne[0], (long long)src1->ne[1], (long long)src1->ne[2],
+                    (long long)ids->ne[0], (long long)ids->ne[1],
+                    host_ids[0], host_ids[1], host_ids[2], host_ids[3], host_ids[4], host_ids[5], host_ids[6], host_ids[7]);
+                fflush(stderr);
+            }
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -4170,6 +4182,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                cudaError_t err = cudaStreamSynchronize(cuda_ctx->stream());
+                if (err != cudaSuccess) {
+                    fprintf(stderr, "[CUDA FAIL] Op failed: %s (%s, node_idx=%d)\n", node->name ? node->name : "unnamed", ggml_op_name(node->op), i);
+                    fflush(stderr);
+                    CUDA_CHECK(err);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
