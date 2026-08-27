@@ -1032,8 +1032,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-                // check if a backend with higher prio wants to offload the op or has an expert cache
-                if ((sched->op_offload || tensor->op == GGML_OP_MUL_MAT_ID) && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                // cache-driven offload is only valid for single-token decode graphs,
+                // where sparse expert selection makes resident experts valuable.
+                // Prompt processing touches nearly all experts and must keep the normal
+                // bulk placement (op_offload only) - do not force MUL_MAT_ID onto GPU.
+                const bool is_decode_mul_mat_id =
+                    tensor->op == GGML_OP_MUL_MAT_ID &&
+                    tensor->src[2] != NULL &&
+                    tensor->src[2]->ne[1] == 1;
+                if ((sched->op_offload || is_decode_mul_mat_id) && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ((sched->expert_caches[b] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[b], src)) || ggml_backend_offload_op(sched->backends[b], tensor))) {
                             SET_CAUSE(tensor, "1.off");
@@ -2028,6 +2035,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         };
         std::vector<ggml_restored_node> restored_nodes;
 
+        // snapshot a node's original state before mutating it, so the scheduler can
+        // restore the graph after this split executes (idempotency across decode calls)
+        auto save_node_for_restore = [&](struct ggml_tensor * node) {
+            restored_nodes.push_back({
+                node,
+                node->src[0],
+                node->src[2],
+                node->op,
+            });
+        };
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -2096,7 +2114,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
 
-                if (cache_can_store) {
+                // Heterogeneous route execution (bundle partition, CPU miss path, slot
+                // remap, graph mutation) is a decode-time optimization for sparse expert
+                // selection. Batch prompt processing touches nearly every expert and
+                // benefits from the original bulk GPU/CPU path - do not intercept it.
+                const bool is_decode_route =
+                    node != NULL && node->src[2] != NULL && node->src[2]->ne[1] == 1;
+                if (cache_can_store && is_decode_route) {
                     const int64_t t_sync_start = ggml_time_us();
                     int64_t t_host_start = 0;
 
@@ -2300,8 +2324,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 //    Mark op = NONE so the GPU split skips recomputing it.
                                 ggml_backend_tensor_set_async(split_backend, node, sched->cpu_sched_down_out.data(), 0, out_bytes);
                                 ggml_backend_synchronize(split_backend);
+                                save_node_for_restore(node);
                                 node->op = GGML_OP_NONE;
-                                restored_nodes.push_back({ node, input_cpy, ids_tensor, node->op });
                             }
                         } else if (slot_tensor != NULL) {
                             remapped_ids.assign(ids.size(), -1);
@@ -2383,8 +2407,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     ggml_backend_graph_compute(sched->backends[cpu_backend_id], &cpu_graph);
                                     ggml_backend_tensor_set_async(split_backend, node, sched->cpu_sched_down_out.data(), 0, out_bytes);
                                     ggml_backend_synchronize(split_backend);
+                                    save_node_for_restore(node);
                                     node->op = GGML_OP_NONE;
-                                    restored_nodes.push_back({ node, input_cpy, ids_tensor, node->op });
                                 } else {
                                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                                         ggml_backend_tensor_copy(input, input_cpy);
@@ -2450,9 +2474,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                             GGML_ASSERT(slot_tensor->nb[2] == input->nb[2]);
 
+                            save_node_for_restore(node);
                             node->src[0] = slot_tensor;
                             node->src[2] = remapped_ids_tensor;
-                            restored_nodes.push_back({ node, input_cpy, ids_tensor, node->op });
                             used_zero_copy = true;
                         }
                         } else {
@@ -2485,7 +2509,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
-            ggml_backend_synchronize(split_backend);
+            // No full-device barrier here: inter-split ordering is handled by the
+            // scheduler's event dependencies so splits can overlap/queue on the stream.
         } else {
             // similar to ggml_backend_compare_graph_backend
             int j0 = 0;
@@ -2528,6 +2553,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             rn.node->src[0] = rn.orig_src0;
             rn.node->src[2] = rn.orig_src2;
             rn.node->op     = rn.orig_op;
+            // interceptions must restore the original MUL_MAT_ID so the graph is
+            // reusable next decode; a saved NONE means the node is permanently amputated
+            if (rn.orig_op == GGML_OP_NONE) {
+                fprintf(stderr, "%s: intercepted node %s/%s saved op=NONE\n",
+                        __func__, rn.node->name, ggml_op_name(rn.node->op));
+                GGML_ABORT("saved op must not be NONE");
+            }
         }
 
         // record the event of this copy
