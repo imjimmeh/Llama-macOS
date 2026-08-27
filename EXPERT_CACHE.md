@@ -192,9 +192,19 @@ Expert cache instances are allocated per accelerator backend:
 
 ### 5.1 Carry-Forward Route Prefetch (Experimental)
 
-`--expert-cache-prefetch` stores prior single-token route snapshots and prefetches at most one valid layer bundle on a later scheduler call. Snapshots are discarded on graph reset or step mismatch. It remains disabled by default, does not force host-resident MoE operations to CUDA, and is currently a correctness-preserving no-op for Compact normal decode.
+`--expert-cache-prefetch` stores prior host-visible route snapshots and
+prefetches at most one valid layer bundle on a later scheduler call. The
+current source can capture general small decode microbatches without copying
+device IDs; snapshots are discarded on graph reset or step mismatch. It
+remains disabled by default, does not force host-resident MoE operations to
+CUDA, and is currently a correctness-preserving no-op for normal Compact
+decode because that graph has no cache-eligible accelerator operation.
 
-The option is not the general route-aware dispatch design. It has no complete-bundle CPU-on-miss fallback, current-route decision boundary, bounded fill queue, route-generation identity, consumer-use ownership, or useful-after-fill admission policy. CUDA slot lookup now waits for load-event completion when the backend provides event queries.
+The option is not the general route-aware dispatch design. It has no
+complete-bundle CPU-on-miss fallback, current-route decision boundary, bounded
+fill queue, route-generation identity, consumer-use ownership, or
+useful-after-fill admission policy. CUDA slot lookup now waits for load-event
+completion when the backend provides event queries.
 ---
 
 ## 6. Known Issues

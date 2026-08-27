@@ -1085,3 +1085,23 @@ default.
 Keep host-route capture disabled by default. It remains an experimental path
 until a full deterministic control/enabled pair completes and confirms that
 prefetch traffic does not change placement or add load-time/runtime stalls.
+
+## Focused Route-Plan Integration Verification (2026-08-26)
+
+```text
+cmake --build build --config Release --target test-expert-cache test-expert-cache-profile test-mtp-dynamic-offload test-backend-ops
+Result: PASS
+build/bin/Release/test-expert-cache.exe
+Result: PASS - all cache, route-plan, lifecycle, and multi-token remap tests
+build/bin/Release/test-expert-cache-profile.exe
+Result: PASS - all profile seed/export and slot integrity tests
+build/bin/Release/test-mtp-dynamic-offload.exe
+Result: PASS - all parameter, parsing, and layer budget tests
+build/bin/Release/test-backend-ops.exe test -o MUL_MAT_ID -j 1
+Result: PASS - 869/869 tests, CUDA0 backend OK
+```
+
+The operation matrix covers `MUL_MAT_ID` token dimensions including one, four,
+five, seventeen, thirty-two, and one hundred twenty-nine rows across supported
+types. This verifies backend numerical support across batch bands; it does not
+claim route-aware dispatch or cache throughput.

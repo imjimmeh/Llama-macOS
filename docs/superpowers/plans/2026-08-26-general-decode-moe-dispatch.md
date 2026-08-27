@@ -21,7 +21,15 @@
 - Every source or behavior change requires a focused test result, deterministic server result, control-versus-enabled benchmark, and a dated append to `EXPERT_CACHE_OPTIMIZATIONS_LOG.md`, including rejected and no-effect results.
 - Throughput claims require five alternating fresh-process control/enabled pairs with fixed model placement, persistence disabled, identical binary/model/options, raw rows, median, mean, standard deviation, TG and PP separately, and causal cache telemetry.
 - MTP comparisons must report target calls, accepted drafts, target tokens, dynamic-promotion state, and VRAM placement. Do not compare rows whose placement differs.
-- Never commit, push, create a PR, or rewrite historical evidence. `EXPERT_CACHE_OPTIMIZATIONS_LOG.md` is append-only.
+- Commits are allowed because the user explicitly requested them; each commit uses an `Assisted-by: OpenAI Codex` trailer. Never push or create a PR.
+
+## Implementation checkpoint (2026-08-26)
+
+- Tasks 1 and 2 are complete: route census, benchmark schema, nonblocking event query, completion-gated slot lookup, and consumer-use event recording.
+- Task 3 is partial: shared route-plan grouping and host-visible route capture exist, but the scheduler does not yet execute a router checkpoint before backend dispatch.
+- Task 4 is partial: the zero-copy path now requires an already complete full hit; a missing route uses the existing copied-tensor fallback. CPU-on-miss dispatch is not implemented.
+- Tasks 5 and 6 remain conditional: no bounded CPU-fallback fill queue or workload-separated route dispatcher has been retained.
+- Current Compact TG remains CPU-routed with zero cache requests. The forced placement diagnostic remains rejected.
 
 ---
 
@@ -488,4 +496,4 @@ cmake --build build --config Release --target test-expert-cache test-expert-cach
 - [ ] Re-run every retained alternating benchmark matrix and include cache-off, CPU fallback, GPU full-hit, and bounded-fill rows where applicable.
 - [ ] Append the full evidence, rejected paths, placement records, and final decision to `EXPERT_CACHE_OPTIMIZATIONS_LOG.md` without editing earlier sections.
 - [ ] Update `EXPERT_CACHE.md` only with verified current behavior. Do not present this proposed design or a planned mixed path as implemented.
-- [ ] Do not commit, push, or create a PR. Present the changed-file list and evidence bundle to the human for review.
+- [ ] Do not push or create a PR. Commit only user-authorized changes with the required `Assisted-by: OpenAI Codex` trailer.

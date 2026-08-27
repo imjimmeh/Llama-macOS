@@ -656,6 +656,13 @@ struct server_slot {
                                 ec_stats.n_mul_mat_id_inputs, ec_stats.n_eligible_ops, ec_stats.n_capacity_bypasses, ec_stats.n_cpu_backend_bypasses, ec_stats.n_non_host_weight_bypasses);
                     }
                 }
+                SLT_INF(*this,
+                        "expert route census = %" PRIu64 " nodes, %" PRIu64 " plans, %" PRIu64 " CPU-host, %" PRIu64 " non-CPU-host, %" PRIu64 " non-host, batch bands [1=%" PRIu64 ", 2-8=%" PRIu64 ", 9-31=%" PRIu64 ", 32+=%" PRIu64 "]\n",
+                        ec_stats.n_route_census_nodes, ec_stats.n_route_census_plans,
+                        ec_stats.n_route_census_cpu_host_nodes, ec_stats.n_route_census_non_cpu_host_nodes,
+                        ec_stats.n_route_census_non_host_nodes, ec_stats.n_route_census_batch_1,
+                        ec_stats.n_route_census_batch_2_8, ec_stats.n_route_census_batch_9_31,
+                        ec_stats.n_route_census_batch_32_plus);
             }
         }
     }
