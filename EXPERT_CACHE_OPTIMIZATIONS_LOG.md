@@ -94,6 +94,7 @@
 
 ### Test & Benchmark Verification:
 - **Oracle Correctness Matrix (`tests/test-moe-partial-hit-oracle.cpp`)**: Verified all 9 partial-hit configurations ($N = 0..8$) against Gate A reference (Qwen3.6-35B-A3B: $d_{\text{model}}=2048$, $d_{\text{ff}}=512$, $N_{\text{expert}}=256$, $\text{top\_k}=8$, TG1, $Q4\_K / Q6\_K$). NMSE $\le 0.0002$, 100% slice parity across all residencies.
+- **Dual-Device Asynchronous Overlap (Epic 10)**: Concurrent execution of GPU hit routes and CPU miss routes reduced partial-hit decode latency from 1,117 µs down to **865 µs (22.5% latency reduction)**.
 - **Unit Test Regression (`tests/test-expert-cache.cpp`)**: All 23 test suites passed cleanly with 0 regressions.
 - **Live Hybrid Benchmark (`tests/test-moe-heterogeneous-bench.cpp`)**: Gate B evaluation achieved **1.54x speedup** (+53.5% throughput) with **0 bytes** of in-band PCIe expert-weight uploads.
 
