@@ -58,15 +58,14 @@ static heterogeneous_bench_result run_tier_bench(
 
     common_params params;
     params.model.path = model_path;
-    if (isolate_dense) {
-        params.n_gpu_layers = 99;
-        params.fit_params = false;
-    } else {
-        params.n_gpu_layers = -1;
-        params.fit_params = true;
-        params.fit_params_target = std::vector<size_t>(llama_max_devices(), fit_target_bytes);
-        params.fit_params_min_ctx = n_prompt + n_gen + 256;
-    }
+    params.n_gpu_layers = -1;
+    params.fit_params = true;
+    params.fit_params_target = std::vector<size_t>(llama_max_devices(), fit_target_bytes + cache_bytes);
+    params.fit_params_min_ctx = n_prompt + n_gen + 256;
+    params.cache_type_k = GGML_TYPE_Q8_0;
+    params.cache_type_v = GGML_TYPE_Q8_0;
+    params.n_batch = 4096;
+    params.n_ubatch = 2048;
     params.cpuparams.n_threads = n_threads;
     params.cpuparams_batch.n_threads = n_threads;
     params.n_ctx = n_prompt + n_gen + 256;
@@ -167,6 +166,12 @@ int main(int argc, char ** argv) {
     size_t fit_target_bytes = 256 * 1024 * 1024; // 256 MiB VRAM margin
     bool isolate_dense = true;
 
+    std::string single_tier_name = "";
+    std::string single_manifest = "";
+    size_t single_cache_bytes = 0;
+    bool single_tier_mode = false;
+    bool output_json = false;
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
             model_path = argv[++i];
@@ -180,7 +185,32 @@ int main(int argc, char ** argv) {
             fit_target_bytes = (size_t)atoi(argv[++i]) * 1024 * 1024;
         } else if (strcmp(argv[i], "--fit") == 0) {
             isolate_dense = false;
+        } else if (strcmp(argv[i], "--tier-name") == 0 && i + 1 < argc) {
+            single_tier_name = argv[++i];
+            single_tier_mode = true;
+        } else if (strcmp(argv[i], "--manifest") == 0 && i + 1 < argc) {
+            single_manifest = argv[++i];
+        } else if (strcmp(argv[i], "--cache-mb") == 0 && i + 1 < argc) {
+            single_cache_bytes = (size_t)atoi(argv[++i]) * 1024 * 1024;
+            single_tier_mode = true;
+        } else if (strcmp(argv[i], "--json") == 0) {
+            output_json = true;
         }
+    }
+
+    if (single_tier_mode) {
+        llama_backend_init();
+        auto r = run_tier_bench(model_path, single_tier_name.empty() ? "Custom Tier" : single_tier_name, single_manifest, single_cache_bytes, n_prompt, n_gen, fit_target_bytes, n_threads, isolate_dense);
+        if (output_json) {
+            printf("\n__JSON_RESULT_START__\n");
+            printf("{\"tier\": \"%s\", \"tg_tps\": %.4f, \"tg_ms\": %.2f, \"pp_tps\": %.2f, \"hits\": %llu, \"requests\": %llu, \"ram_to_gpu\": %llu, \"hit_rate\": %.2f}\n",
+                r.tier_name.c_str(), r.tg_tps, r.tg_ms_per_tok, r.pp_tps,
+                (unsigned long long)r.n_hits, (unsigned long long)r.n_requests,
+                (unsigned long long)r.bytes_ram_to_gpu, r.hit_rate_pct);
+            printf("__JSON_RESULT_END__\n");
+        }
+        llama_backend_free();
+        return 0;
     }
 
     printf("================================================================================\n");

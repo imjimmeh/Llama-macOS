@@ -9,9 +9,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <numeric>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -508,13 +510,22 @@ static void compute_mixed_partial_hit(
         }
     }
 
-    // 1. Execute GPU hit routes
     std::vector<float> gpu_route_out;
-    execute_gpu_hit_routes(moec, n_gpu_hits, hit_descs, gpu_route_out);
-
-    // 2. Execute CPU miss routes
     std::vector<float> cpu_route_out;
-    execute_cpu_miss_routes(moec, n_misses, miss_descs, cpu_route_out);
+
+    if (n_gpu_hits > 0 && n_misses > 0) {
+        // Epic 10: Asynchronous Dual-Device Overlap
+        auto fut_gpu = std::async(std::launch::async, [&]() {
+            execute_gpu_hit_routes(moec, n_gpu_hits, hit_descs, gpu_route_out);
+        });
+
+        execute_cpu_miss_routes(moec, n_misses, miss_descs, cpu_route_out);
+        fut_gpu.get();
+    } else if (n_gpu_hits > 0) {
+        execute_gpu_hit_routes(moec, n_gpu_hits, hit_descs, gpu_route_out);
+    } else {
+        execute_cpu_miss_routes(moec, n_misses, miss_descs, cpu_route_out);
+    }
 
     // 3. Scatter merge both into canonical route layout
     for (int32_t k = 0; k < n_gpu_hits; k++) {
