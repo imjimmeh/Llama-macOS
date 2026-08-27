@@ -36,7 +36,7 @@ enum ggml_expert_cache_slot_state {
     GGML_EXPERT_CACHE_SLOT_RESIDENT  = 2,
 };
 
-// Bundle route descriptor
+// Canonical MoE route descriptor (Epic 2)
 struct ggml_cache_route_bundle {
     int32_t token;
     int32_t route;
@@ -44,7 +44,28 @@ struct ggml_cache_route_bundle {
     int32_t gate_slot;
     int32_t up_slot;
     int32_t down_slot;
-    bool    is_bundle_hit;
+    int32_t gate_up_slot;
+    bool    bundle_resident;
+    bool    is_bundle_hit; // legacy alias
+};
+typedef struct ggml_cache_route_bundle ggml_moe_route_desc;
+
+enum ggml_moe_bundle_kind {
+    GGML_MOE_BUNDLE_SEPARATE_GATE_UP = 0,
+    GGML_MOE_BUNDLE_FUSED_GATE_UP    = 1,
+};
+
+struct ggml_moe_bundle_plan {
+    int32_t layer;
+    enum ggml_moe_bundle_kind kind;
+    const struct ggml_tensor * route_ids;
+    struct ggml_tensor * gate_node;
+    struct ggml_tensor * up_node;
+    struct ggml_tensor * gate_up_node;
+    struct ggml_tensor * down_node;
+    struct ggml_tensor * layer_input;
+    struct ggml_tensor * canonical_route_output;
+    bool valid;
 };
 
 // Expert tensor map metadata

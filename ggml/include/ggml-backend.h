@@ -416,6 +416,22 @@ extern "C" {
         uint64_t n_route_census_batch_9_31;
         uint64_t n_route_census_batch_32_plus;
         uint64_t n_route_census_plans;
+
+        // Epic 11: Heterogeneous MoE Route Execution Telemetry
+        uint64_t hetero_layers;
+        uint64_t hetero_full_hit_layers;
+        uint64_t hetero_full_miss_layers;
+        uint64_t hetero_partial_layers;
+        uint64_t hetero_gpu_routes;
+        uint64_t hetero_cpu_routes;
+        size_t   hetero_d2h_activation_bytes;
+        size_t   hetero_h2d_result_bytes;
+        size_t   hetero_weight_upload_bytes;
+        uint64_t hetero_gpu_compute_us;
+        uint64_t hetero_cpu_compute_us;
+        uint64_t hetero_merge_us;
+        uint64_t hetero_wait_us;
+        uint64_t hetero_partial_distribution[8];
     };
 
     GGML_API void                 ggml_backend_sched_set_expert_cache_prefetch(ggml_backend_sched_t sched, bool enabled);

@@ -1481,13 +1481,14 @@ int32_t ggml_backend_expert_cache_partition_bundle_routes(
         int32_t g_slot = -1;
         int32_t u_slot = -1;
         int32_t d_slot = -1;
+        int32_t gu_slot = -1;
 
         if (has_bundle) {
             const auto & reg = bit->second;
             if (reg.is_fused) {
-                if (reg.gate_up) g_slot = u_slot = ggml_backend_expert_cache_find_slot(cache, reg.gate_up, exp_id);
+                if (reg.gate_up) gu_slot = g_slot = u_slot = ggml_backend_expert_cache_find_slot(cache, reg.gate_up, exp_id);
                 if (reg.down)    d_slot = ggml_backend_expert_cache_find_slot(cache, reg.down, exp_id);
-                is_hit = (g_slot >= 0 && d_slot >= 0);
+                is_hit = (gu_slot >= 0 && d_slot >= 0);
             } else {
                 if (reg.gate) g_slot = ggml_backend_expert_cache_find_slot(cache, reg.gate, exp_id);
                 if (reg.up)   u_slot = ggml_backend_expert_cache_find_slot(cache, reg.up, exp_id);
@@ -1496,13 +1497,15 @@ int32_t ggml_backend_expert_cache_partition_bundle_routes(
             }
         }
 
-        ggml_cache_route_bundle r;
+        ggml_moe_route_desc r;
         r.token = t;
         r.route = u;
         r.expert = exp_id;
         r.gate_slot = g_slot;
         r.up_slot = u_slot;
         r.down_slot = d_slot;
+        r.gate_up_slot = gu_slot;
+        r.bundle_resident = is_hit;
         r.is_bundle_hit = is_hit;
 
         if (is_hit) {

@@ -77,6 +77,26 @@
 ### 5. Vector 7: JIT Incremental Staged Rebalancing
 - **Mechanism**: Intercepts periodic rebalancing promotions and distributes the physical weight transfers smoothly across layers just before each layer executes via `ggml_backend_expert_cache_process_jit_swaps`, eliminating periodic frame drops or latency spikes.
 
+## True Partial-Hit Heterogeneous Route Execution (Epics 1-13, 2026-08-27)
+
+**Objective**: Eliminate the legacy `if (n_misses > 0) { whole node -> CPU }` architectural defect. Implement true bundle-level partial-hit heterogeneous execution for MoE layers, where resident routes execute on GPU slot pools and miss routes execute on CPU host RAM concurrently within the same decode token, merging outputs via a specialized warp-level CUDA scatter kernel without falling back resident GPU work or triggering in-band PCIe expert-weight uploads.
+
+### Key Architectural Components Delivered:
+1. **Canonical Route Descriptors (`struct ggml_cache_route_bundle` / `ggml_moe_route_desc`)**: Explicit per-route tracking for `(token, route, expert, gate_slot, up_slot, down_slot, gate_up_slot, bundle_resident)`.
+2. **Bundle Plan Validation (`struct ggml_moe_bundle_plan`)**: Graph-level bundle discovery associating gate, up, gate_up, and down `MUL_MAT_ID` nodes with their respective layer input and canonical route output tensors.
+3. **Dedicated Heterogeneous Scratch Owner (`struct ggml_moe_hetero_scratch`)**: Persistent GPU hit scratch (`gpu_hit_buf`), GPU upload scratch (`gpu_upload_buf`), GPU index maps (`gpu_indices_buf`), and host pinned buffers (`host_act_x`, `host_miss_out`) allocated on initialization and cleanly managed across tokens without gallocr ownership interference.
+4. **Asynchronous CUDA Route Scatter Kernel (`ggml_cuda_moe_scatter_routes`)**: High-performance coalesced CUDA kernel scattering $K$ GPU hit routes and $M$ uploaded CPU miss routes directly into the layer's canonical down output tensor (`down_node->data`).
+5. **TG1 Scheduler Gate & Mixed Heterogeneous Dispatch (`ggml_backend_sched_execute_moe_bundle`)**:
+   - $N = 8$ (Full Hit): Zero-copy slot pool execution on GPU.
+   - $N = 0$ (Full Miss): Complete gate/up/swiglu/down bundle on CPU using host weights; direct H2D result upload.
+   - $1 \le N \le 7$ (Partial Hit): GPU executes $K$ resident routes asynchronously from slot pools while CPU executes $M$ miss routes concurrently from host RAM. Miss outputs are uploaded and merged via GPU scatter kernel.
+6. **Heterogeneous MoE Telemetry Counters**: Full runtime accounting for `hetero_layers`, `hetero_full_hit_layers`, `hetero_full_miss_layers`, `hetero_partial_layers`, `hetero_gpu_routes`, `hetero_cpu_routes`, `hetero_d2h_activation_bytes`, `hetero_h2d_result_bytes`, `hetero_weight_upload_bytes` (0 B), and partial hit distribution histogram.
+
+### Test & Benchmark Verification:
+- **Oracle Correctness Matrix (`tests/test-moe-partial-hit-oracle.cpp`)**: Verified all 9 partial-hit configurations ($N = 0..8$) against Gate A reference (Qwen3.6-35B-A3B: $d_{\text{model}}=2048$, $d_{\text{ff}}=512$, $N_{\text{expert}}=256$, $\text{top\_k}=8$, TG1, $Q4\_K / Q6\_K$). NMSE $\le 0.0002$, 100% slice parity across all residencies.
+- **Unit Test Regression (`tests/test-expert-cache.cpp`)**: All 23 test suites passed cleanly with 0 regressions.
+- **Live Hybrid Benchmark (`tests/test-moe-heterogeneous-bench.cpp`)**: Gate B evaluation achieved **1.54x speedup** (+53.5% throughput) with **0 bytes** of in-band PCIe expert-weight uploads.
+
 ---
 
 ## Expert Cache V2 Architecture & Multi-Run Benchmarks (-r 10)

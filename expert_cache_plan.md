@@ -790,8 +790,37 @@ cache expert ─────┘
 
 The MVP stays almost entirely inside the generic scheduler and therefore has a much better chance of being maintainable/upstreamable.
 
-**So yes: I think this is quite feasible, and considerably cleaner than I initially expected.** The current master already contains the hardest prerequisite: generic detection and selective transfer of only the expert slices referenced by `MUL_MAT_ID`. We're essentially adding persistence to those temporary transfers.
+---
 
-For your particular experiment, I'd implement **Epics 1–6 first**, benchmark Qwen3.5/3.6 on the 1080 at cache sizes of 256/512/1024/1536/2048 MiB, and look at both tok/s and hit rate. That will tell us very quickly whether V2's zero-copy/direct-cache `MUL_MAT_ID` is worth the much larger implementation effort.
+# Heterogeneous MoE Execution Architecture (Implemented 2026-08-27)
+
+True partial-hit heterogeneous execution is fully implemented and verified for single-token decode (TG1):
+
+```text
+Routes:
+[ e0, e1, e2, e3, e4, e5, e6, e7 ]
+
+Residency:
+[ GPU, GPU, GPU, GPU, GPU, GPU, GPU, CPU ]
+
+Concurrent Execution:
+GPU Stream:                 CPU Threadpool:
+  e0, e1, e2, e3, e4, e5, e6  e7 (using host weights)
+        │                          │
+        │                    upload miss output
+        │                          │
+        └────────► GPU Scatter ◄───┘
+                       │
+             canonical down output
+                       │
+            existing router reduction
+```
+
+### Invariants:
+1. Current misses never trigger expert-weight H2D PCIe transfers.
+2. One miss never forces GPU-resident routes onto CPU.
+3. GPU hit routes execute zero-copy directly from GPU slot pools.
+4. CPU miss routes execute concurrently on host RAM and upload only unweighted outputs (`n_misses * d_model * sizeof(float)`).
+5. All outputs are scattered directly into the standard `down_node->data` buffer via `ggml_cuda_moe_scatter_routes`.
 
 [1]: https://github.com/martinalderson/llama.cpp/tree/moe-profile "GitHub - martinalderson/llama.cpp at moe-profile · GitHub"
