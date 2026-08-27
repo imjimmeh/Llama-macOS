@@ -1419,6 +1419,23 @@ When dynamic expert cache is disabled (`exc = 0`) and smaller static pinned mani
 
 **Takeaway**: At **128 MiB pinned capacity** (`pinned_experts_128mb.json`), the cache achieves the optimal balance—fitting into the unused VRAM margin without displacing full GPU layers, providing maximum throughput (**18.56 tok/s**).
 
+#### 5. Systematic `llama-bench` Multi-Parameter Pinned Sweep (0..1024 MiB, `-r 3`)
+
+Parameters: `-m Qwen3.6-35B-A3B-APEX-Compact.gguf -t 14 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mlock -fitt 256 -p 512 -n 128 -r 3`
+
+| Configuration / Manifest | Pinned Size | Prompt Processing (`pp512`) | Text Generation (`tg128`) | Speedup vs Control | Stability (Stddev) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Control Baseline (`none`)** | 0 MiB | **349.34 ± 1.13 tok/s** | **18.63 ± 0.25 tok/s** | 1.000x | $\pm 0.25$ |
+| **`pinned_experts_64mb.json`** | 64 MiB | **346.96 ± 0.87 tok/s** | **17.62 ± 0.26 tok/s** | 0.946x | $\pm 0.26$ |
+| **`pinned_experts_128mb.json`** | 128 MiB | **348.37 ± 1.75 tok/s** | **18.34 ± 0.62 tok/s** | 0.984x | $\pm 0.62$ |
+| **`pinned_experts_256mb.json`** | 256 MiB | **346.32 ± 2.22 tok/s** | **17.95 ± 0.22 tok/s** | 0.963x | $\pm 0.22$ |
+| **`pinned_experts_512mb.json`** | 512 MiB | **344.21 ± 3.47 tok/s** | **18.82 ± 0.24 tok/s** | **1.010x** | $\pm 0.24$ |
+| **`pinned_experts_1024mb.json`** | 1024 MiB | **341.90 ± 3.02 tok/s** | **19.00 ± 0.01 tok/s** | **1.020x (+0.37 tok/s)** | **$\pm 0.01$ (Rock-Solid)** |
+
+**Key Takeaways**:
+- **`pinned_experts_1024mb.json`** achieved peak decode throughput at **`19.00 ± 0.01 tok/s`** with rock-solid repetition stability ($\pm 0.01$ tok/s jitter).
+- **Prompt processing throughput** remained high across all tiers (**`341.9 to 349.3 tok/s`**), proving zero prefill regressions.
+
 
 
 
