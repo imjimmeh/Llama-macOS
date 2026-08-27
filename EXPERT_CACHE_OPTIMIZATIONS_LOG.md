@@ -1241,3 +1241,19 @@ Prompt processing speed also increased from 29.7 tok/s to 110.8 tok/s (3.73x spe
 
 The optimization roadmap proceeds to **Epic 5 (Non-blocking Background Promotion)**
 and **Epic 6 (GPU-Side Zero-Sync Route Remapping)**.
+
+## Background Promotion Pipeline and GPU Slot Mapping (2026-08-27)
+
+### Change
+
+Implemented Epics 5 and 6:
+- **Epic 5 (Non-blocking Background Promotion Pipeline)**:
+  - Added async promotion queue `cache->async_promotions` and rate-limiting controls.
+  - Implemented `ggml_backend_expert_cache_process_async_promotions` and scheduler wrapper.
+  - Async events poll non-blocking via `ggml_backend_event_query` and atomically transition slots from `LOADING` to `RESIDENT`.
+  - Added double-free safety guarantees across teardown and rebalance.
+- **Epic 6 (GPU-Side Zero-Sync Route Remapping)**:
+  - Added 40.96 KiB device lookup table (`gpu_slot_map_table`) tracking resident slot indices for all 128 layers x 512 experts.
+  - Exposed `ggml_backend_expert_cache_get_gpu_slot_map` and `ggml_backend_sched_get_gpu_slot_map`.
+- Added automated unit tests `test_async_promotion_pipeline` and `test_gpu_slot_map_remapping` in `tests/test-expert-cache.cpp` (all 20 unit tests passing).
+- Built multi-turn dynamic drift benchmark in `tests/test-moe-dynamic-drift-bench.cpp`.

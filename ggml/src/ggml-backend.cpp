@@ -2929,6 +2929,34 @@ bool ggml_backend_sched_load_pinned_manifest(
     return any_success;
 }
 
+size_t ggml_backend_sched_process_async_promotions(
+        ggml_backend_sched_t sched,
+        size_t max_promotions) {
+    if (sched == NULL) {
+        return 0;
+    }
+    size_t count = 0;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->expert_caches[b]) {
+            count += ggml_backend_expert_cache_process_async_promotions(sched->expert_caches[b], max_promotions);
+        }
+    }
+    return count;
+}
+
+const int32_t * ggml_backend_sched_get_gpu_slot_map(
+        ggml_backend_sched_t sched,
+        int backend_idx,
+        int32_t layer) {
+    if (sched == NULL || backend_idx < 0 || backend_idx >= sched->n_backends) {
+        return NULL;
+    }
+    if (sched->expert_caches[backend_idx]) {
+        return ggml_backend_expert_cache_get_gpu_slot_map(sched->expert_caches[backend_idx], layer);
+    }
+    return NULL;
+}
+
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;

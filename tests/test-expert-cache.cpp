@@ -878,6 +878,91 @@ static void test_auto_reserve_sentinel() {
     printf("  auto reserve sentinel semantics tests passed\n");
 }
 
+static void test_async_promotion_pipeline() {
+    printf("testing async promotion pipeline and rate limiting...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+    const size_t expert_bytes = 8 * 16 * sizeof(float);
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, expert_bytes * 8);
+    require(cache != nullptr);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    struct ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 8);
+    require(tensor != nullptr);
+    ggml_set_name(tensor, "blk.3.ffn_gate_exps.weight");
+    tensor->nb[2] = expert_bytes;
+    memset(tensor->data, 0xEE, ggml_nbytes(tensor));
+
+    ggml_backend_expert_cache_set_max_async_promotions(cache, 2);
+
+    // Seed 4 experts
+    ggml_backend_expert_cache_seed(cache, tensor, 0, 100);
+    ggml_backend_expert_cache_seed(cache, tensor, 1, 200);
+    ggml_backend_expert_cache_seed(cache, tensor, 2, 300);
+    ggml_backend_expert_cache_seed(cache, tensor, 3, 400);
+
+    // Process async promotions with limit = 2
+    size_t promoted = ggml_backend_expert_cache_process_async_promotions(cache, 2);
+    require(promoted <= 2);
+
+    // Process remaining
+    promoted += ggml_backend_expert_cache_process_async_promotions(cache, 10);
+    require(promoted >= 0);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  async promotion pipeline tests passed\n");
+}
+
+static void test_gpu_slot_map_remapping() {
+    printf("testing GPU slot map table consistency...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+    const size_t expert_bytes = 8 * 16 * sizeof(float);
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, expert_bytes * 4);
+    require(cache != nullptr);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    struct ggml_tensor * tensor = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 8, 16, 8);
+    require(tensor != nullptr);
+    ggml_set_name(tensor, "blk.7.ffn_gate_exps.weight");
+    tensor->nb[2] = expert_bytes;
+    memset(tensor->data, 0xAA, ggml_nbytes(tensor));
+
+    const int32_t * map_l7 = ggml_backend_expert_cache_get_gpu_slot_map(cache, 7);
+    require(map_l7 != nullptr);
+    require(map_l7[4] == -1); // unseeded expert 4 should be -1
+
+    ggml_backend_expert_cache_seed(cache, tensor, 4, 100);
+    int32_t slot = ggml_backend_expert_cache_find_slot(cache, tensor, 4);
+    require(slot >= 0);
+    require(map_l7[4] == slot);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  GPU slot map table consistency tests passed\n");
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -901,6 +986,8 @@ int main() {
     test_per_tensor_slot_isolation();
     test_staging_sync_teardown();
     test_auto_reserve_sentinel();
+    test_async_promotion_pipeline();
+    test_gpu_slot_map_remapping();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

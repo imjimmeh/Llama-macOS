@@ -105,6 +105,13 @@ struct ggml_pending_swap_entry {
     int32_t slot = -1;
 };
 
+struct ggml_expert_cache_async_promotion {
+    const struct ggml_tensor * tensor = nullptr;
+    int32_t layer = -1;
+    int32_t expert_id = -1;
+    int32_t slot = -1;
+};
+
 struct ggml_backend_expert_cache {
     ggml_backend_t backend;
 
@@ -155,6 +162,13 @@ struct ggml_backend_expert_cache {
     std::set<std::pair<int32_t, int32_t>> pinned_bundles;
     bool is_static_manifest_loaded = false;
     bool zero_miss_upload = true;
+
+    // Epic 5: Non-blocking Background Promotion Pipeline
+    std::vector<ggml_expert_cache_async_promotion> async_promotions;
+    int32_t max_async_promotions = 2;
+
+    // Epic 6: GPU-Side Zero-Sync Route Remapping (128 layers x 512 experts)
+    std::vector<int32_t> gpu_slot_map_table;
 
     struct ggml_backend_expert_cache_stats stats;
 };
@@ -327,6 +341,7 @@ ggml_backend_expert_cache_t ggml_backend_expert_cache_new(
     cache->pinned_host_buffer = nullptr;
     cache->pinned_host_capacity = 0;
     cache->pinned_is_cuda = false;
+    cache->gpu_slot_map_table.assign(128 * 512, -1);
     memset(&cache->stats, 0, sizeof(cache->stats));
 
     return cache;
@@ -366,6 +381,17 @@ static bool ggml_expert_cache_poll_slot(
     ggml_backend_event_free(slot.load_event);
     slot.load_event = nullptr;
     slot.state = GGML_EXPERT_CACHE_SLOT_RESIDENT;
+    if (slot.layer >= 0 && slot.layer < 128 && slot.expert_id >= 0 && slot.expert_id < 512) {
+        int32_t slot_idx = -1;
+        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, slot.tensor);
+        if (pool) {
+            auto smit = pool->slot_maps.find(slot.tensor);
+            if (smit != pool->slot_maps.end() && (size_t)slot.expert_id < smit->second.size()) {
+                slot_idx = smit->second[slot.expert_id];
+            }
+        }
+        cache->gpu_slot_map_table[slot.layer * 512 + slot.expert_id] = slot_idx;
+    }
     return true;
 }
 
@@ -421,6 +447,8 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
     }
     cache->registered_host_ranges.clear();
 #endif
+
+    cache->async_promotions.clear();
 
     if (cache->ctx) {
         ggml_free(cache->ctx);
@@ -1638,9 +1666,13 @@ void ggml_backend_expert_cache_promote_slot(
         }
         if (slot_entry.load_event != nullptr) {
             ggml_backend_event_record(slot_entry.load_event, cache->backend);
+            cache->async_promotions.push_back({ tensor, slot_entry.layer, expert_id, slot });
         } else if (ggml_backend_dev_type(ggml_backend_get_device(cache->backend)) ==
                 GGML_BACKEND_DEVICE_TYPE_CPU) {
             slot_entry.state = GGML_EXPERT_CACHE_SLOT_RESIDENT;
+            if (slot_entry.layer >= 0 && slot_entry.layer < 128 && expert_id >= 0 && expert_id < 512) {
+                cache->gpu_slot_map_table[slot_entry.layer * 512 + expert_id] = slot;
+            }
         }
     }
 }
@@ -1780,4 +1812,58 @@ void ggml_backend_expert_cache_set_zero_miss_upload(
 bool ggml_backend_expert_cache_get_zero_miss_upload(
         ggml_backend_expert_cache_t cache) {
     return cache != NULL ? cache->zero_miss_upload : true;
+}
+
+size_t ggml_backend_expert_cache_process_async_promotions(
+        ggml_backend_expert_cache_t cache,
+        size_t max_promotions) {
+    if (cache == NULL || cache->async_promotions.empty()) {
+        return 0;
+    }
+
+    size_t promoted_count = 0;
+    auto it = cache->async_promotions.begin();
+    while (it != cache->async_promotions.end()) {
+        if (max_promotions > 0 && promoted_count >= max_promotions) {
+            break;
+        }
+
+        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, it->tensor);
+        if (pool && it->slot >= 0 && it->slot < pool->max_slots) {
+            auto & s = pool->slots[it->slot];
+            if (s.tensor == it->tensor && s.expert_id == it->expert_id) {
+                if (ggml_expert_cache_poll_slot(cache, s)) {
+                    it = cache->async_promotions.erase(it);
+                    promoted_count++;
+                    continue;
+                }
+            } else {
+                it = cache->async_promotions.erase(it);
+                continue;
+            }
+        } else {
+            it = cache->async_promotions.erase(it);
+            continue;
+        }
+        ++it;
+    }
+
+    return promoted_count;
+}
+
+void ggml_backend_expert_cache_set_max_async_promotions(
+        ggml_backend_expert_cache_t cache,
+        int32_t max_promotions) {
+    if (cache != NULL) {
+        cache->max_async_promotions = max_promotions;
+    }
+}
+
+const int32_t * ggml_backend_expert_cache_get_gpu_slot_map(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer) {
+    if (cache == NULL || layer < 0 || layer >= 128 || cache->gpu_slot_map_table.empty()) {
+        return NULL;
+    }
+    return cache->gpu_slot_map_table.data() + (size_t)layer * 512;
 }

@@ -434,6 +434,8 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_register_host_memory(ggml_backend_sched_t sched, const struct ggml_tensor * tensor);
     GGML_API void                 ggml_backend_sched_expert_cache_sync(ggml_backend_sched_t sched);
     GGML_API bool                 ggml_backend_sched_load_pinned_manifest(ggml_backend_sched_t sched, const char * manifest_path);
+    GGML_API size_t               ggml_backend_sched_process_async_promotions(ggml_backend_sched_t sched, size_t max_promotions);
+    GGML_API const int32_t *      ggml_backend_sched_get_gpu_slot_map(ggml_backend_sched_t sched, int backend_idx, int32_t layer);
 
     //
     // Meta backend

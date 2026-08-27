@@ -343,6 +343,20 @@ GGML_API void ggml_backend_expert_cache_set_zero_miss_upload(
 GGML_API bool ggml_backend_expert_cache_get_zero_miss_upload(
     ggml_backend_expert_cache_t cache);
 
+// Epic 5: Non-blocking Background Promotion Pipeline
+GGML_API size_t ggml_backend_expert_cache_process_async_promotions(
+    ggml_backend_expert_cache_t cache,
+    size_t max_promotions);
+
+GGML_API void ggml_backend_expert_cache_set_max_async_promotions(
+    ggml_backend_expert_cache_t cache,
+    int32_t max_promotions);
+
+// Epic 6: GPU-Side Zero-Sync Route Remapping
+GGML_API const int32_t * ggml_backend_expert_cache_get_gpu_slot_map(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer);
+
 #ifdef __cplusplus
 }
 #endif
