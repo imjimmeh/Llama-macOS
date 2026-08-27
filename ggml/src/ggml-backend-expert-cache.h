@@ -36,6 +36,23 @@ enum ggml_expert_cache_slot_state {
     GGML_EXPERT_CACHE_SLOT_RESIDENT  = 2,
 };
 
+// Bundle route descriptor
+struct ggml_cache_route_bundle {
+    int32_t token;
+    int32_t route;
+    int32_t expert;
+    int32_t gate_slot;
+    int32_t up_slot;
+    int32_t down_slot;
+    bool    is_bundle_hit;
+};
+
+// Expert tensor map metadata
+struct ggml_expert_map_meta {
+    uint32_t offset;
+    uint32_t n_expert;
+};
+
 
 
 typedef struct ggml_backend_expert_cache * ggml_backend_expert_cache_t;
@@ -205,10 +222,49 @@ GGML_API void ggml_backend_expert_cache_register_bundle(
     const struct ggml_tensor * up_tensor,
     const struct ggml_tensor * down_tensor);
 
+GGML_API void ggml_backend_expert_cache_register_fused_bundle(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const struct ggml_tensor * gate_up_tensor,
+    const struct ggml_tensor * down_tensor);
+
 GGML_API bool ggml_backend_expert_cache_is_bundle_resident(
     ggml_backend_expert_cache_t cache,
     int32_t layer,
     int32_t expert_id);
+
+GGML_API bool ggml_backend_expert_cache_is_layer_fully_resident(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer);
+
+GGML_API int32_t ggml_backend_expert_cache_partition_bundle_routes(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const int32_t * router_ids,
+    int32_t n_routes,
+    int32_t n_tokens,
+    struct ggml_cache_route_bundle * out_hit_routes,
+    int32_t * out_n_hits,
+    struct ggml_cache_route_bundle * out_miss_routes,
+    int32_t * out_n_misses);
+
+GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_device_bundle_map(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_device_slot_map(
+    ggml_backend_expert_cache_t cache);
+
+GGML_API uint32_t ggml_backend_expert_cache_get_map_id(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * tensor);
+
+GGML_API bool ggml_backend_expert_cache_get_bundle_tensors(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const struct ggml_tensor ** out_gate,
+    const struct ggml_tensor ** out_up,
+    const struct ggml_tensor ** out_down,
+    const struct ggml_tensor ** out_gate_up);
 
 
 GGML_API void ggml_backend_expert_cache_record_all_hit_resolution(

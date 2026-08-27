@@ -963,6 +963,191 @@ static void test_gpu_slot_map_remapping() {
     printf("  GPU slot map table consistency tests passed\n");
 }
 
+static void test_hit_mask_matrix_partitioning() {
+    printf("testing hit-mask matrix partitioning (0/8 to 8/8 hits)...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+    const size_t expert_bytes = 16 * 16 * sizeof(float);
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, expert_bytes * 32);
+    require(cache != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    struct ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
+    struct ggml_tensor * up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
+    struct ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
+    ggml_set_name(gate, "blk.5.ffn_gate_exps.weight");
+    ggml_set_name(up,   "blk.5.ffn_up_exps.weight");
+    ggml_set_name(down, "blk.5.ffn_down_exps.weight");
+    gate->nb[2] = expert_bytes;
+    up->nb[2]   = expert_bytes;
+    down->nb[2] = expert_bytes;
+
+    ggml_backend_expert_cache_register_bundle(cache, 5, gate, up, down);
+
+    // Pre-seed experts 0 to 7 across all three bundle projections
+    for (int e = 0; e < 8; e++) {
+        ggml_backend_expert_cache_seed(cache, gate, e, 100);
+        ggml_backend_expert_cache_seed(cache, up,   e, 100);
+        ggml_backend_expert_cache_seed(cache, down, e, 100);
+        require(ggml_backend_expert_cache_is_bundle_resident(cache, 5, e));
+    }
+
+    // Experts 8 to 15 remain unseeded (misses)
+    for (int e = 8; e < 16; e++) {
+        require(!ggml_backend_expert_cache_is_bundle_resident(cache, 5, e));
+    }
+
+    // Test all hit counts K from 0 to 8
+    for (int K = 0; K <= 8; K++) {
+        std::vector<int32_t> test_routes(8);
+        // Fill first K with resident experts (0..K-1), remaining 8-K with missing experts (8..15)
+        for (int i = 0; i < K; i++) test_routes[i] = i;
+        for (int i = K; i < 8; i++) test_routes[i] = 8 + (i - K);
+
+        ggml_cache_route_bundle hit_routes[8];
+        ggml_cache_route_bundle miss_routes[8];
+        int32_t n_hits = 0;
+        int32_t n_misses = 0;
+
+        int32_t res_hits = ggml_backend_expert_cache_partition_bundle_routes(
+            cache, 5, test_routes.data(), 8, 1,
+            hit_routes, &n_hits, miss_routes, &n_misses);
+
+        require(res_hits == K);
+        require(n_hits == K);
+        require(n_misses == 8 - K);
+
+        for (int i = 0; i < n_hits; i++) {
+            require(hit_routes[i].is_bundle_hit);
+            require(hit_routes[i].expert == i);
+            require(hit_routes[i].route == i);
+            require(hit_routes[i].gate_slot >= 0);
+            require(hit_routes[i].up_slot >= 0);
+            require(hit_routes[i].down_slot >= 0);
+        }
+
+        for (int i = 0; i < n_misses; i++) {
+            require(!miss_routes[i].is_bundle_hit);
+            require(miss_routes[i].expert == 8 + i);
+            require(miss_routes[i].route == K + i);
+        }
+    }
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  hit-mask matrix partitioning tests passed\n");
+}
+
+static void test_multi_token_repeated_experts() {
+    printf("testing multi-token repeated expert routing...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+    const size_t expert_bytes = 16 * 16 * sizeof(float);
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, expert_bytes * 32);
+    require(cache != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    struct ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
+    struct ggml_tensor * up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
+    struct ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
+    ggml_set_name(gate, "blk.2.ffn_gate_exps.weight");
+    ggml_set_name(up,   "blk.2.ffn_up_exps.weight");
+    ggml_set_name(down, "blk.2.ffn_down_exps.weight");
+    gate->nb[2] = expert_bytes;
+    up->nb[2]   = expert_bytes;
+    down->nb[2] = expert_bytes;
+
+    ggml_backend_expert_cache_register_bundle(cache, 2, gate, up, down);
+
+    // Seed experts 0, 1, 2
+    ggml_backend_expert_cache_seed(cache, gate, 0, 100);
+    ggml_backend_expert_cache_seed(cache, up,   0, 100);
+    ggml_backend_expert_cache_seed(cache, down, 0, 100);
+    ggml_backend_expert_cache_seed(cache, gate, 1, 100);
+    ggml_backend_expert_cache_seed(cache, up,   1, 100);
+    ggml_backend_expert_cache_seed(cache, down, 1, 100);
+
+    // Batch of 2 tokens, top_k = 4 (total 8 routes)
+    // Token 0: [0, 1, 4, 5] -> Hits: 0, 1. Misses: 4, 5
+    // Token 1: [0, 1, 6, 7] -> Hits: 0, 1 (repeated!). Misses: 6, 7
+    int32_t router_ids[8] = { 0, 1, 4, 5, 0, 1, 6, 7 };
+
+    ggml_cache_route_bundle hit_routes[8];
+    ggml_cache_route_bundle miss_routes[8];
+    int32_t n_hits = 0;
+    int32_t n_misses = 0;
+
+    int32_t res_hits = ggml_backend_expert_cache_partition_bundle_routes(
+        cache, 2, router_ids, 8, 2,
+        hit_routes, &n_hits, miss_routes, &n_misses);
+
+    require(res_hits == 4);
+    require(n_hits == 4);
+    require(n_misses == 4);
+
+    // Verify token & route tracking
+    require(hit_routes[0].token == 0 && hit_routes[0].route == 0 && hit_routes[0].expert == 0);
+    require(hit_routes[1].token == 0 && hit_routes[1].route == 1 && hit_routes[1].expert == 1);
+    require(hit_routes[2].token == 1 && hit_routes[2].route == 0 && hit_routes[2].expert == 0);
+    require(hit_routes[3].token == 1 && hit_routes[3].route == 1 && hit_routes[3].expert == 1);
+
+    require(miss_routes[0].token == 0 && miss_routes[0].route == 2 && miss_routes[0].expert == 4);
+    require(miss_routes[1].token == 0 && miss_routes[1].route == 3 && miss_routes[1].expert == 5);
+    require(miss_routes[2].token == 1 && miss_routes[2].route == 2 && miss_routes[2].expert == 6);
+    require(miss_routes[3].token == 1 && miss_routes[3].route == 3 && miss_routes[3].expert == 7);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  multi-token repeated expert routing tests passed\n");
+}
+
+static void test_dynamic_map_metadata_and_device_maps() {
+    printf("testing dynamic map metadata and device maps...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+    const size_t expert_bytes = 16 * 16 * sizeof(float);
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, expert_bytes * 32);
+    require(cache != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    struct ggml_tensor * t0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 8);
+    struct ggml_tensor * t1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 16, 16);
+    ggml_set_name(t0, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(t1, "blk.1.ffn_gate_exps.weight");
+    t0->nb[2] = expert_bytes;
+    t1->nb[2] = expert_bytes;
+
+    uint32_t map0 = ggml_backend_expert_cache_get_map_id(cache, t0);
+    uint32_t map1 = ggml_backend_expert_cache_get_map_id(cache, t1);
+    require(map0 == 0);
+    require(map1 == 1);
+
+    struct ggml_tensor * d_slot_map = ggml_backend_expert_cache_get_device_slot_map(cache);
+    require(d_slot_map != nullptr);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  dynamic map metadata and device maps tests passed\n");
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -988,6 +1173,10 @@ int main() {
     test_auto_reserve_sentinel();
     test_async_promotion_pipeline();
     test_gpu_slot_map_remapping();
+
+    test_hit_mask_matrix_partitioning();
+    test_multi_token_repeated_experts();
+    test_dynamic_map_metadata_and_device_maps();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

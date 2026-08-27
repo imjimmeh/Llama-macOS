@@ -94,9 +94,16 @@ struct ggml_expert_cache_slot_pool {
 };
 
 struct ggml_expert_bundle_reg {
+    int32_t layer = -1;
     const struct ggml_tensor * gate = nullptr;
     const struct ggml_tensor * up   = nullptr;
     const struct ggml_tensor * down = nullptr;
+    const struct ggml_tensor * gate_up = nullptr;
+    uint32_t gate_map_id = UINT32_MAX;
+    uint32_t up_map_id   = UINT32_MAX;
+    uint32_t down_map_id = UINT32_MAX;
+    uint32_t gate_up_map_id = UINT32_MAX;
+    bool is_fused = false;
 };
 
 struct ggml_pending_swap_entry {
@@ -138,6 +145,19 @@ struct ggml_backend_expert_cache {
     // Expert bundle registrations
     std::unordered_map<int32_t, ggml_expert_bundle_reg> bundle_registrations;
 
+    // Dynamic map_id mapping and offset table
+    std::unordered_map<const struct ggml_tensor *, uint32_t> tensor_to_map_id;
+    std::vector<ggml_expert_map_meta> map_metas;
+    std::vector<int32_t> host_slot_map;
+    std::vector<uint8_t> host_bundle_resident;
+    std::unordered_map<int32_t, bool> layer_full_resident;
+
+    // Device-side VRAM buffers and tensors
+    ggml_backend_buffer_t gpu_slot_map_buffer = nullptr;
+    ggml_backend_buffer_t gpu_bundle_map_buffer = nullptr;
+    struct ggml_tensor *  gpu_slot_map_tensor = nullptr;
+    struct ggml_tensor *  gpu_bundle_map_tensor = nullptr;
+
     // Per-layer budget tracking
     std::unordered_map<int32_t, int32_t> layer_slots;
 
@@ -177,11 +197,49 @@ static int ggml_expert_cache_get_tensor_layer(const struct ggml_tensor * tensor)
     if (tensor == NULL || tensor->name[0] == '\0') {
         return -1;
     }
-    int layer = -1;
-    if (sscanf(tensor->name, "blk.%d.", &layer) == 1) {
-        return layer;
+    const char * blk = strstr(tensor->name, "blk.");
+    if (blk != NULL) {
+        int layer = -1;
+        if (sscanf(blk, "blk.%d.", &layer) == 1) {
+            return layer;
+        }
     }
     return -1;
+}
+
+static uint32_t ggml_expert_cache_get_or_create_map_id(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor) {
+    if (cache == nullptr || tensor == nullptr) {
+        return UINT32_MAX;
+    }
+    auto it = cache->tensor_to_map_id.find(tensor);
+    if (it != cache->tensor_to_map_id.end()) {
+        return it->second;
+    }
+    uint32_t new_id = (uint32_t)cache->map_metas.size();
+    uint32_t offset = (uint32_t)cache->host_slot_map.size();
+    uint32_t n_expert = (uint32_t)tensor->ne[2];
+    if (n_expert == 0) {
+        n_expert = 256;
+    }
+    cache->map_metas.push_back({ offset, n_expert });
+    cache->host_slot_map.resize(offset + n_expert, -1);
+    cache->tensor_to_map_id[tensor] = new_id;
+    return new_id;
+}
+
+uint32_t ggml_backend_expert_cache_get_map_id(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * tensor) {
+    if (cache == nullptr || tensor == nullptr) {
+        return UINT32_MAX;
+    }
+    auto it = cache->tensor_to_map_id.find(tensor);
+    if (it != cache->tensor_to_map_id.end()) {
+        return it->second;
+    }
+    return ggml_expert_cache_get_or_create_map_id(cache, tensor);
 }
 
 static ggml_expert_cache_slot_pool * ggml_backend_expert_cache_get_or_create_pool(
@@ -218,8 +276,8 @@ static ggml_expert_cache_slot_pool * ggml_backend_expert_cache_get_or_create_poo
     if (!cache->bundle_registrations.empty()) {
         std::vector<ggml_expert_cache_pool_key> unique_keys;
         for (const auto & b : cache->bundle_registrations) {
-            const struct ggml_tensor * t_list[3] = { b.second.gate, b.second.up, b.second.down };
-            for (int ti = 0; ti < 3; ti++) {
+            const struct ggml_tensor * t_list[4] = { b.second.gate, b.second.up, b.second.down, b.second.gate_up };
+            for (int ti = 0; ti < 4; ti++) {
                 if (t_list[ti]) {
                     ggml_expert_cache_pool_key k = { t_list[ti]->ne[0], t_list[ti]->ne[1], t_list[ti]->type, (size_t)t_list[ti]->nb[2] };
                     if (std::find(unique_keys.begin(), unique_keys.end(), k) == unique_keys.end()) {
@@ -452,6 +510,14 @@ void ggml_backend_expert_cache_free(ggml_backend_expert_cache_t cache) {
 
     if (cache->ctx) {
         ggml_free(cache->ctx);
+    }
+    if (cache->gpu_slot_map_buffer) {
+        ggml_backend_buffer_free(cache->gpu_slot_map_buffer);
+        cache->gpu_slot_map_buffer = nullptr;
+    }
+    if (cache->gpu_bundle_map_buffer) {
+        ggml_backend_buffer_free(cache->gpu_bundle_map_buffer);
+        cache->gpu_bundle_map_buffer = nullptr;
     }
     if (cache->buffer) {
         ggml_backend_buffer_free(cache->buffer);
@@ -1223,7 +1289,28 @@ void ggml_backend_expert_cache_register_bundle(
     if (cache == NULL || layer < 0) {
         return;
     }
-    cache->bundle_registrations[layer] = { gate_tensor, up_tensor, down_tensor };
+
+    if (up_tensor == nullptr && gate_tensor != nullptr && strstr(gate_tensor->name, "gate_up") != nullptr) {
+        ggml_backend_expert_cache_register_fused_bundle(cache, layer, gate_tensor, down_tensor);
+        return;
+    }
+
+    const uint32_t g_id = ggml_expert_cache_get_or_create_map_id(cache, gate_tensor);
+    const uint32_t u_id = ggml_expert_cache_get_or_create_map_id(cache, up_tensor);
+    const uint32_t d_id = ggml_expert_cache_get_or_create_map_id(cache, down_tensor);
+
+    ggml_expert_bundle_reg reg;
+    reg.layer = layer;
+    reg.gate = gate_tensor;
+    reg.up = up_tensor;
+    reg.down = down_tensor;
+    reg.gate_up = nullptr;
+    reg.gate_map_id = g_id;
+    reg.up_map_id = u_id;
+    reg.down_map_id = d_id;
+    reg.gate_up_map_id = UINT32_MAX;
+    reg.is_fused = false;
+    cache->bundle_registrations[layer] = reg;
 
     if (cache->is_static_manifest_loaded) {
         for (const auto & entry : cache->pinned_bundles) {
@@ -1258,6 +1345,55 @@ void ggml_backend_expert_cache_register_bundle(
     }
 }
 
+void ggml_backend_expert_cache_register_fused_bundle(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const struct ggml_tensor * gate_up_tensor,
+        const struct ggml_tensor * down_tensor) {
+    if (cache == NULL || layer < 0) {
+        return;
+    }
+    const uint32_t gu_id = ggml_expert_cache_get_or_create_map_id(cache, gate_up_tensor);
+    const uint32_t d_id  = ggml_expert_cache_get_or_create_map_id(cache, down_tensor);
+
+    ggml_expert_bundle_reg reg;
+    reg.layer = layer;
+    reg.gate = nullptr;
+    reg.up = nullptr;
+    reg.down = down_tensor;
+    reg.gate_up = gate_up_tensor;
+    reg.gate_map_id = UINT32_MAX;
+    reg.up_map_id = UINT32_MAX;
+    reg.down_map_id = d_id;
+    reg.gate_up_map_id = gu_id;
+    reg.is_fused = true;
+    cache->bundle_registrations[layer] = reg;
+
+    if (cache->is_static_manifest_loaded) {
+        for (const auto & entry : cache->pinned_bundles) {
+            if (entry.first == layer) {
+                int32_t expert_id = entry.second;
+                if (gate_up_tensor && gate_up_tensor->data != NULL) {
+                    ggml_backend_expert_cache_seed(cache, gate_up_tensor, expert_id, 1000);
+                    int32_t s = ggml_backend_expert_cache_find_slot(cache, gate_up_tensor, expert_id);
+                    if (s >= 0) {
+                        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, gate_up_tensor);
+                        if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                    }
+                }
+                if (down_tensor && down_tensor->data != NULL) {
+                    ggml_backend_expert_cache_seed(cache, down_tensor, expert_id, 1000);
+                    int32_t s = ggml_backend_expert_cache_find_slot(cache, down_tensor, expert_id);
+                    if (s >= 0) {
+                        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, down_tensor);
+                        if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
 bool ggml_backend_expert_cache_is_bundle_resident(
         ggml_backend_expert_cache_t cache,
         int32_t layer,
@@ -1272,16 +1408,178 @@ bool ggml_backend_expert_cache_is_bundle_resident(
     }
 
     const auto & reg = bit->second;
-    if (reg.gate != NULL && ggml_backend_expert_cache_find_slot(cache, reg.gate, expert_id) < 0) {
-        return false;
-    }
-    if (reg.up != NULL && ggml_backend_expert_cache_find_slot(cache, reg.up, expert_id) < 0) {
-        return false;
-    }
-    if (reg.down != NULL && ggml_backend_expert_cache_find_slot(cache, reg.down, expert_id) < 0) {
-        return false;
+    if (reg.is_fused) {
+        if (reg.gate_up != NULL && ggml_backend_expert_cache_find_slot(cache, reg.gate_up, expert_id) < 0) {
+            return false;
+        }
+        if (reg.down != NULL && ggml_backend_expert_cache_find_slot(cache, reg.down, expert_id) < 0) {
+            return false;
+        }
+    } else {
+        if (reg.gate != NULL && ggml_backend_expert_cache_find_slot(cache, reg.gate, expert_id) < 0) {
+            return false;
+        }
+        if (reg.up != NULL && ggml_backend_expert_cache_find_slot(cache, reg.up, expert_id) < 0) {
+            return false;
+        }
+        if (reg.down != NULL && ggml_backend_expert_cache_find_slot(cache, reg.down, expert_id) < 0) {
+            return false;
+        }
     }
     return true;
+}
+
+bool ggml_backend_expert_cache_is_layer_fully_resident(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer) {
+    if (cache == NULL || layer < 0) {
+        return false;
+    }
+    auto it = cache->layer_full_resident.find(layer);
+    if (it != cache->layer_full_resident.end()) {
+        return it->second;
+    }
+    return false;
+}
+
+int32_t ggml_backend_expert_cache_partition_bundle_routes(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const int32_t * router_ids,
+        int32_t n_routes,
+        int32_t n_tokens,
+        struct ggml_cache_route_bundle * out_hit_routes,
+        int32_t * out_n_hits,
+        struct ggml_cache_route_bundle * out_miss_routes,
+        int32_t * out_n_misses) {
+    if (out_n_hits) *out_n_hits = 0;
+    if (out_n_misses) *out_n_misses = 0;
+    if (cache == NULL || router_ids == NULL || n_routes <= 0) {
+        return 0;
+    }
+
+    int32_t n_hits = 0;
+    int32_t n_misses = 0;
+    const int32_t top_k = n_tokens > 0 ? (n_routes / n_tokens) : n_routes;
+
+    auto bit = cache->bundle_registrations.find(layer);
+    const bool has_bundle = (bit != cache->bundle_registrations.end());
+
+    for (int32_t i = 0; i < n_routes; i++) {
+        const int32_t exp_id = router_ids[i];
+        const int32_t t = top_k > 0 ? (i / top_k) : 0;
+        const int32_t u = top_k > 0 ? (i % top_k) : i;
+
+        if (exp_id < 0) {
+            continue;
+        }
+
+        bool is_hit = false;
+        int32_t g_slot = -1;
+        int32_t u_slot = -1;
+        int32_t d_slot = -1;
+
+        if (has_bundle) {
+            const auto & reg = bit->second;
+            if (reg.is_fused) {
+                if (reg.gate_up) g_slot = u_slot = ggml_backend_expert_cache_find_slot(cache, reg.gate_up, exp_id);
+                if (reg.down)    d_slot = ggml_backend_expert_cache_find_slot(cache, reg.down, exp_id);
+                is_hit = (g_slot >= 0 && d_slot >= 0);
+            } else {
+                if (reg.gate) g_slot = ggml_backend_expert_cache_find_slot(cache, reg.gate, exp_id);
+                if (reg.up)   u_slot = ggml_backend_expert_cache_find_slot(cache, reg.up, exp_id);
+                if (reg.down) d_slot = ggml_backend_expert_cache_find_slot(cache, reg.down, exp_id);
+                is_hit = (g_slot >= 0 && u_slot >= 0 && d_slot >= 0);
+            }
+        }
+
+        ggml_cache_route_bundle r;
+        r.token = t;
+        r.route = u;
+        r.expert = exp_id;
+        r.gate_slot = g_slot;
+        r.up_slot = u_slot;
+        r.down_slot = d_slot;
+        r.is_bundle_hit = is_hit;
+
+        if (is_hit) {
+            if (out_hit_routes) {
+                out_hit_routes[n_hits] = r;
+            }
+            n_hits++;
+        } else {
+            if (out_miss_routes) {
+                out_miss_routes[n_misses] = r;
+            }
+            n_misses++;
+        }
+    }
+
+    if (out_n_hits) *out_n_hits = n_hits;
+    if (out_n_misses) *out_n_misses = n_misses;
+
+    return n_hits;
+}
+
+bool ggml_backend_expert_cache_get_bundle_tensors(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const struct ggml_tensor ** out_gate,
+        const struct ggml_tensor ** out_up,
+        const struct ggml_tensor ** out_down,
+        const struct ggml_tensor ** out_gate_up) {
+    if (cache == nullptr || layer < 0) {
+        return false;
+    }
+    auto it = cache->bundle_registrations.find(layer);
+    if (it == cache->bundle_registrations.end()) {
+        return false;
+    }
+    if (out_gate)    *out_gate    = it->second.gate;
+    if (out_up)      *out_up      = it->second.up;
+    if (out_down)    *out_down    = it->second.down;
+    if (out_gate_up) *out_gate_up = it->second.gate_up;
+    return true;
+}
+
+struct ggml_tensor * ggml_backend_expert_cache_get_device_slot_map(ggml_backend_expert_cache_t cache) {
+    if (cache == nullptr || cache->host_slot_map.empty()) return nullptr;
+
+    const size_t bytes = cache->host_slot_map.size() * sizeof(int32_t);
+    if (cache->gpu_slot_map_buffer == nullptr || cache->gpu_slot_map_tensor == nullptr) {
+        cache->gpu_slot_map_buffer = ggml_backend_alloc_buffer(cache->backend, std::max((size_t)64 * 1024, bytes));
+        if (cache->gpu_slot_map_buffer != nullptr) {
+            struct ggml_init_params p = { 4 * ggml_tensor_overhead(), nullptr, true };
+            struct ggml_context * c = ggml_init(p);
+            cache->gpu_slot_map_tensor = ggml_new_tensor_1d(c, GGML_TYPE_I32, (int64_t)cache->host_slot_map.size());
+            cache->gpu_slot_map_tensor->data = ggml_backend_buffer_get_base(cache->gpu_slot_map_buffer);
+            cache->gpu_slot_map_tensor->buffer = cache->gpu_slot_map_buffer;
+        }
+    }
+    if (cache->gpu_slot_map_tensor != nullptr && cache->gpu_slot_map_buffer != nullptr) {
+        ggml_backend_tensor_set_async(cache->backend, cache->gpu_slot_map_tensor, cache->host_slot_map.data(), 0, bytes);
+    }
+    return cache->gpu_slot_map_tensor;
+}
+
+struct ggml_tensor * ggml_backend_expert_cache_get_device_bundle_map(ggml_backend_expert_cache_t cache) {
+    if (cache == nullptr || cache->host_bundle_resident.empty()) return nullptr;
+
+    const size_t bytes = cache->host_bundle_resident.size() * sizeof(uint8_t);
+    if (cache->gpu_bundle_map_buffer == nullptr || cache->gpu_bundle_map_tensor == nullptr) {
+        cache->gpu_bundle_map_buffer = ggml_backend_alloc_buffer(cache->backend, std::max((size_t)64 * 1024, bytes));
+        if (cache->gpu_bundle_map_buffer != nullptr) {
+            struct ggml_init_params p = { 4 * ggml_tensor_overhead(), nullptr, true };
+            struct ggml_context * c = ggml_init(p);
+            cache->gpu_bundle_map_tensor = ggml_new_tensor_1d(c, GGML_TYPE_I8, (int64_t)cache->host_bundle_resident.size());
+            cache->gpu_bundle_map_tensor->data = ggml_backend_buffer_get_base(cache->gpu_bundle_map_buffer);
+            cache->gpu_bundle_map_tensor->buffer = cache->gpu_bundle_map_buffer;
+        }
+    }
+    if (cache->gpu_bundle_map_tensor != nullptr && cache->gpu_bundle_map_buffer != nullptr) {
+        ggml_backend_tensor_set_async(cache->backend, cache->gpu_bundle_map_tensor, cache->host_bundle_resident.data(), 0, bytes);
+    }
+    return cache->gpu_bundle_map_tensor;
 }
 
 void * ggml_backend_expert_cache_get_pinned_buffer(
@@ -1763,28 +2061,48 @@ bool ggml_backend_expert_cache_load_pinned_manifest(
 
         auto reg_it = cache->bundle_registrations.find(layer);
         if (reg_it != cache->bundle_registrations.end()) {
-            if (reg_it->second.gate && reg_it->second.gate->data != NULL) {
-                ggml_backend_expert_cache_seed(cache, reg_it->second.gate, expert_id, 1000);
-                int32_t s = ggml_backend_expert_cache_find_slot(cache, reg_it->second.gate, expert_id);
-                if (s >= 0) {
-                    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg_it->second.gate);
-                    if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+            const auto & reg = reg_it->second;
+            if (reg.is_fused) {
+                if (reg.gate_up && reg.gate_up->data != NULL) {
+                    ggml_backend_expert_cache_seed(cache, reg.gate_up, expert_id, 1000);
+                    int32_t s = ggml_backend_expert_cache_find_slot(cache, reg.gate_up, expert_id);
+                    if (s >= 0) {
+                        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg.gate_up);
+                        if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                    }
                 }
-            }
-            if (reg_it->second.up && reg_it->second.up->data != NULL) {
-                ggml_backend_expert_cache_seed(cache, reg_it->second.up, expert_id, 1000);
-                int32_t s = ggml_backend_expert_cache_find_slot(cache, reg_it->second.up, expert_id);
-                if (s >= 0) {
-                    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg_it->second.up);
-                    if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                if (reg.down && reg.down->data != NULL) {
+                    ggml_backend_expert_cache_seed(cache, reg.down, expert_id, 1000);
+                    int32_t s = ggml_backend_expert_cache_find_slot(cache, reg.down, expert_id);
+                    if (s >= 0) {
+                        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg.down);
+                        if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                    }
                 }
-            }
-            if (reg_it->second.down && reg_it->second.down->data != NULL) {
-                ggml_backend_expert_cache_seed(cache, reg_it->second.down, expert_id, 1000);
-                int32_t s = ggml_backend_expert_cache_find_slot(cache, reg_it->second.down, expert_id);
-                if (s >= 0) {
-                    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg_it->second.down);
-                    if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+            } else {
+                if (reg.gate && reg.gate->data != NULL) {
+                    ggml_backend_expert_cache_seed(cache, reg.gate, expert_id, 1000);
+                    int32_t s = ggml_backend_expert_cache_find_slot(cache, reg.gate, expert_id);
+                    if (s >= 0) {
+                        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg.gate);
+                        if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                    }
+                }
+                if (reg.up && reg.up->data != NULL) {
+                    ggml_backend_expert_cache_seed(cache, reg.up, expert_id, 1000);
+                    int32_t s = ggml_backend_expert_cache_find_slot(cache, reg.up, expert_id);
+                    if (s >= 0) {
+                        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg.up);
+                        if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                    }
+                }
+                if (reg.down && reg.down->data != NULL) {
+                    ggml_backend_expert_cache_seed(cache, reg.down, expert_id, 1000);
+                    int32_t s = ggml_backend_expert_cache_find_slot(cache, reg.down, expert_id);
+                    if (s >= 0) {
+                        auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, reg.down);
+                        if (pool && s < pool->max_slots) pool->slots[s].is_pinned = true;
+                    }
                 }
             }
         }

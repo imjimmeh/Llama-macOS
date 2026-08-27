@@ -42,7 +42,8 @@ static heterogeneous_bench_result run_tier_bench(
         int n_prompt,
         int n_gen,
         size_t fit_target_bytes,
-        int n_threads) {
+        int n_threads,
+        bool isolate_dense) {
 
     heterogeneous_bench_result res;
     res.tier_name = tier_name;
@@ -50,16 +51,22 @@ static heterogeneous_bench_result run_tier_bench(
     res.cache_bytes = cache_bytes;
 
     printf("\n================================================================================\n");
-    printf("  Benchmarking Tier: %s (Manifest: %s | Cache: %zu MiB)\n",
-        tier_name.c_str(), manifest_path.empty() ? "None (CPU Control)" : manifest_path.c_str(), cache_bytes / (1024 * 1024));
+    printf("  Benchmarking Tier: %s (Manifest: %s | Cache: %zu MiB | Mode: %s)\n",
+        tier_name.c_str(), manifest_path.empty() ? "None (CPU Control)" : manifest_path.c_str(),
+        cache_bytes / (1024 * 1024), isolate_dense ? "Scientific Isolation (Frozen Dense)" : "Fit Budget Competition");
     printf("================================================================================\n");
 
     common_params params;
     params.model.path = model_path;
-    params.n_gpu_layers = -1;
-    params.fit_params = true;
-    params.fit_params_target = std::vector<size_t>(llama_max_devices(), fit_target_bytes);
-    params.fit_params_min_ctx = n_prompt + n_gen + 256;
+    if (isolate_dense) {
+        params.n_gpu_layers = 99;
+        params.fit_params = false;
+    } else {
+        params.n_gpu_layers = -1;
+        params.fit_params = true;
+        params.fit_params_target = std::vector<size_t>(llama_max_devices(), fit_target_bytes);
+        params.fit_params_min_ctx = n_prompt + n_gen + 256;
+    }
     params.cpuparams.n_threads = n_threads;
     params.cpuparams_batch.n_threads = n_threads;
     params.n_ctx = n_prompt + n_gen + 256;
@@ -158,6 +165,7 @@ int main(int argc, char ** argv) {
     int n_prompt = 16;
     int n_gen = 64;
     size_t fit_target_bytes = 256 * 1024 * 1024; // 256 MiB VRAM margin
+    bool isolate_dense = true;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -170,14 +178,16 @@ int main(int argc, char ** argv) {
             n_gen = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-fitt") == 0 && i + 1 < argc) {
             fit_target_bytes = (size_t)atoi(argv[++i]) * 1024 * 1024;
+        } else if (strcmp(argv[i], "--fit") == 0) {
+            isolate_dense = false;
         }
     }
 
     printf("================================================================================\n");
-    printf("Epic 4: True Heterogeneous Route Execution Benchmark & Gate B Evaluation\n");
+    printf("Epic 4: Bundle-Level Heterogeneous Route Execution Benchmark & Gate B Evaluation\n");
     printf("Model: %s\n", model_path.c_str());
-    printf("Threads: %d | Prompt: %d tokens | Generation: %d tokens | Fit Target: %zu MiB\n",
-        n_threads, n_prompt, n_gen, fit_target_bytes / (1024 * 1024));
+    printf("Threads: %d | Prompt: %d tokens | Generation: %d tokens | Mode: %s\n",
+        n_threads, n_prompt, n_gen, isolate_dense ? "Scientific Isolation (Frozen Dense)" : "Fit Budget Competition");
     printf("================================================================================\n");
 
     llama_backend_init();
@@ -185,27 +195,37 @@ int main(int argc, char ** argv) {
     std::vector<heterogeneous_bench_result> results;
 
     // 1. Control Baseline: CPU routed MoE (0 MiB cache)
-    results.push_back(run_tier_bench(model_path, "CPU Baseline (Control)", "", 0, n_prompt, n_gen, fit_target_bytes, n_threads));
+    results.push_back(run_tier_bench(model_path, "CPU Baseline (Control)", "", 0, n_prompt, n_gen, fit_target_bytes, n_threads, isolate_dense));
+
+    // Calibration check: verify baseline is authentic
+    const double baseline_tps = results[0].tg_tps;
+    printf("\n[Baseline Calibration Check] Measured Control Baseline: %.2f tok/s (Expected ~2.60 tok/s)\n", baseline_tps);
+    if (baseline_tps < 1.5 || baseline_tps > 5.0) {
+        printf("WARNING: Baseline throughput deviates significantly from established ~2.60 tok/s reference.\n");
+        printf("Diagnose tensor placement / host thread configuration before drawing final Gate B conclusions.\n");
+    } else {
+        printf(">> Baseline calibration verified within valid reference envelope.\n\n");
+    }
 
     // 2. Static Pinned 64 MiB Tier
-    results.push_back(run_tier_bench(model_path, "Pinned 64 MiB", "pinned_experts_64mb.json", 64 * 1024 * 1024, n_prompt, n_gen, fit_target_bytes, n_threads));
+    results.push_back(run_tier_bench(model_path, "Pinned 64 MiB", "pinned_experts_64mb.json", 64 * 1024 * 1024, n_prompt, n_gen, fit_target_bytes, n_threads, isolate_dense));
 
     // 3. Static Pinned 128 MiB Tier
-    results.push_back(run_tier_bench(model_path, "Pinned 128 MiB", "pinned_experts_128mb.json", 128 * 1024 * 1024, n_prompt, n_gen, fit_target_bytes, n_threads));
+    results.push_back(run_tier_bench(model_path, "Pinned 128 MiB", "pinned_experts_128mb.json", 128 * 1024 * 1024, n_prompt, n_gen, fit_target_bytes, n_threads, isolate_dense));
 
     // 4. Static Pinned 256 MiB Tier
-    results.push_back(run_tier_bench(model_path, "Pinned 256 MiB", "pinned_experts_256mb.json", 256 * 1024 * 1024, n_prompt, n_gen, fit_target_bytes, n_threads));
+    results.push_back(run_tier_bench(model_path, "Pinned 256 MiB", "pinned_experts_256mb.json", 256 * 1024 * 1024, n_prompt, n_gen, fit_target_bytes, n_threads, isolate_dense));
 
     // 5. Static Pinned 512 MiB Tier
-    results.push_back(run_tier_bench(model_path, "Pinned 512 MiB", "pinned_experts_512mb.json", 512 * 1024 * 1024, n_prompt, n_gen, fit_target_bytes, n_threads));
+    results.push_back(run_tier_bench(model_path, "Pinned 512 MiB", "pinned_experts_512mb.json", 512 * 1024 * 1024, n_prompt, n_gen, fit_target_bytes, n_threads, isolate_dense));
 
     // 6. Static Pinned 1024 MiB Tier
-    results.push_back(run_tier_bench(model_path, "Pinned 1024 MiB", "pinned_experts_1024mb.json", 1024 * 1024 * 1024, n_prompt, n_gen, fit_target_bytes, n_threads));
+    results.push_back(run_tier_bench(model_path, "Pinned 1024 MiB", "pinned_experts_1024mb.json", 1024 * 1024 * 1024, n_prompt, n_gen, fit_target_bytes, n_threads, isolate_dense));
 
     // Compute speedup vs control baseline
-    const double baseline_tps = results[0].tg_tps > 0 ? results[0].tg_tps : 1.0;
+    const double valid_base_tps = baseline_tps > 0 ? baseline_tps : 1.0;
     for (auto & r : results) {
-        r.speedup_vs_baseline = r.tg_tps / baseline_tps;
+        r.speedup_vs_baseline = r.tg_tps / valid_base_tps;
     }
 
     printf("\n\n========================================================================================================================\n");
