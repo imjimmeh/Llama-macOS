@@ -1965,6 +1965,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * node;
             struct ggml_tensor * orig_src0;
             struct ggml_tensor * orig_src2;
+            enum ggml_op         orig_op;
         };
         std::vector<ggml_restored_node> restored_nodes;
 
@@ -2226,150 +2227,73 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                                 node->src[0] = slot_tensor;
                                 node->src[2] = remapped_ids_tensor;
-                                restored_nodes.push_back({ node, input_cpy, ids_tensor });
+                                restored_nodes.push_back({ node, input_cpy, ids_tensor, node->op });
                                 used_zero_copy = true;
 
                             }
                         }
 
                         if (!used_zero_copy) {
-                            // partition into hits and misses
-                            miss_bitset.assign(ggml_bitset_size(n_expert), 0);
-                            struct cache_hit_info {
-                                int32_t expert_id;
-                                size_t  cache_offset;
-                            };
-                            std::vector<cache_hit_info> hits;
-
-                            struct ggml_tensor * cache_tensor = ggml_backend_expert_cache_get_tensor(cache);
-
-                            for (int32_t exp_id : requested_experts) {
-                                size_t c_offset = ggml_backend_expert_cache_find_offset(cache, input, exp_id);
-                                if (c_offset != SIZE_MAX) {
-                                    ggml_backend_expert_cache_record_hit(cache, input, exp_id, expert_size);
-                                    hits.push_back({ exp_id, c_offset });
-                                } else {
-                                    ggml_backend_expert_cache_record_miss(cache, expert_size);
-                                    ggml_bitset_set(miss_bitset.data(), exp_id);
+                            int cpu_backend_id = -1;
+                            for (int b = 0; b < sched->n_backends; b++) {
+                                if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                    cpu_backend_id = b;
+                                    break;
                                 }
                             }
 
-                        // 1. Process hits via Device-to-Device async copies
-                        for (const auto & hit : hits) {
-                            const size_t expert_offset = (size_t)hit.expert_id * expert_size;
-                            const size_t copy_size = expert_size;
+                            if (cpu_backend_id >= 0 && ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                // Execute MUL_MAT_ID directly on CPU threads using host RAM weights
+                                // ZERO expert weights are copied across PCIe!
+                                const size_t in_bytes  = ggml_nbytes(node->src[1]);
+                                const size_t out_bytes = ggml_nbytes(node);
 
-                            struct ggml_tensor src_view = *cache_tensor;
-                            src_view.type = GGML_TYPE_I8;
-                            src_view.data = (uint8_t *)cache_tensor->data + hit.cache_offset;
-                            src_view.ne[0] = copy_size;
-                            src_view.ne[1] = 1;
-                            src_view.ne[2] = 1;
-                            src_view.ne[3] = 1;
-                            src_view.nb[0] = 1;
-                            src_view.nb[1] = copy_size;
-                            src_view.nb[2] = copy_size;
-                            src_view.nb[3] = copy_size;
-                            src_view.view_src = cache_tensor;
+                                static std::vector<uint8_t> cpu_act_in;
+                                static std::vector<uint8_t> cpu_act_out;
+                                if (cpu_act_in.size() < in_bytes)   cpu_act_in.resize(in_bytes);
+                                if (cpu_act_out.size() < out_bytes) cpu_act_out.resize(out_bytes);
 
-                            struct ggml_tensor dst_view = *input_cpy;
-                            dst_view.type = GGML_TYPE_I8;
-                            dst_view.data = (uint8_t *)input_cpy->data + expert_offset;
-                            dst_view.ne[0] = copy_size;
-                            dst_view.ne[1] = 1;
-                            dst_view.ne[2] = 1;
-                            dst_view.ne[3] = 1;
-                            dst_view.nb[0] = 1;
-                            dst_view.nb[1] = copy_size;
-                            dst_view.nb[2] = copy_size;
-                            dst_view.nb[3] = copy_size;
-                            dst_view.view_src = input_cpy;
+                                // 1. Fetch input activation from GPU (only 8 KiB)
+                                ggml_backend_tensor_get_async(split_backend, node->src[1], cpu_act_in.data(), 0, in_bytes);
+                                ggml_backend_synchronize(split_backend);
 
-                            ggml_backend_tensor_copy_async(split_backend, split_backend, &src_view, &dst_view);
-                        }
+                                // 2. Construct CPU execution tensor descriptors
+                                struct ggml_tensor cpu_src1 = *(node->src[1]);
+                                cpu_src1.data = cpu_act_in.data();
+                                cpu_src1.buffer = nullptr;
+                                cpu_src1.view_src = nullptr;
 
-                        // 2. Process misses: copy PCIe to input_cpy (+ populate cache if on-demand LRU mode)
-                        const bool is_periodic = ggml_backend_expert_cache_get_period(cache) > 0;
-                        const bool allow_lru_insert = !is_periodic && (ids_tensor->ne[1] == 1);
+                                struct ggml_tensor cpu_ids = *ids_tensor;
+                                cpu_ids.data = ids.data();
+                                cpu_ids.buffer = nullptr;
+                                cpu_ids.view_src = nullptr;
 
-                        auto copy_miss_range = [&](int32_t first_id, int32_t last_id) {
-                            const size_t expert_offset = (size_t)first_id * expert_size;
-                            const size_t expert_size_copy = (size_t)(last_id - first_id + 1) * expert_size;
-                            const size_t padding = std::min<size_t>(expert_size, (size_t)512);
-                            const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+                                struct ggml_tensor cpu_out = *node;
+                                cpu_out.data = cpu_act_out.data();
+                                cpu_out.buffer = nullptr;
+                                cpu_out.view_src = nullptr;
+                                cpu_out.src[0] = input;      // Host weights directly in CPU RAM!
+                                cpu_out.src[1] = &cpu_src1;  // Input activation in host RAM
+                                cpu_out.src[2] = &cpu_ids;   // Router IDs in host RAM
 
-                            ggml_backend_tensor_set_async(split_backend,
-                                input_cpy,
-                                (const uint8_t *)input->data + expert_offset, expert_offset,
-                                expert_size_copy + padding_end);
+                                struct ggml_tensor * cpu_nodes[1] = { &cpu_out };
+                                struct ggml_tensor * cpu_leafs[3] = { input, &cpu_src1, &cpu_ids };
+                                struct ggml_cgraph cpu_graph = {};
+                                cpu_graph.n_nodes = 1;
+                                cpu_graph.nodes = cpu_nodes;
+                                cpu_graph.n_leafs = 3;
+                                cpu_graph.leafs = cpu_leafs;
 
-                            if (allow_lru_insert) {
-                                for (int32_t mid = first_id; mid <= last_id; mid++) {
-                                    size_t slot_offset = ggml_backend_expert_cache_alloc_slot(
-                                        cache, input, mid, expert_size,
-                                        pinned_keys.data(), pinned_keys.size());
+                                // 3. Compute MUL_MAT_ID on CPU using CPU threads
+                                ggml_backend_graph_compute(sched->backends[cpu_backend_id], &cpu_graph);
 
-                                    if (slot_offset != SIZE_MAX) {
-                                        const size_t src_off = (size_t)mid * expert_size;
-                                        const size_t copy_size = expert_size;
+                                // 4. Set computed activation back to GPU node output buffer
+                                ggml_backend_tensor_set_async(split_backend, node, cpu_act_out.data(), 0, out_bytes);
 
-                                        struct ggml_tensor src_view = *input_cpy;
-                                        src_view.type = GGML_TYPE_I8;
-                                        src_view.data = (uint8_t *)input_cpy->data + src_off;
-                                        src_view.ne[0] = copy_size;
-                                        src_view.ne[1] = 1;
-                                        src_view.ne[2] = 1;
-                                        src_view.ne[3] = 1;
-                                        src_view.nb[0] = 1;
-                                        src_view.nb[1] = copy_size;
-                                        src_view.nb[2] = copy_size;
-                                        src_view.nb[3] = copy_size;
-                                        src_view.view_src = input_cpy;
-
-                                        struct ggml_tensor dst_view = *cache_tensor;
-                                        dst_view.type = GGML_TYPE_I8;
-                                        dst_view.data = (uint8_t *)cache_tensor->data + slot_offset;
-                                        dst_view.ne[0] = copy_size;
-                                        dst_view.ne[1] = 1;
-                                        dst_view.ne[2] = 1;
-                                        dst_view.ne[3] = 1;
-                                        dst_view.nb[0] = 1;
-                                        dst_view.nb[1] = copy_size;
-                                        dst_view.nb[2] = copy_size;
-                                        dst_view.nb[3] = copy_size;
-                                        dst_view.view_src = cache_tensor;
-
-                                        ggml_backend_tensor_copy_async(split_backend, split_backend, &src_view, &dst_view);
-                                    }
-                                }
+                                // 5. Mark node as GGML_OP_NONE so GPU split skips recomputing it
+                                restored_nodes.push_back({ node, input_cpy, ids_tensor, node->op });
+                                node->op = GGML_OP_NONE;
                             }
-                        };
-
-                        int mid = 0;
-                        while (mid < n_expert && !ggml_bitset_get(miss_bitset.data(), mid)) {
-                            mid++;
-                        }
-                        if (mid < n_expert) {
-                            int32_t first_id = mid;
-                            int32_t last_id = first_id;
-
-                            for (++mid; mid < n_expert; ++mid) {
-                                if (!ggml_bitset_get(miss_bitset.data(), mid)) {
-                                    continue;
-                                }
-
-                                if (mid == last_id + 1) {
-                                    last_id = mid;
-                                    continue;
-                                }
-
-                                copy_miss_range(first_id, last_id);
-
-                                first_id = mid;
-                                last_id = mid;
-                            }
-                            copy_miss_range(first_id, last_id);
-                        }
                         }
                     }
                 } else {
@@ -2434,10 +2358,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
 
-        // restore any modified node src[0] and src[2] pointers for graph idempotency
+        // restore any modified node src[0], src[2], and op pointers for graph idempotency
         for (auto & rn : restored_nodes) {
             rn.node->src[0] = rn.orig_src0;
             rn.node->src[2] = rn.orig_src2;
+            rn.node->op     = rn.orig_op;
         }
 
         // record the event of this copy
