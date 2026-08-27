@@ -2320,10 +2320,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 // 3. Compute MUL_MAT_ID on CPU using CPU threads (host RAM weights).
                                 ggml_backend_graph_compute(sched->backends[cpu_backend_id], &cpu_graph);
 
-                                // 4. Write computed activation back to node output on GPU.
+                                // 4. Write computed activation back to node output on GPU stream asynchronously.
                                 //    Mark op = NONE so the GPU split skips recomputing it.
                                 ggml_backend_tensor_set_async(split_backend, node, sched->cpu_sched_down_out.data(), 0, out_bytes);
-                                ggml_backend_synchronize(split_backend);
                                 save_node_for_restore(node);
                                 node->op = GGML_OP_NONE;
                             }

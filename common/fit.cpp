@@ -583,7 +583,11 @@ static void common_params_fit_impl(
     std::vector<int64_t> targets; // maximum acceptable memory use per device
     targets.reserve(nd);
     for (size_t id = 0; id < nd; id++) {
-        targets.push_back(dmds_full[id].free - margins[id]);
+        int64_t target_mem = dmds_full[id].free - margins[id];
+        if (cparams != nullptr && cparams->expert_cache_size > 0 && cparams->expert_cache_size != (size_t)-1) {
+            target_mem -= int64_t(cparams->expert_cache_size);
+        }
+        targets.push_back(std::max<int64_t>(0, target_mem));
         LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
     }
 
@@ -664,7 +668,7 @@ static void common_params_fit_impl(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
-    if (hp_nex == 0 || global_surplus_cpu_moe <= 0 || (cparams != nullptr && cparams->expert_cache_size > 0)) {
+    if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }

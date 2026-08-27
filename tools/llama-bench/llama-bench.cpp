@@ -356,6 +356,7 @@ struct cmd_params {
     std::vector<size_t>              expert_cache_size;
     std::vector<int32_t>             expert_cache_period;
     std::vector<int32_t>             expert_cache_max_swaps;
+    std::vector<std::string>         pinned_experts_manifest;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -404,6 +405,7 @@ static const cmd_params cmd_params_defaults = {
     /* expert_cache_size    */ { 0 },
     /* expert_cache_period  */ { 64 },
     /* expert_cache_max_swaps */ { -1 },
+    /* pinned_experts_manifest */ { "" },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -434,6 +436,7 @@ static void print_usage(int /*argc*/, const char * const * argv) {
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     printf("  -exc, --expert-cache <MiB>                  size of VRAM expert cache in MiB (default: 0)\n");
     printf("  -excp, --expert-cache-period <n0,n1,...>    token interval for expert cache rebalancing (0 = on-demand LRU, default: 64)\n");
+    printf("  -pe, --pinned-experts <path0,path1,...>     path to static pinned experts JSON manifest (e.g. pinned_experts_1024mb.json)\n");
     if (llama_supports_rpc()) {
         printf("  -rpc, --rpc <rpc_servers>                   register RPC devices (comma separated)\n");
     }
@@ -1103,6 +1106,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 for (const auto & v : p) {
                     params.expert_cache_max_swaps.push_back(std::stoi(v));
                 }
+            } else if (arg == "-pe" || arg == "--pinned-experts") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                for (const auto & v : p) {
+                    params.pinned_experts_manifest.push_back((v == "none" || v == "0" || v == "null") ? "" : v);
+                }
             } else {
                 invalid_param = true;
                 break;
@@ -1238,6 +1250,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.expert_cache_max_swaps.empty()) {
         params.expert_cache_max_swaps = cmd_params_defaults.expert_cache_max_swaps;
     }
+    if (params.pinned_experts_manifest.empty()) {
+        params.pinned_experts_manifest = cmd_params_defaults.pinned_experts_manifest;
+    }
 
     return params;
 }
@@ -1274,6 +1289,7 @@ struct cmd_params_instance {
     size_t             expert_cache_size;
     int32_t            expert_cache_period;
     int32_t            expert_cache_max_swaps;
+    std::string        pinned_experts_manifest;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1334,6 +1350,7 @@ struct cmd_params_instance {
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && devices == other.devices && no_host == other.no_host &&
+               pinned_experts_manifest == other.pinned_experts_manifest &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
@@ -1370,6 +1387,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & exc : params.expert_cache_size)
     for (const auto & excp : params.expert_cache_period)
     for (const auto & excm : params.expert_cache_max_swaps)
+    for (const auto & pe : params.pinned_experts_manifest)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & fs : params.ffn_split)
     for (const auto & ncmoe : params.n_cpu_moe)
@@ -1429,6 +1447,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_size     = */ exc,
                 /* .expert_cache_period   = */ excp,
                 /* .expert_cache_max_swaps = */ excm,
+                /* .pinned_experts_manifest = */ pe,
             };
             instances.push_back(instance);
         }
@@ -1469,6 +1488,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_size     = */ exc,
                 /* .expert_cache_period   = */ excp,
                 /* .expert_cache_max_swaps = */ excm,
+                /* .pinned_experts_manifest = */ pe,
             };
             instances.push_back(instance);
         }
@@ -1509,6 +1529,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .expert_cache_size     = */ exc,
                 /* .expert_cache_period   = */ excp,
                 /* .expert_cache_max_swaps = */ excm,
+                /* .pinned_experts_manifest = */ pe,
             };
             instances.push_back(instance);
         }
@@ -1618,6 +1639,7 @@ struct test {
     ggml_backend_expert_cache_stats expert_cache_stats = {};
     int32_t                  expert_cache_period;
     int32_t                  expert_cache_max_swaps;
+    std::string              pinned_experts_manifest;
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
@@ -1661,6 +1683,7 @@ struct test {
         expert_cache_size   = inst.expert_cache_size;
         expert_cache_period = inst.expert_cache_period;
         expert_cache_max_swaps = inst.expert_cache_max_swaps;
+        pinned_experts_manifest = inst.pinned_experts_manifest;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
@@ -1719,7 +1742,7 @@ struct test {
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
-            "expert_cache_size", "expert_cache_period",
+            "expert_cache_size", "expert_cache_period", "pinned_experts",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts",
             "expert_cache_requests",
@@ -1786,7 +1809,7 @@ struct test {
         if (field == "avg_ts" || field == "stddev_ts" || field == "ffn_split") {
             return FLOAT;
         }
-        if (field == "load_mode") {
+        if (field == "load_mode" || field == "pinned_experts") {
             return STRING;
         }
         if (field == "expert_cache_requests" ||
@@ -1908,6 +1931,7 @@ struct test {
                                             std::to_string(fit_min_ctx),
                                             std::to_string(expert_cache_size),
                                             std::to_string(expert_cache_period),
+                                            pinned_experts_manifest.empty() ? "none" : (pinned_experts_manifest.find_last_of("/\\") == std::string::npos ? pinned_experts_manifest : pinned_experts_manifest.substr(pinned_experts_manifest.find_last_of("/\\") + 1)),
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
@@ -2199,6 +2223,9 @@ struct markdown_printer : public printer {
         if (field == "expert_cache_period") {
             return "excp";
         }
+        if (field == "pinned_experts") {
+            return "pinned";
+        }
         return field;
     }
 
@@ -2288,6 +2315,9 @@ struct markdown_printer : public printer {
         }
         if (params.expert_cache_period.size() > 1 || params.expert_cache_period != cmd_params_defaults.expert_cache_period) {
             fields.emplace_back("expert_cache_period");
+        }
+        if (params.pinned_experts_manifest.size() > 1 || (params.pinned_experts_manifest.size() == 1 && !params.pinned_experts_manifest[0].empty())) {
+            fields.emplace_back("pinned_experts");
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
@@ -2618,6 +2648,13 @@ int llama_bench(int argc, char ** argv) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
             llama_model_free(lmodel);
             return 1;
+        }
+
+        if (!inst.pinned_experts_manifest.empty()) {
+            ggml_backend_sched_t sched = llama_context_get_sched(ctx);
+            if (sched) {
+                ggml_backend_sched_load_pinned_manifest(sched, inst.pinned_experts_manifest.c_str());
+            }
         }
 
         test t(inst, lmodel, ctx);
