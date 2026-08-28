@@ -1479,3 +1479,15 @@ Command: `llama-bench -m <model> -p 16 -n 64 -t 14 -r 1 -fitt 256 -exc 64`
 - **PP16**: **10.46 tok/s**
 - **TG64**: **5.42 tok/s**
 - **Weight Upload Bytes**: **0 Bytes (Zero PCIe Weight Transfers Across Entire Inference Run)**
+
+### 5. Server & Long-Context Scaling Verification (`llama-server`)
+- **Target Model**: `Qwen3.6-35B-A3B-APEX-Compact.gguf`
+- **Router Config**: `G:\qwen3.6-35b-a3b-presets-exc-latest.ini` (Preset: `[qwen3.6-35B-apex-compact]`, `fit = on`, `fit-target = 256`, `exc = 128M`, `pinned-experts = ...`).
+- **Safeguards Applied**:
+  1. **Hopper PDL Compatibility Guard**: Prevented `cudaErrorMemoryAllocation` during kernel launch attribute inspection on pre-Hopper (Pascal CC 6.1) GPUs in `ggml-cuda/common.cuh`.
+  2. **Windows WDDM Memory Headroom**: Reserved 768 MiB working margin for WDDM compositor and CUDA runtime context arena in `--fit` (`common/fit.cpp`).
+  3. **Dynamic Buffer Multi-Token Prefill**: Used `no_alloc = true` with `ggml_backend_alloc_ctx_tensors(ctx_cpu, cpu_backend)` to support arbitrary prompt lengths up to 32k+ tokens with 0 memory pool exhaustion (`ggml-backend-moe-hetero.cpp`).
+- **Server Verification Result**:
+  - Warmup & slot initialization: **0 CUDA errors**.
+  - TG generation: **4.15 tok/s** on GTX 1080.
+  - Telemetry: **0 bytes in-band PCIe expert weight uploads**.
