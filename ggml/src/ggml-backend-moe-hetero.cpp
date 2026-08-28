@@ -123,17 +123,14 @@ enum ggml_status ggml_backend_moe_hetero_execute_serial(
         }
 
         struct ggml_init_params params_cpu = {
-            /*.mem_size   =*/ 64 * 1024 * 1024,
+            /*.mem_size   =*/ 16 * 1024 * 1024,
             /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ false,
+            /*.no_alloc   =*/ true,
         };
         struct ggml_context * ctx_cpu = ggml_init(params_cpu);
 
         struct ggml_tensor * cpu_x = ggml_new_tensor_3d(ctx_cpu, GGML_TYPE_F32, d_model, 1, n_tokens);
-        ggml_backend_tensor_get(bundle->layer_input, cpu_x->data, 0, (size_t)d_model * n_tokens * sizeof(float));
-
         struct ggml_tensor * cpu_ids = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_I32, top_k, n_tokens);
-        ggml_backend_tensor_get(bundle->route_ids, cpu_ids->data, 0, (size_t)top_k * n_tokens * sizeof(int32_t));
 
         struct ggml_tensor * cpu_gate = nullptr;
         struct ggml_tensor * cpu_up   = nullptr;
@@ -151,11 +148,17 @@ enum ggml_status ggml_backend_moe_hetero_execute_serial(
         struct ggml_tensor * cpu_act  = ggml_mul(ctx_cpu, cpu_silu, cpu_up);
         struct ggml_tensor * cpu_down = ggml_mul_mat_id(ctx_cpu, bw.down, cpu_act, cpu_ids);
 
+        ggml_backend_buffer_t buf_cpu = ggml_backend_alloc_ctx_tensors(ctx_cpu, cpu_backend);
+
+        ggml_backend_tensor_get(bundle->layer_input, cpu_x->data, 0, (size_t)d_model * n_tokens * sizeof(float));
+        ggml_backend_tensor_get(bundle->route_ids, cpu_ids->data, 0, (size_t)top_k * n_tokens * sizeof(int32_t));
+
         struct ggml_cgraph * gf_cpu = ggml_new_graph(ctx_cpu);
         ggml_build_forward_expand(gf_cpu, cpu_down);
         ggml_backend_graph_compute(cpu_backend, gf_cpu);
 
         ggml_backend_tensor_set(bundle->down_node, cpu_down->data, 0, (size_t)d_model * top_k * n_tokens * sizeof(float));
+        ggml_backend_buffer_free(buf_cpu);
         ggml_free(ctx_cpu);
 
         if (stats) {
