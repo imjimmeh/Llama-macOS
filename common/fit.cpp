@@ -220,13 +220,7 @@ static void common_params_fit_impl(
         margins.push_back(margins_s[0]);
     } else {
         for (size_t id = 0; id < nd; id++) {
-            int64_t margin = margins_s[id];
-#if defined(_WIN32)
-            if (id < devs.size() && ggml_backend_dev_type(devs[id]) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                margin += 768 * 1024 * 1024; // reserve 768 MiB for WDDM desktop composition and CUDA runtime context stack
-            }
-#endif
-            margins.push_back(margin);
+            margins.push_back(margins_s[id]);
         }
     }
 
