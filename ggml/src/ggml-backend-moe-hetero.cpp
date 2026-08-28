@@ -114,6 +114,60 @@ enum ggml_status ggml_backend_moe_hetero_execute_serial(
     const int64_t d_model = down_node->ne[0];
     const int64_t d_ff    = gu_node ? (gu_node->ne[0] / 2) : (gate_node ? gate_node->ne[0] : 0);
 
+    const int32_t n_tokens = (int32_t)(bundle->route_ids ? bundle->route_ids->ne[1] : 1);
+    if (n_tokens > 1) {
+        struct ggml_expert_bundle_weights bw = {};
+        if (!ggml_backend_expert_cache_get_bundle_weights(cache, bundle->layer, &bw)) {
+            fprintf(stderr, "[ERROR] hetero_execute_serial: failed to get bundle weights for layer=%d\n", bundle->layer);
+            return GGML_STATUS_FAILED;
+        }
+
+        struct ggml_init_params params_cpu = {
+            /*.mem_size   =*/ 64 * 1024 * 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ false,
+        };
+        struct ggml_context * ctx_cpu = ggml_init(params_cpu);
+
+        struct ggml_tensor * cpu_x = ggml_new_tensor_3d(ctx_cpu, GGML_TYPE_F32, d_model, 1, n_tokens);
+        ggml_backend_tensor_get(bundle->layer_input, cpu_x->data, 0, (size_t)d_model * n_tokens * sizeof(float));
+
+        struct ggml_tensor * cpu_ids = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_I32, top_k, n_tokens);
+        ggml_backend_tensor_get(bundle->route_ids, cpu_ids->data, 0, (size_t)top_k * n_tokens * sizeof(int32_t));
+
+        struct ggml_tensor * cpu_gate = nullptr;
+        struct ggml_tensor * cpu_up   = nullptr;
+
+        if (bundle->is_fused) {
+            struct ggml_tensor * cpu_gu = ggml_mul_mat_id(ctx_cpu, bw.gate_up, cpu_x, cpu_ids);
+            cpu_gate = ggml_view_3d(ctx_cpu, cpu_gu, d_ff, top_k, n_tokens, cpu_gu->nb[1], cpu_gu->nb[2], 0);
+            cpu_up   = ggml_view_3d(ctx_cpu, cpu_gu, d_ff, top_k, n_tokens, cpu_gu->nb[1], cpu_gu->nb[2], d_ff * cpu_gu->nb[0]);
+        } else {
+            cpu_gate = ggml_mul_mat_id(ctx_cpu, bw.gate, cpu_x, cpu_ids);
+            cpu_up   = ggml_mul_mat_id(ctx_cpu, bw.up,   cpu_x, cpu_ids);
+        }
+
+        struct ggml_tensor * cpu_silu = ggml_silu(ctx_cpu, cpu_gate);
+        struct ggml_tensor * cpu_act  = ggml_mul(ctx_cpu, cpu_silu, cpu_up);
+        struct ggml_tensor * cpu_down = ggml_mul_mat_id(ctx_cpu, bw.down, cpu_act, cpu_ids);
+
+        struct ggml_cgraph * gf_cpu = ggml_new_graph(ctx_cpu);
+        ggml_build_forward_expand(gf_cpu, cpu_down);
+        ggml_backend_graph_compute(cpu_backend, gf_cpu);
+
+        ggml_backend_tensor_set(bundle->down_node, cpu_down->data, 0, (size_t)d_model * top_k * n_tokens * sizeof(float));
+        ggml_free(ctx_cpu);
+
+        if (stats) {
+            stats->hetero_layers++;
+            stats->hetero_full_miss_layers++;
+            stats->hetero_cpu_routes += top_k * n_tokens;
+            stats->hetero_d2h_activation_bytes += (size_t)d_model * n_tokens * sizeof(float);
+            stats->hetero_h2d_result_bytes += (size_t)d_model * top_k * n_tokens * sizeof(float);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
     // Lazy initialization of persistent scratch if needed
     if (scratch == nullptr || !scratch->initialized) {
         fprintf(stderr, "[ERROR] hetero_execute_serial: uninitialized scratch %p\n", (void*)scratch);

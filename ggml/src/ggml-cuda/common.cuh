@@ -1584,6 +1584,9 @@ struct ggml_cuda_pdl_config {
 
 static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
     const int device = ggml_cuda_get_device();
+    if (ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_HOPPER) {
+        return false;
+    }
 
     struct cache_key {
         int          device;

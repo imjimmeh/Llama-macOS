@@ -221,9 +221,11 @@ static void common_params_fit_impl(
     } else {
         for (size_t id = 0; id < nd; id++) {
             int64_t margin = margins_s[id];
-            if (id == 0 && cparams != nullptr && cparams->expert_cache_size > 0 && cparams->expert_cache_size != (size_t)-1) {
-                margin += (int64_t)cparams->expert_cache_size;
+#if defined(_WIN32)
+            if (id < devs.size() && ggml_backend_dev_type(devs[id]) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                margin += 768 * 1024 * 1024; // reserve 768 MiB for WDDM desktop composition and CUDA runtime context stack
             }
+#endif
             margins.push_back(margin);
         }
     }
@@ -584,9 +586,6 @@ static void common_params_fit_impl(
     targets.reserve(nd);
     for (size_t id = 0; id < nd; id++) {
         int64_t target_mem = dmds_full[id].free - margins[id];
-        if (cparams != nullptr && cparams->expert_cache_size > 0 && cparams->expert_cache_size != (size_t)-1) {
-            target_mem -= int64_t(cparams->expert_cache_size);
-        }
         targets.push_back(std::max<int64_t>(0, target_mem));
         LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
     }

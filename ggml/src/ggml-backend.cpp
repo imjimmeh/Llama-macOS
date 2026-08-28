@@ -2182,9 +2182,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // remap, graph mutation) is a decode-time optimization for sparse expert
                 // selection. Batch prompt processing touches nearly every expert and
                 // benefits from the original bulk GPU/CPU path - do not intercept it.
-                const bool is_decode_route =
-                    node != NULL && node->src[2] != NULL && node->src[2]->ne[1] == 1;
-                if (cache_can_store && is_decode_route) {
+                if (cache_can_store) {
                     const int64_t t_sync_start = ggml_time_us();
                     int64_t t_host_start = 0;
 
@@ -2217,7 +2215,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     bool used_zero_copy = false;
 
-                    if (bplan && bplan->valid && ids_tensor->ne[1] == 1) {
+                    if (bplan && bplan->valid) {
                         used_zero_copy = true;
 
                         bool already_registered = false;
@@ -2410,7 +2408,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                                 used_zero_copy = true;
                                 continue;
-                            } else if (bplan && bplan->valid && ids_tensor->ne[1] == 1) {
+                            } else if (bplan && bplan->valid) {
                                 // Heterogeneous Partial-Hit / Miss: Avoid transferring weights across PCIe
                                 used_zero_copy = true;
 
@@ -2530,9 +2528,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         ggml_backend_expert_cache_t cache = sched->expert_caches[split_backend_id];
 
-                        std::vector<int32_t> live_ids(hb.top_k);
+                        const int32_t n_tokens = (int32_t)(plan.route_ids ? plan.route_ids->ne[1] : 1);
+                        const size_t total_ids = (size_t)hb.top_k * n_tokens;
+                        std::vector<int32_t> live_ids(total_ids);
                         if (plan.route_ids) {
-                            ggml_backend_tensor_get(plan.route_ids, live_ids.data(), 0, hb.top_k * sizeof(int32_t));
+                            ggml_backend_tensor_get(plan.route_ids, live_ids.data(), 0, total_ids * sizeof(int32_t));
                         }
 
                         enum ggml_status ec = ggml_backend_moe_hetero_execute_serial(
