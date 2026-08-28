@@ -1489,5 +1489,20 @@ Command: `llama-bench -m <model> -p 16 -n 64 -t 14 -r 1 -fitt 256 -exc 64`
   3. **Dynamic Buffer Multi-Token Prefill**: Used `no_alloc = true` with `ggml_backend_alloc_ctx_tensors(ctx_cpu, cpu_backend)` to support arbitrary prompt lengths up to 32k+ tokens with 0 memory pool exhaustion (`ggml-backend-moe-hetero.cpp`).
 - **Server Verification Result**:
   - Warmup & slot initialization: **0 CUDA errors**.
-  - TG generation: **4.15 tok/s** on GTX 1080.
+  - TG generation: **4.86 tok/s** on GTX 1080.
   - Telemetry: **0 bytes in-band PCIe expert weight uploads**.
+
+### 6. Single-Token vs Prompt-Batch Scheduling Partition & Slot Layout Alignment (2026-08-28)
+- **Problem**: 
+  1. Prompt processing throughput regressed due to per-layer synchronous host serialization during multi-token prefill.
+  2. Text generation generated slashes (`///`) due to assigning `hit_gate_slots` to `slot_down` across independent slot pools.
+  3. Server OOM occurred during TG graph reserve when the scheduler attempted to allocate 12.89 GB of VRAM copies for host MoE weights.
+- **Root Cause & Fixes**:
+  1. **Slot Independence**: Gate, Up, and Down pools maintain independent slot assignments. Separated `gpu_gate_ids`, `gpu_up_ids`, and `gpu_down_ids` in `ggml-backend-moe-hetero.cpp` and loaded their corresponding slot indices.
+  2. **Prompt Processing Gating**: Enforced `is_decode_mul_mat_id` (`tensor->src[2]->ne[1] == 1`) across `ggml_backend_sched_backend_id_from_cur`, `sched_split_graph` (passes 1-4), and `sched_compute_splits`. Multi-token prompt batches remain on CPU threadpools (`n_threads_batch = 14`) with zero weight transfers over PCIe.
+  3. **VRAM Weight Copy Bypass**: In `sched_split_graph` pass 5, added explicit bypass when tensors are managed by `expert_cache` to prevent `gallocr` from allocating 12.89 GB weight copies on GPU.
+- **Verification Results**:
+  - `pp512`: **118.98 tok/s** (fully restored multi-token prompt throughput).
+  - `tg32` / `tg128`: **4.86 tok/s** coherent deterministic reasoning output via `llama-server` and `curl`.
+  - Speculative decoding (`ngram-mod`): **100% draft acceptance rate** (`draft_n: 26, draft_n_accepted: 26`).
+  - Oracle unit tests: **100% pass across all 9 configurations ($N=0..8$)**.

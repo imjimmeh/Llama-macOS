@@ -1061,9 +1061,11 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                     tensor->op == GGML_OP_MUL_MAT_ID &&
                     tensor->src[2] != NULL &&
                     tensor->src[2]->ne[1] == 1;
-                if ((sched->op_offload || is_decode_mul_mat_id) && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                if (src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
-                        if (ggml_backend_supports_op(sched->backends[b], tensor) && ((sched->expert_caches[b] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[b], src)) || ggml_backend_offload_op(sched->backends[b], tensor))) {
+                        const bool has_cache = (sched->expert_caches[b] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[b], src));
+                        if (ggml_backend_supports_op(sched->backends[b], tensor) &&
+                            ((has_cache && is_decode_mul_mat_id) || (!has_cache && sched->op_offload && ggml_backend_offload_op(sched->backends[b], tensor)))) {
                             SET_CAUSE(tensor, "1.off");
                             return b;
                         }
@@ -1360,7 +1362,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             } else if (cur_backend_id != -1) {
                 if (node->src[0] && node->src[0]->buffer && ggml_backend_buffer_is_host(node->src[0]->buffer)) {
-                    if (sched->expert_caches[cur_backend_id] == NULL || !ggml_backend_expert_cache_has_tensor(sched->expert_caches[cur_backend_id], node->src[0])) {
+                    const bool is_decode_mul_mat_id =
+                        node->op == GGML_OP_MUL_MAT_ID &&
+                        node->src[2] != NULL &&
+                        node->src[2]->ne[1] == 1;
+                    if (!is_decode_mul_mat_id || sched->expert_caches[cur_backend_id] == NULL || !ggml_backend_expert_cache_has_tensor(sched->expert_caches[cur_backend_id], node->src[0])) {
                         continue;
                     }
                 }
@@ -1386,7 +1392,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             } else if (cur_backend_id != -1) {
                 if (node->src[0] && node->src[0]->buffer && ggml_backend_buffer_is_host(node->src[0]->buffer)) {
-                    if (sched->expert_caches[cur_backend_id] == NULL || !ggml_backend_expert_cache_has_tensor(sched->expert_caches[cur_backend_id], node->src[0])) {
+                    const bool is_decode_mul_mat_id =
+                        node->op == GGML_OP_MUL_MAT_ID &&
+                        node->src[2] != NULL &&
+                        node->src[2]->ne[1] == 1;
+                    if (!is_decode_mul_mat_id || sched->expert_caches[cur_backend_id] == NULL || !ggml_backend_expert_cache_has_tensor(sched->expert_caches[cur_backend_id], node->src[0])) {
                         continue;
                     }
                 }
@@ -1439,7 +1449,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             int n_supported_best = -1;
             for (int b = 0; b < sched->n_backends; b++) {
                 if (node->src[0] && node->src[0]->buffer && ggml_backend_buffer_is_host(node->src[0]->buffer) && b < sched->n_backends - 1) {
-                    if (sched->expert_caches[b] == NULL || !ggml_backend_expert_cache_has_tensor(sched->expert_caches[b], node->src[0])) {
+                    const bool is_decode_mul_mat_id =
+                        node->op == GGML_OP_MUL_MAT_ID &&
+                        node->src[2] != NULL &&
+                        node->src[2]->ne[1] == 1;
+                    if (!is_decode_mul_mat_id || sched->expert_caches[b] == NULL || !ggml_backend_expert_cache_has_tensor(sched->expert_caches[b], node->src[0])) {
                         continue;
                     }
                 }
@@ -1465,7 +1479,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // assigned node: upgrade to higher prio backend if possible
             for (int b = 0; b < *node_backend_id; b++) {
                 if (node->src[0] && node->src[0]->buffer && ggml_backend_buffer_is_host(node->src[0]->buffer)) {
-                    if (sched->expert_caches[b] == NULL || !ggml_backend_expert_cache_has_tensor(sched->expert_caches[b], node->src[0])) {
+                    const bool is_decode_mul_mat_id =
+                        node->op == GGML_OP_MUL_MAT_ID &&
+                        node->src[2] != NULL &&
+                        node->src[2]->ne[1] == 1;
+                    if (!is_decode_mul_mat_id || sched->expert_caches[b] == NULL || !ggml_backend_expert_cache_has_tensor(sched->expert_caches[b], node->src[0])) {
                         continue;
                     }
                 }
@@ -1658,6 +1676,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                    if (sched->expert_caches[cur_backend_id] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[cur_backend_id], src)) {
+                        // Managed by expert cache; do not duplicate full weight matrices into GPU VRAM
+                        continue;
+                    }
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -2214,8 +2236,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     bool used_zero_copy = false;
+                    const bool is_decode_route = ids_tensor != NULL && ids_tensor->ne[1] == 1;
 
-                    if (bplan && bplan->valid) {
+                    if (bplan && bplan->valid && is_decode_route) {
                         used_zero_copy = true;
 
                         bool already_registered = false;

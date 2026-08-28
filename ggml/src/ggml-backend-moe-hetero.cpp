@@ -227,8 +227,12 @@ enum ggml_status ggml_backend_moe_hetero_execute_serial(
         }
 
         std::vector<int32_t> hit_gate_slots(n_hits);
+        std::vector<int32_t> hit_up_slots(n_hits);
+        std::vector<int32_t> hit_down_slots(n_hits);
         for (int32_t i = 0; i < n_hits; i++) {
             hit_gate_slots[i] = bundle->is_fused ? hit_routes[i].gate_up_slot : hit_routes[i].gate_slot;
+            hit_up_slots[i]   = bundle->is_fused ? hit_routes[i].gate_up_slot : hit_routes[i].up_slot;
+            hit_down_slots[i] = hit_routes[i].down_slot;
         }
 
         struct ggml_init_params params_gpu = {
@@ -238,29 +242,35 @@ enum ggml_status ggml_backend_moe_hetero_execute_serial(
         };
         struct ggml_context * ctx_gpu = ggml_init(params_gpu);
 
-        struct ggml_tensor * inp_x   = ggml_new_tensor_3d(ctx_gpu, GGML_TYPE_F32, d_model, 1, 1);
+        struct ggml_tensor * inp_x        = ggml_new_tensor_3d(ctx_gpu, GGML_TYPE_F32, d_model, 1, 1);
         inp_x->data = input_x->data;
-        struct ggml_tensor * gpu_ids = ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_I32, n_hits, 1);
-        struct ggml_tensor * gpu_gate = nullptr;
-        struct ggml_tensor * gpu_up   = nullptr;
+        struct ggml_tensor * gpu_gate_ids = ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_I32, n_hits, 1);
+        struct ggml_tensor * gpu_up_ids   = bundle->is_fused ? gpu_gate_ids : ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_I32, n_hits, 1);
+        struct ggml_tensor * gpu_down_ids = ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_I32, n_hits, 1);
+        struct ggml_tensor * gpu_gate     = nullptr;
+        struct ggml_tensor * gpu_up       = nullptr;
 
         if (bundle->is_fused) {
-            struct ggml_tensor * gpu_gu = ggml_mul_mat_id(ctx_gpu, slot_gu, inp_x, gpu_ids);
+            struct ggml_tensor * gpu_gu = ggml_mul_mat_id(ctx_gpu, slot_gu, inp_x, gpu_gate_ids);
             gpu_gate = ggml_view_3d(ctx_gpu, gpu_gu, d_ff, n_hits, 1, gpu_gu->nb[1], gpu_gu->nb[2], 0);
             gpu_up   = ggml_view_3d(ctx_gpu, gpu_gu, d_ff, n_hits, 1, gpu_gu->nb[1], gpu_gu->nb[2], d_ff * gpu_gu->nb[0]);
         } else {
-            gpu_gate = ggml_mul_mat_id(ctx_gpu, slot_gate, inp_x, gpu_ids);
-            gpu_up   = ggml_mul_mat_id(ctx_gpu, slot_up,   inp_x, gpu_ids);
+            gpu_gate = ggml_mul_mat_id(ctx_gpu, slot_gate, inp_x, gpu_gate_ids);
+            gpu_up   = ggml_mul_mat_id(ctx_gpu, slot_up,   inp_x, gpu_up_ids);
         }
 
         struct ggml_tensor * gpu_act  = ggml_swiglu_split(ctx_gpu, gpu_gate, gpu_up);
-        struct ggml_tensor * gpu_down = ggml_mul_mat_id(ctx_gpu, slot_down, gpu_act, gpu_ids);
+        struct ggml_tensor * gpu_down = ggml_mul_mat_id(ctx_gpu, slot_down, gpu_act, gpu_down_ids);
 
         struct ggml_cgraph * gf_gpu = ggml_new_graph(ctx_gpu);
         ggml_build_forward_expand(gf_gpu, gpu_down);
 
         ggml_backend_buffer_t buf_gpu_exec = ggml_backend_alloc_ctx_tensors(ctx_gpu, gpu_backend);
-        ggml_backend_tensor_set(gpu_ids, hit_gate_slots.data(), 0, n_hits * sizeof(int32_t));
+        ggml_backend_tensor_set(gpu_gate_ids, hit_gate_slots.data(), 0, n_hits * sizeof(int32_t));
+        if (!bundle->is_fused) {
+            ggml_backend_tensor_set(gpu_up_ids, hit_up_slots.data(), 0, n_hits * sizeof(int32_t));
+        }
+        ggml_backend_tensor_set(gpu_down_ids, hit_down_slots.data(), 0, n_hits * sizeof(int32_t));
 
         ggml_backend_graph_compute(gpu_backend, gf_gpu);
         ggml_backend_synchronize(gpu_backend);
@@ -350,9 +360,13 @@ enum ggml_status ggml_backend_moe_hetero_execute_serial(
     }
 
     std::vector<int32_t> hit_gate_slots(n_hits);
+    std::vector<int32_t> hit_up_slots(n_hits);
+    std::vector<int32_t> hit_down_slots(n_hits);
     std::vector<int32_t> hit_route_indices(n_hits);
     for (int32_t i = 0; i < n_hits; i++) {
         hit_gate_slots[i]    = bundle->is_fused ? hit_routes[i].gate_up_slot : hit_routes[i].gate_slot;
+        hit_up_slots[i]      = bundle->is_fused ? hit_routes[i].gate_up_slot : hit_routes[i].up_slot;
+        hit_down_slots[i]    = hit_routes[i].down_slot;
         hit_route_indices[i] = hit_routes[i].route;
     }
 
@@ -371,29 +385,35 @@ enum ggml_status ggml_backend_moe_hetero_execute_serial(
     };
     struct ggml_context * ctx_gpu = ggml_init(params_gpu);
 
-    struct ggml_tensor * inp_x   = ggml_new_tensor_3d(ctx_gpu, GGML_TYPE_F32, d_model, 1, 1);
+    struct ggml_tensor * inp_x        = ggml_new_tensor_3d(ctx_gpu, GGML_TYPE_F32, d_model, 1, 1);
     inp_x->data = input_x->data;
-    struct ggml_tensor * gpu_ids = ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_I32, n_hits, 1);
-    struct ggml_tensor * gpu_gate = nullptr;
-    struct ggml_tensor * gpu_up   = nullptr;
+    struct ggml_tensor * gpu_gate_ids = ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_I32, n_hits, 1);
+    struct ggml_tensor * gpu_up_ids   = bundle->is_fused ? gpu_gate_ids : ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_I32, n_hits, 1);
+    struct ggml_tensor * gpu_down_ids = ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_I32, n_hits, 1);
+    struct ggml_tensor * gpu_gate     = nullptr;
+    struct ggml_tensor * gpu_up       = nullptr;
 
     if (bundle->is_fused) {
-        struct ggml_tensor * gpu_gu = ggml_mul_mat_id(ctx_gpu, slot_gu, inp_x, gpu_ids);
+        struct ggml_tensor * gpu_gu = ggml_mul_mat_id(ctx_gpu, slot_gu, inp_x, gpu_gate_ids);
         gpu_gate = ggml_view_3d(ctx_gpu, gpu_gu, d_ff, n_hits, 1, gpu_gu->nb[1], gpu_gu->nb[2], 0);
         gpu_up   = ggml_view_3d(ctx_gpu, gpu_gu, d_ff, n_hits, 1, gpu_gu->nb[1], gpu_gu->nb[2], d_ff * gpu_gu->nb[0]);
     } else {
-        gpu_gate = ggml_mul_mat_id(ctx_gpu, slot_gate, inp_x, gpu_ids);
-        gpu_up   = ggml_mul_mat_id(ctx_gpu, slot_up,   inp_x, gpu_ids);
+        gpu_gate = ggml_mul_mat_id(ctx_gpu, slot_gate, inp_x, gpu_gate_ids);
+        gpu_up   = ggml_mul_mat_id(ctx_gpu, slot_up,   inp_x, gpu_up_ids);
     }
 
     struct ggml_tensor * gpu_act  = ggml_swiglu_split(ctx_gpu, gpu_gate, gpu_up);
-    struct ggml_tensor * gpu_down = ggml_mul_mat_id(ctx_gpu, slot_down, gpu_act, gpu_ids);
+    struct ggml_tensor * gpu_down = ggml_mul_mat_id(ctx_gpu, slot_down, gpu_act, gpu_down_ids);
 
     struct ggml_cgraph * gf_gpu = ggml_new_graph(ctx_gpu);
     ggml_build_forward_expand(gf_gpu, gpu_down);
 
     ggml_backend_buffer_t buf_gpu_exec = ggml_backend_alloc_ctx_tensors(ctx_gpu, gpu_backend);
-    ggml_backend_tensor_set(gpu_ids, hit_gate_slots.data(), 0, n_hits * sizeof(int32_t));
+    ggml_backend_tensor_set(gpu_gate_ids, hit_gate_slots.data(), 0, n_hits * sizeof(int32_t));
+    if (!bundle->is_fused) {
+        ggml_backend_tensor_set(gpu_up_ids, hit_up_slots.data(), 0, n_hits * sizeof(int32_t));
+    }
+    ggml_backend_tensor_set(gpu_down_ids, hit_down_slots.data(), 0, n_hits * sizeof(int32_t));
 
     // Execute GPU hit routes
     ggml_backend_graph_compute(gpu_backend, gf_gpu);
