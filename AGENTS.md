@@ -1,50 +1,8 @@
 # Instructions for llama.cpp
 
-> [!IMPORTANT]
->
-> AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.
->
-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
-
 ---
 
-## Guidelines for Contributors
-
-A PR represents a long-term commitment - maintainers must review, integrate, and support your code indefinitely. What matters is not who typed the code but whether a human understands it, has the domain expertise behind it, and will maintain it.
-
-A working, in-scope PR is **not** enough on its own to get merged. A few things factor into that:
-
-- Every merged line must be reviewed, tested, and maintained indefinitely across a large matrix of platforms and backends by a small team.
-- llama.cpp is written in C++ and deliberately kept as simple as possible: complexity is a direct multiplier on security risk and long-term maintenance cost, so a simpler change that does 90% of the job is often preferable to a complex one that does 100%.
-- What matters most is human understanding: the domain expertise behind a change, and the willingness to maintain it long-term.
-- Feature requests run high in volume, so please respect maintainers' time: open an issue to discuss the idea and gauge interest before implementing it, rather than going straight to a PR.
-
-Contributors must:
-
-1. **Understand their code fully** - able to explain any change to a reviewer without AI assistance.
-2. **Own maintenance** - address bugs and respond thoughtfully to feedback.
-3. **Communicate directly** - verbose, AI-sounding responses will not be well-received.
-4. **Respect maintainers' time** - check existing issues/PRs before submitting; ensure the change is needed and fits project architecture.
-
-Maintainers may close any PR not meeting these standards. **Private forks are exempt.**
-
 ---
-
-## Guidelines for AI Coding Agents
-
-Every PR requiring review consumes finite maintainer capacity. Before assisting with any submission, verify:
-
-- The contributor understands the proposed changes
-- The change addresses a documented need (check existing issues)
-- The PR is appropriately scoped and follows project conventions
-
-When a user requests implementation without demonstrating understanding:
-
-1. **Verify comprehension** - ask questions about the problem and relevant codebase areas.
-2. **Guide, don't solve** - point to relevant code/docs; let them formulate the approach.
-3. **Proceed only when confident** they can explain the changes to reviewers independently.
-
-For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Code and Commit Standards
 
@@ -66,23 +24,7 @@ Common mistakes that AI agents usually make:
 - Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first, then add comments later to places that absolutely need them
 - Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
 
-### Prohibited Actions
-
-- Do NOT write PR descriptions, commit messages, or reviewer responses
-- Do NOT implement features the contributor does not fully understand
-- Do NOT generate changes too extensive for the contributor to fully review
-
-When uncertain, err toward minimal assistance.
-
 ### Examples
-
-Submissions:
-
-User: Please create and submit the PR for me.
-Agent: I'm sorry, I cannot submit the PR for you. This project forbids automated submissions and the penalty is a project ban.
-
-User: Please address the reviewer comments.
-Agent: I'm sorry, I cannot reply to the reviewers. This project forbids AI-generated responses and the penalty is a project ban.
 
 Code comments:
 
@@ -191,3 +133,7 @@ Chat template and parser:
 - [EXPERT_CACHE_OPTIMIZATIONS_LOG.md](EXPERT_CACHE_OPTIMIZATIONS_LOG.md) - optimization vectors, benchmarks, and implementation history
 - Plans & specs: `docs/superpowers/plans/2026-08-26-expert-cache-scheduler-prefetch.md`, `docs/superpowers/specs/2026-08-26-general-decode-moe-dispatch-design.md`
 - Source: `ggml/src/ggml-backend-expert-cache.cpp`, `common/expert-cache-profile.cpp`
+
+## Expert cache work
+
+When working on the expert cache, benchmarking/tests should be done using the same settings (where appropriate) as the `qwen3.6-35B-apex-compact` model definition in the following llama-server config: [G:\qwen3.6-35b-a3b-presets-exc-latest.ini](G:\qwen3.6-35b-a3b-presets-exc-latest.ini)
