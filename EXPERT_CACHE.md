@@ -4,19 +4,33 @@ The **Expert Cache** provides high-performance heterogeneous inference for Mixtu
 
 ---
 
-## 1. Current Status & Executive Summary (Updated 2026-08-27)
+## 1. Current Status & Implementation Matrix (Updated 2026-08-27)
 
-Following Epics 1 through 6 optimization and benchmarking on `Qwen3.6-35B-A3B-APEX-Compact.gguf` (14 CPU threads, NVIDIA GTX 1080 Pascal SM61, Flash Attention, 256 MiB fit target):
+```text
+CURRENT IMPLEMENTATION STATUS:
+- Full-hit slot execution: Implemented.
+- Whole-node CPU fallback on any miss: Implemented (replacing with per-route heterogeneous execution).
+- Route hit/miss partition metadata: Implemented.
+- True partial-hit GPU/CPU execution: IN PROGRESS.
+- Concurrent GPU-hit + CPU-miss execution: IN PROGRESS.
+- GPU/CPU route output merge: IN PROGRESS.
+```
+
+The objective is to replace whole-node fallback with canonical per-route heterogeneous execution for single-token generation (TG1):
+```text
+0 hits / 8 misses -> CPU routes = 8, GPU routes = 0
+1 hit  / 7 misses -> CPU routes = 7, GPU routes = 1
+...
+7 hits / 1 miss   -> CPU routes = 1, GPU routes = 7
+8 hits / 0 misses -> CPU routes = 0, GPU routes = 8
+```
 
 - **Gate A (Pre-Resident GPU Compute Oracle)**: **PASSED (Outcome A)**. Single-token decode execution for resident GPU experts takes **185 us vs. 297 us on CPU (+60.5% speedup / 1.61x)**.
-- **Gate B (Heterogeneous Route Execution & Zero Miss Upload)**: **PASSED (Outcome A)**. Pre-pinning static hot experts in GPU VRAM and eliminating synchronous PCIe miss uploads achieved **+42.0% speedup (2.59 tok/s -> 3.67 tok/s)** in scientific isolation with **EXACTLY 0 bytes of in-band PCIe miss uploads**.
-- **The Two Operational Regimes**:
-  1. **Regime 1: Severe VRAM Constraints (Zero Full Layers Fit on GPU)**: Expert Cache provides a **+42.0% TG speedup** by hosting frequently routed experts in spare VRAM headroom that cannot fit whole layers.
-  2. **Regime 2: Layer-Fit Regime (`--fit`)**: When GPU VRAM is large enough to hold full MoE layers (e.g. 11 full layers on an 8 GB card for Qwen 35B Compact), **offloading full layers (18.26 tok/s) is faster than reserving VRAM for an expert cache (16.18 - 17.71 tok/s)**, because a full GPU layer guarantees 100% hit rate with zero CPU fallbacks.
-- **Prompt Processing (PP) Invariant**: Expert Cache is strictly a single-token decode optimization (`ne[1] == 1`) and is completely bypassed during batch prompt processing (`ne[1] > 1`). Variations in initial PP benchmarks (267 -> 340 tok/s) are purely due to OS file cache warming on first load.
+- **Gate B (Heterogeneous Route Execution & Zero Miss Upload)**: **IN PROGRESS**. Dedicated partial-hit heterogeneous execution engine undergoing two-phase validation (Phase 1 serial correctness -> Phase 2 concurrent streams).
+- **Prompt Processing (PP) Invariant**: Expert Cache is strictly a single-token decode optimization (`ne[1] == 1`) and is completely bypassed during batch prompt processing (`ne[1] > 1`).
 - **Native Tooling**: `llama-bench` natively supports `-pe / --pinned-experts <path0,path1,...>` alongside `-exc`, `-excp`, and `-fitt`.
 - **Background Promotion Pipeline (Epic 5)**: Non-blocking asynchronous promotion worker streams emerging hot experts from host pinned RAM into device slot pools without stalling active decode steps.
-- **GPU-Side Route Remapping (Epic 6)**: Compact 40.96 KiB device lookup table (`gpu_slot_map_table`) maps resident slot indices directly in GPU memory, eliminating host synchronization bubbles.
+- **GPU-Side Route Remapping (Epic 6)**: Compact 40.96 KiB device lookup table (`gpu_slot_map_table`) maps resident slot indices directly in GPU memory.
 
 ---
 
@@ -91,7 +105,7 @@ The built-in profiler ranks all candidate expert bundles and produces pinned man
 
 ---
 
-## 4. Empirical Benchmark Sweep Results
+## 4. Empirical Benchmark Sweep Results (Preliminary Baseline Context)
 
 Hardware: NVIDIA GeForce GTX 1080 (SM61, 8 GB VRAM) | CPU: 14 Threads | Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf`
 
@@ -110,7 +124,7 @@ Hardware: NVIDIA GeForce GTX 1080 (SM61, 8 GB VRAM) | CPU: 14 Threads | Model: `
 |:---|:---|---:|---:|---:|:---|
 | **Control Baseline** | none | 0 MiB | 334.38 tok/s | **18.36 ± 0.87 tok/s** | 11 full MoE layers offloaded to GPU. 0 CPU fallback. |
 | **Pinned 64 MiB** | `pinned_experts_64mb.json` | 0 MiB | 342.35 tok/s | **18.06 tok/s** | 11 full layers + 33 pinned experts. |
-| **Pinned 128 MiB (Sweet Spot)** | `pinned_experts_128mb.json` | 0 MiB | **337.61 tok/s** | **18.56 ± 0.58 tok/s** | **11 full layers + 67 pinned experts (Optimal throughput).** |
+| **Pinned 128 MiB** | `pinned_experts_128mb.json` | 0 MiB | **337.61 tok/s** | **18.56 ± 0.58 tok/s** | 11 full layers + 67 pinned experts (within statistical variance of control). |
 | **Pinned 256 MiB** | `pinned_experts_256mb.json` | 0 MiB | 336.79 tok/s | **18.12 ± 0.13 tok/s** | 11 full layers + 134 pinned experts. |
 | **Pinned 1024 MiB** | `pinned_experts_1024mb.json` | 0 MiB | 340.04 tok/s | **17.71 tok/s** | 8 full layers + 1024M pinned experts (displaces 3 full layers). |
 | **Dynamic Cache 128 MiB** | none | 128 MiB | 324.55 tok/s | **16.39 tok/s** | 8 full layers + 128M dynamic LRU cache. |
@@ -118,10 +132,26 @@ Hardware: NVIDIA GeForce GTX 1080 (SM61, 8 GB VRAM) | CPU: 14 Threads | Model: `
 
 ---
 
-## 5. Verification Tools & Test Executables
+## 5. Verification Tools & Acceptance Criteria
 
+### Test Executables
+- `build/bin/Release/test-moe-partial-hit-bench.exe`: Standalone partial-hit heterogeneous execution oracle and latency curve benchmark (Epic 1 / Milestone 1-2).
 - `build/bin/Release/test-expert-cache.exe`: Comprehensive unit test suite covering 20 invariants (slot pools, non-blocking query, SLRU admission, pinned staging ring, async promotions, GPU slot mapping).
 - `build/bin/Release/test-moe-oracle-bench.exe`: Gate A microbenchmark comparing isolated resident GPU vs CPU compute.
 - `build/bin/Release/test-moe-tg-profiler.exe`: Op-level profiler and value-per-byte pinned manifest generator.
 - `build/bin/Release/test-moe-heterogeneous-bench.exe`: Gate B comparative sweep runner benchmarking memory tiers.
 - `build/bin/Release/test-moe-dynamic-drift-bench.exe`: Multi-turn topic drift benchmark evaluating dynamic background promotions.
+
+### Partial-Hit Heterogeneous Acceptance Criteria Matrix
+| Hit Mask | GPU Routes Executed | CPU Routes Executed | Numerical Tolerance | Status |
+| :---: | :---: | :---: | :---: | :---: |
+| 0/8 | 0 | 8 | Exact CPU Reference | Pending Verification |
+| 1/8 | 1 | 7 | NMSE <= 0.0002, MeanRel <= 0.005 | Pending Verification |
+| 2/8 | 2 | 6 | NMSE <= 0.0002, MeanRel <= 0.005 | Pending Verification |
+| 3/8 | 3 | 5 | NMSE <= 0.0002, MeanRel <= 0.005 | Pending Verification |
+| 4/8 | 4 | 4 | NMSE <= 0.0002, MeanRel <= 0.005 | Pending Verification |
+| 5/8 | 5 | 3 | NMSE <= 0.0002, MeanRel <= 0.005 | Pending Verification |
+| 6/8 | 6 | 2 | NMSE <= 0.0002, MeanRel <= 0.005 | Pending Verification |
+| 7/8 | 7 | 1 | NMSE <= 0.0002, MeanRel <= 0.005 | Pending Verification |
+| 8/8 | 8 | 0 | Exact GPU Slot Reference | Pending Verification |
+

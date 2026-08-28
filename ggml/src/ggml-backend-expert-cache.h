@@ -36,7 +36,7 @@ enum ggml_expert_cache_slot_state {
     GGML_EXPERT_CACHE_SLOT_RESIDENT  = 2,
 };
 
-// Canonical MoE route descriptor (Epic 2)
+// Canonical MoE route descriptor (Epic 2 & Epics 10-13)
 struct ggml_cache_route_bundle {
     int32_t token;
     int32_t route;
@@ -50,6 +50,11 @@ struct ggml_cache_route_bundle {
 };
 typedef struct ggml_cache_route_bundle ggml_moe_route_desc;
 
+struct ggml_moe_miss_desc {
+    int32_t route;
+    int32_t expert;
+};
+
 enum ggml_moe_bundle_kind {
     GGML_MOE_BUNDLE_SEPARATE_GATE_UP = 0,
     GGML_MOE_BUNDLE_FUSED_GATE_UP    = 1,
@@ -62,9 +67,13 @@ struct ggml_moe_bundle_plan {
     struct ggml_tensor * gate_node;
     struct ggml_tensor * up_node;
     struct ggml_tensor * gate_up_node;
+    struct ggml_tensor * act_node;
     struct ggml_tensor * down_node;
     struct ggml_tensor * layer_input;
     struct ggml_tensor * canonical_route_output;
+    int32_t graph_first_node;
+    int32_t graph_last_node;
+    bool is_fused;
     bool valid;
 };
 
@@ -248,6 +257,19 @@ GGML_API void ggml_backend_expert_cache_register_fused_bundle(
     int32_t layer,
     const struct ggml_tensor * gate_up_tensor,
     const struct ggml_tensor * down_tensor);
+
+struct ggml_expert_bundle_weights {
+    struct ggml_tensor * gate;
+    struct ggml_tensor * up;
+    struct ggml_tensor * down;
+    struct ggml_tensor * gate_up;
+    bool is_fused;
+};
+
+GGML_API bool ggml_backend_expert_cache_get_bundle_weights(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    struct ggml_expert_bundle_weights * out_weights);
 
 GGML_API bool ggml_backend_expert_cache_is_bundle_resident(
     ggml_backend_expert_cache_t cache,
@@ -438,6 +460,21 @@ GGML_API const int32_t * ggml_backend_expert_cache_get_gpu_slot_map(
     ggml_backend_expert_cache_t cache,
     int32_t layer);
 
+// Heterogeneous MoE Slot Reservation & Lifetime Protection
+GGML_API void ggml_backend_expert_cache_reserve_bundle_slots(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const struct ggml_cache_route_bundle * hit_routes,
+    int32_t n_hits);
+
+GGML_API void ggml_backend_expert_cache_release_bundle_slots(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    const struct ggml_cache_route_bundle * hit_routes,
+    int32_t n_hits,
+    ggml_backend_event_t completion_event);
+
 #ifdef __cplusplus
 }
 #endif
+

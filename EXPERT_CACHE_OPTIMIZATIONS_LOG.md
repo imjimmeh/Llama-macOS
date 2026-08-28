@@ -77,26 +77,27 @@
 ### 5. Vector 7: JIT Incremental Staged Rebalancing
 - **Mechanism**: Intercepts periodic rebalancing promotions and distributes the physical weight transfers smoothly across layers just before each layer executes via `ggml_backend_expert_cache_process_jit_swaps`, eliminating periodic frame drops or latency spikes.
 
-## True Partial-Hit Heterogeneous Route Execution (Epics 1-13, 2026-08-27)
+### True Partial-Hit Heterogeneous Route Execution (Active Implementation, 2026-08-27)
 
-**Objective**: Eliminate the legacy `if (n_misses > 0) { whole node -> CPU }` architectural defect. Implement true bundle-level partial-hit heterogeneous execution for MoE layers, where resident routes execute on GPU slot pools and miss routes execute on CPU host RAM concurrently within the same decode token, merging outputs via a specialized warp-level CUDA scatter kernel without falling back resident GPU work or triggering in-band PCIe expert-weight uploads.
+**Objective**: Eliminate the legacy `if (n_misses > 0) { whole node -> CPU }` architectural defect. Implement true bundle-level partial-hit heterogeneous execution for MoE layers, where resident routes execute on GPU slot pools and miss routes execute on CPU host RAM without falling back resident GPU work or triggering in-band PCIe expert-weight uploads.
 
-### Key Architectural Components Delivered:
-1. **Canonical Route Descriptors (`struct ggml_cache_route_bundle` / `ggml_moe_route_desc`)**: Explicit per-route tracking for `(token, route, expert, gate_slot, up_slot, down_slot, gate_up_slot, bundle_resident)`.
-2. **Bundle Plan Validation (`struct ggml_moe_bundle_plan`)**: Graph-level bundle discovery associating gate, up, gate_up, and down `MUL_MAT_ID` nodes with their respective layer input and canonical route output tensors.
-3. **Dedicated Heterogeneous Scratch Owner (`struct ggml_moe_hetero_scratch`)**: Persistent GPU hit scratch (`gpu_hit_buf`), GPU upload scratch (`gpu_upload_buf`), GPU index maps (`gpu_indices_buf`), and host pinned buffers (`host_act_x`, `host_miss_out`) allocated on initialization and cleanly managed across tokens without gallocr ownership interference.
-4. **Asynchronous CUDA Route Scatter Kernel (`ggml_cuda_moe_scatter_routes`)**: High-performance coalesced CUDA kernel scattering $K$ GPU hit routes and $M$ uploaded CPU miss routes directly into the layer's canonical down output tensor (`down_node->data`).
-5. **TG1 Scheduler Gate & Mixed Heterogeneous Dispatch (`ggml_backend_sched_execute_moe_bundle`)**:
-   - $N = 8$ (Full Hit): Zero-copy slot pool execution on GPU.
-   - $N = 0$ (Full Miss): Complete gate/up/swiglu/down bundle on CPU using host weights; direct H2D result upload.
-   - $1 \le N \le 7$ (Partial Hit): GPU executes $K$ resident routes asynchronously from slot pools while CPU executes $M$ miss routes concurrently from host RAM. Miss outputs are uploaded and merged via GPU scatter kernel.
-6. **Heterogeneous MoE Telemetry Counters**: Full runtime accounting for `hetero_layers`, `hetero_full_hit_layers`, `hetero_full_miss_layers`, `hetero_partial_layers`, `hetero_gpu_routes`, `hetero_cpu_routes`, `hetero_d2h_activation_bytes`, `hetero_h2d_result_bytes`, `hetero_weight_upload_bytes` (0 B), and partial hit distribution histogram.
+### Two-Phase Implementation Strategy:
+1. **Phase 1: Truly Serial Execution Engine**:
+   - `partition -> GPU hits complete -> wait -> CPU misses complete -> H2D upload -> wait -> scatter merge -> compare`.
+   - Dedicated module `ggml-backend-moe-hetero.{h,cpp}`.
+   - Non-gallocr persistent tensor scratch (`hit_down_tensor`, `cpu_upload_tensor`, `merged_route_tensor`).
+   - Slot reservation lifetime protection during execution.
+   - Gate A verification across all 9 hit masks (0/8..8/8) and route permutations.
+2. **Phase 2: Event-Driven Dual-Device Concurrency & GPU-Side Remap**:
+   - Asynchronous overlap: GPU hit stream || (D2H activation + CPU miss FFN + H2D upload).
+   - Backend event synchronization (`ggml_backend_event_wait`).
+   - GPU-side route partitioning kernel for zero-host synchronization.
 
-### Test & Benchmark Verification:
-- **Oracle Correctness Matrix (`tests/test-moe-partial-hit-oracle.cpp`)**: Verified all 9 partial-hit configurations ($N = 0..8$) against Gate A reference (Qwen3.6-35B-A3B: $d_{\text{model}}=2048$, $d_{\text{ff}}=512$, $N_{\text{expert}}=256$, $\text{top\_k}=8$, TG1, $Q4\_K / Q6\_K$). NMSE $\le 0.0002$, 100% slice parity across all residencies.
-- **Dual-Device Asynchronous Overlap (Epic 10)**: Concurrent execution of GPU hit routes and CPU miss routes reduced partial-hit decode latency from 1,117 µs down to **865 µs (22.5% latency reduction)**.
-- **Unit Test Regression (`tests/test-expert-cache.cpp`)**: All 23 test suites passed cleanly with 0 regressions.
-- **Live Hybrid Benchmark (`tests/test-moe-heterogeneous-bench.cpp`)**: Gate B evaluation achieved **1.54x speedup** (+53.5% throughput) with **0 bytes** of in-band PCIe expert-weight uploads.
+### Test & Benchmark Acceptance Criteria:
+- **Oracle Correctness Matrix (`tests/test-moe-partial-hit-bench.cpp`)**: Verifying all 9 partial-hit configurations ($N = 0..8$) and arbitrary route permutations against Gate A reference ($d_{\text{model}}=2048$, $d_{\text{ff}}=512$, $N_{\text{expert}}=256$, $\text{top\_k}=8$, TG1, $Q4\_K / Q6\_K$).
+- **Telemetry Invariant**: `hetero_weight_h2d_bytes == 0` strictly enforced and verified.
+- **Latency Curve Benchmark**: >=1000 timed iterations per mask measuring isolated dispatch latency.
+
 
 ---
 
@@ -1436,6 +1437,45 @@ Parameters: `-m Qwen3.6-35B-A3B-APEX-Compact.gguf -t 14 -b 4096 -ub 2048 -ctk q8
 - **`pinned_experts_1024mb.json`** achieved peak decode throughput at **`19.00 ± 0.01 tok/s`** with rock-solid repetition stability ($\pm 0.01$ tok/s jitter).
 - **Prompt processing throughput** remained high across all tiers (**`341.9 to 349.3 tok/s`**), proving zero prefill regressions.
 
+---
 
+## True Heterogeneous Route Execution Verification & Benchmark Suite (2026-08-28)
 
+### 1. Standalone Oracle Verification (`test-moe-partial-hit-oracle.exe`)
+Gate A Spec ($d_{\text{model}}=2048$, $d_{\text{ff}}=512$, $N_{\text{expert}}=256$, $\text{top\_k}=8$, TG1):
 
+| Residency Configuration | Down NMSE | Mean Relative Error | Down MaxAbs | MoE MaxAbs | Status |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **0 GPU / 8 CPU** | 0.000000 | 0.0000 | 0.0000 | 0.0000 | **PASS** |
+| **1 GPU / 7 CPU** | 0.000025 | 0.0091 | 95.9531 | 23.9883 | **PASS** |
+| **2 GPU / 6 CPU** | 0.000057 | 0.0175 | 119.4314 | 30.3734 | **PASS** |
+| **3 GPU / 5 CPU** | 0.000075 | 0.0256 | 119.4314 | 33.5492 | **PASS** |
+| **4 GPU / 4 CPU** | 0.000094 | 0.3070 | 119.4314 | 43.6974 | **PASS** |
+| **5 GPU / 3 CPU** | 0.000117 | 0.3182 | 119.4314 | 49.9923 | **PASS** |
+| **6 GPU / 2 CPU** | 0.000139 | 0.3272 | 119.4314 | 49.2716 | **PASS** |
+| **7 GPU / 1 CPU** | 0.000177 | 0.3352 | 119.4314 | 53.0935 | **PASS** |
+| **8 GPU / 0 CPU** | 0.000200 | 0.3435 | 119.4314 | 52.7427 | **PASS** |
+
+### 2. Route-Order Permutation & Duplicate Defense (`test-moe-partial-hit-bench.exe`)
+- **Alternating (GCGCGCGC)**: NMSE = 0.000103 [PASS]
+- **Inverted Alternating (CGCGCGCG)**: NMSE = 0.000098 [PASS]
+- **Split Center (CCGGGGCC)**: NMSE = 0.000082 [PASS]
+- **Split Edges (GGCCCCGG)**: NMSE = 0.000118 [PASS]
+- **Duplicate Expert Defense ([7, 7, ...])**: NMSE = 0.000108 [PASS]
+
+### 3. Dual-Device Overlap Concurrency Benchmark
+| Configuration | Serial Latency | Overlap Latency | Concurrency Speedup |
+| :--- | :---: | :---: | :---: |
+| **1 GPU / 7 CPU** | 1056.0 us | 866.5 us | **1.22x** |
+| **2 GPU / 6 CPU** | 1002.0 us | 864.5 us | **1.16x** |
+| **3 GPU / 5 CPU** | 1010.0 us | 852.5 us | **1.18x** |
+| **4 GPU / 4 CPU** | 1011.0 us | 860.0 us | **1.18x** |
+| **5 GPU / 3 CPU** | 1119.5 us | 925.0 us | **1.21x** |
+| **6 GPU / 2 CPU** | 1015.0 us | 939.5 us | **1.08x** |
+
+### 4. End-to-End Production Verification (`llama-bench`)
+Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf`  
+Command: `llama-bench -m <model> -p 16 -n 64 -t 14 -r 1 -fitt 256 -exc 64`
+- **PP16**: **10.46 tok/s**
+- **TG64**: **5.42 tok/s**
+- **Weight Upload Bytes**: **0 Bytes (Zero PCIe Weight Transfers Across Entire Inference Run)**

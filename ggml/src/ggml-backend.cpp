@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend-expert-cache.h"
+#include "ggml-backend-moe-hetero.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -886,19 +887,8 @@ struct ggml_backend_sched {
     };
     std::vector<ggml_backend_sched_route_bundle_plan> bundle_plans;
 
-    // Persistent Heterogeneous Scratch Owner (Epic 5)
-    struct ggml_moe_hetero_scratch {
-        ggml_backend_buffer_t gpu_hit_buf = nullptr;
-        ggml_backend_buffer_t gpu_upload_buf = nullptr;
-        ggml_backend_buffer_t gpu_indices_buf = nullptr;
-
-        void * gpu_hit_out = nullptr;
-        void * gpu_cpu_upload_out = nullptr;
-        int32_t * gpu_hit_indices = nullptr;
-        int32_t * gpu_miss_indices = nullptr;
-
-        size_t capacity_bytes = 0;
-    } moe_scratch;
+    // Dedicated Heterogeneous Scratch Owner
+    ggml_moe_hetero_scratch_t hetero_scratch = nullptr;
 
     // Persistent CPU scratch for miss-path host execution
     std::vector<uint8_t> cpu_sched_act_x;
@@ -1215,6 +1205,26 @@ static void ggml_backend_sched_discover_route_plans(
         bp.valid = (bp.is_fused ? (bp.gate_up_node != nullptr && bp.down_node != nullptr)
                                 : (bp.gate_node != nullptr && bp.up_node != nullptr && bp.down_node != nullptr))
                    && (bp.layer >= 0);
+        if (bp.valid) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (sched->expert_caches[b]) {
+                    if (bp.is_fused) {
+                        ggml_backend_expert_cache_register_fused_bundle(
+                            sched->expert_caches[b],
+                            bp.layer,
+                            bp.gate_up_node->src[0],
+                            bp.down_node->src[0]);
+                    } else {
+                        ggml_backend_expert_cache_register_bundle(
+                            sched->expert_caches[b],
+                            bp.layer,
+                            bp.gate_node->src[0],
+                            bp.up_node->src[0],
+                            bp.down_node->src[0]);
+                    }
+                }
+            }
+        }
         sched->bundle_plans.push_back(bp);
     }
 
@@ -1566,8 +1576,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-                            need_new_split = true;
-                            break;
+                            if (sched->expert_caches[cur_backend_id] != NULL && node->op == GGML_OP_MUL_MAT_ID) {
+                                // Handled by expert cache without weight transfer, keep in current split
+                            } else {
+                                need_new_split = true;
+                                break;
+                            }
                         }
                     }
                     // check if the split has too many inputs
@@ -1577,8 +1591,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         int src_backend_id = sched->hv_tensor_backend_ids[id];
                         bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
                         if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
-                            need_new_split = true;
-                            break;
+                            if (sched->expert_caches[cur_backend_id] != NULL && node->op == GGML_OP_MUL_MAT_ID) {
+                                // Handled by expert cache without PCIe weight transfer
+                            } else {
+                                need_new_split = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -1999,319 +2017,7 @@ static void ggml_backend_sched_record_host_route_snapshots(
     }
 }
 
-static bool ggml_backend_sched_execute_moe_bundle(
-        ggml_backend_sched_t sched,
-        const ggml_backend_sched::ggml_backend_sched_route_bundle_plan * bplan,
-        ggml_backend_t split_backend,
-        ggml_backend_expert_cache_t cache,
-        const int32_t * ids_data,
-        int32_t top_k,
-        const std::function<void(struct ggml_tensor *)> & save_node_for_restore) {
 
-    int cpu_backend_id = -1;
-    for (int b = 0; b < sched->n_backends; b++) {
-        if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            cpu_backend_id = b;
-            break;
-        }
-    }
-    if (cpu_backend_id < 0) {
-        return false;
-    }
-
-    struct ggml_tensor * gate_node = bplan->gate_node;
-    struct ggml_tensor * up_node   = bplan->up_node;
-    struct ggml_tensor * gu_node   = bplan->gate_up_node;
-    struct ggml_tensor * down_node = bplan->down_node;
-    struct ggml_tensor * act_node  = down_node ? down_node->src[1] : nullptr;
-    struct ggml_tensor * input_x   = gu_node ? gu_node->src[1] : (gate_node ? gate_node->src[1] : nullptr);
-
-    if (!down_node || !input_x) {
-        return false;
-    }
-
-    if (sched->sched_hit_routes.size() < (size_t)top_k) {
-        sched->sched_hit_routes.resize(top_k);
-        sched->sched_miss_routes.resize(top_k);
-    }
-
-    int32_t n_hits = 0;
-    int32_t n_misses = 0;
-    ggml_backend_expert_cache_partition_bundle_routes(
-        cache,
-        bplan->layer,
-        ids_data,
-        top_k,
-        1,
-        sched->sched_hit_routes.data(),
-        &n_hits,
-        sched->sched_miss_routes.data(),
-        &n_misses);
-
-    // Case 1: Full Hit (all top_k routes resident on GPU)
-    if (n_misses == 0) {
-        sched->route_census_stats.hetero_layers++;
-        sched->route_census_stats.hetero_full_hit_layers++;
-        sched->route_census_stats.hetero_gpu_routes += n_hits;
-        return false; // Fall through to standard zero-copy slot pool path
-    }
-
-    const size_t in_bytes  = ggml_nbytes(input_x);
-    const size_t out_bytes = ggml_nbytes(down_node);
-    const int64_t d_model  = down_node->ne[0];
-    const int64_t d_ff     = gu_node ? (gu_node->ne[0] / 2) : (gate_node ? gate_node->ne[0] : 0);
-
-    if (sched->cpu_sched_act_x.size() < in_bytes) {
-        sched->cpu_sched_act_x.resize(in_bytes);
-    }
-    if (sched->cpu_sched_down_out.size() < out_bytes) {
-        sched->cpu_sched_down_out.resize(out_bytes);
-    }
-
-    // Case 2: Full Miss (all top_k routes on CPU)
-    if (n_hits == 0) {
-        // 1. Fetch activation to CPU host RAM
-        ggml_backend_tensor_get_async(split_backend, input_x, sched->cpu_sched_act_x.data(), 0, in_bytes);
-        ggml_backend_synchronize(split_backend);
-
-        // 2. Build full CPU MoE graph
-        struct ggml_init_params params = {
-            /*.mem_size   =*/ 16 * 1024 * 1024,
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ false,
-        };
-        struct ggml_context * ctx_cpu = ggml_init(params);
-
-        struct ggml_tensor * cpu_x = ggml_new_tensor_3d(ctx_cpu, GGML_TYPE_F32, d_model, 1, 1);
-        memcpy(cpu_x->data, sched->cpu_sched_act_x.data(), in_bytes);
-
-        struct ggml_tensor * cpu_ids = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_I32, top_k, 1);
-        memcpy(cpu_ids->data, ids_data, top_k * sizeof(int32_t));
-
-        struct ggml_tensor * cpu_gate = nullptr;
-        struct ggml_tensor * cpu_up   = nullptr;
-
-        if (bplan->is_fused) {
-            struct ggml_tensor * cpu_gu = ggml_mul_mat_id(ctx_cpu, gu_node->src[0], cpu_x, cpu_ids);
-            cpu_gate = ggml_view_3d(ctx_cpu, cpu_gu, d_ff, top_k, 1, cpu_gu->nb[1], cpu_gu->nb[2], 0);
-            cpu_up   = ggml_view_3d(ctx_cpu, cpu_gu, d_ff, top_k, 1, cpu_gu->nb[1], cpu_gu->nb[2], d_ff * cpu_gu->nb[0]);
-        } else {
-            cpu_gate = ggml_mul_mat_id(ctx_cpu, gate_node->src[0], cpu_x, cpu_ids);
-            cpu_up   = ggml_mul_mat_id(ctx_cpu, up_node->src[0],   cpu_x, cpu_ids);
-        }
-
-        struct ggml_tensor * cpu_act  = ggml_swiglu_split(ctx_cpu, cpu_gate, cpu_up);
-        struct ggml_tensor * cpu_down = ggml_mul_mat_id(ctx_cpu, down_node->src[0], cpu_act, cpu_ids);
-
-        struct ggml_cgraph * gf_cpu = ggml_new_graph(ctx_cpu);
-        ggml_build_forward_expand(gf_cpu, cpu_down);
-        ggml_backend_graph_compute(sched->backends[cpu_backend_id], gf_cpu);
-
-        // 3. Upload computed unweighted down outputs directly to down_node on GPU
-        ggml_backend_tensor_set_async(split_backend, down_node, cpu_down->data, 0, out_bytes);
-
-        ggml_free(ctx_cpu);
-
-        // 4. Mark all bundle nodes op = NONE
-        save_node_for_restore(down_node);
-        down_node->op = GGML_OP_NONE;
-        if (gate_node) { save_node_for_restore(gate_node); gate_node->op = GGML_OP_NONE; }
-        if (up_node)   { save_node_for_restore(up_node);   up_node->op = GGML_OP_NONE; }
-        if (gu_node)   { save_node_for_restore(gu_node);   gu_node->op = GGML_OP_NONE; }
-        if (act_node)  { save_node_for_restore(act_node);  act_node->op = GGML_OP_NONE; }
-
-        sched->route_census_stats.hetero_layers++;
-        sched->route_census_stats.hetero_full_miss_layers++;
-        sched->route_census_stats.hetero_cpu_routes += n_misses;
-        sched->route_census_stats.hetero_d2h_activation_bytes += in_bytes;
-        sched->route_census_stats.hetero_h2d_result_bytes += out_bytes;
-
-        return true;
-    }
-
-    // Case 3: Mixed Partial Hit (0 < n_hits < top_k)
-    // Ensure GPU heterogeneous scratch buffers are allocated
-    if (sched->moe_scratch.gpu_hit_buf == nullptr) {
-        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
-        sched->moe_scratch.gpu_hit_buf = ggml_backend_buft_alloc_buffer(buft, 2 * 1024 * 1024);
-        sched->moe_scratch.gpu_upload_buf = ggml_backend_buft_alloc_buffer(buft, 2 * 1024 * 1024);
-        sched->moe_scratch.gpu_indices_buf = ggml_backend_buft_alloc_buffer(buft, 64 * sizeof(int32_t));
-        if (sched->moe_scratch.gpu_hit_buf && sched->moe_scratch.gpu_upload_buf && sched->moe_scratch.gpu_indices_buf) {
-            sched->moe_scratch.gpu_hit_out = ggml_backend_buffer_get_base(sched->moe_scratch.gpu_hit_buf);
-            sched->moe_scratch.gpu_cpu_upload_out = ggml_backend_buffer_get_base(sched->moe_scratch.gpu_upload_buf);
-            sched->moe_scratch.gpu_hit_indices = (int32_t *)ggml_backend_buffer_get_base(sched->moe_scratch.gpu_indices_buf);
-            sched->moe_scratch.gpu_miss_indices = (int32_t *)((char *)sched->moe_scratch.gpu_hit_indices + 32 * sizeof(int32_t));
-            sched->moe_scratch.capacity_bytes = 2 * 1024 * 1024;
-        }
-    }
-
-    // Get GPU slot pool tensors
-    struct ggml_tensor * slot_gate = gate_node ? ggml_backend_expert_cache_get_slot_tensor(cache, gate_node->src[0]) : nullptr;
-    struct ggml_tensor * slot_up   = up_node   ? ggml_backend_expert_cache_get_slot_tensor(cache, up_node->src[0])   : nullptr;
-    struct ggml_tensor * slot_gu   = gu_node   ? ggml_backend_expert_cache_get_slot_tensor(cache, gu_node->src[0])   : nullptr;
-    struct ggml_tensor * slot_down = ggml_backend_expert_cache_get_slot_tensor(cache, down_node->src[0]);
-
-    if (!slot_down || (!slot_gu && (!slot_gate || !slot_up))) {
-        return false;
-    }
-
-    // Prepare Hit & Miss Route Descriptors
-    std::vector<int32_t> hit_gate_slots(n_hits);
-    std::vector<int32_t> hit_up_slots(n_hits);
-    std::vector<int32_t> hit_down_slots(n_hits);
-    std::vector<int32_t> hit_route_indices(n_hits);
-
-    for (int32_t i = 0; i < n_hits; i++) {
-        hit_gate_slots[i]    = sched->sched_hit_routes[i].gate_slot;
-        hit_up_slots[i]      = sched->sched_hit_routes[i].up_slot;
-        hit_down_slots[i]    = sched->sched_hit_routes[i].down_slot;
-        hit_route_indices[i] = sched->sched_hit_routes[i].route;
-    }
-
-    std::vector<int32_t> miss_experts(n_misses);
-    std::vector<int32_t> miss_route_indices(n_misses);
-    for (int32_t i = 0; i < n_misses; i++) {
-        miss_experts[i]       = sched->sched_miss_routes[i].expert;
-        miss_route_indices[i] = sched->sched_miss_routes[i].route;
-    }
-
-    // GPU Hit Path: compute K hit routes from slot pools
-    struct ggml_init_params params_gpu = {
-        /*.mem_size   =*/ 16 * 1024 * 1024,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    struct ggml_context * ctx_gpu = ggml_init(params_gpu);
-
-    struct ggml_tensor * gpu_ids = ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_I32, n_hits, 1);
-    struct ggml_tensor * gpu_gate = nullptr;
-    struct ggml_tensor * gpu_up   = nullptr;
-
-    if (bplan->is_fused) {
-        struct ggml_tensor * gpu_gu = ggml_mul_mat_id(ctx_gpu, slot_gu, input_x, gpu_ids);
-        gpu_gate = ggml_view_3d(ctx_gpu, gpu_gu, d_ff, n_hits, 1, gpu_gu->nb[1], gpu_gu->nb[2], 0);
-        gpu_up   = ggml_view_3d(ctx_gpu, gpu_gu, d_ff, n_hits, 1, gpu_gu->nb[1], gpu_gu->nb[2], d_ff * gpu_gu->nb[0]);
-    } else {
-        gpu_gate = ggml_mul_mat_id(ctx_gpu, slot_gate, input_x, gpu_ids);
-        gpu_up   = ggml_mul_mat_id(ctx_gpu, slot_up,   input_x, gpu_ids);
-    }
-
-    struct ggml_tensor * gpu_act  = ggml_swiglu_split(ctx_gpu, gpu_gate, gpu_up);
-    struct ggml_tensor * gpu_down = ggml_mul_mat_id(ctx_gpu, slot_down, gpu_act, gpu_ids);
-
-    struct ggml_cgraph * gf_gpu = ggml_new_graph(ctx_gpu);
-    ggml_build_forward_expand(gf_gpu, gpu_down);
-
-    ggml_backend_buffer_t buf_gpu = ggml_backend_alloc_ctx_tensors(ctx_gpu, split_backend);
-    ggml_backend_tensor_set(gpu_ids, hit_gate_slots.data(), 0, n_hits * sizeof(int32_t));
-
-    ggml_backend_graph_compute(split_backend, gf_gpu);
-
-    // CPU Miss Path: D2H activation + CPU miss bundle
-    ggml_backend_tensor_get_async(split_backend, input_x, sched->cpu_sched_act_x.data(), 0, in_bytes);
-    ggml_backend_synchronize(split_backend);
-
-    struct ggml_init_params params_cpu = {
-        /*.mem_size   =*/ 16 * 1024 * 1024,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ false,
-    };
-    struct ggml_context * ctx_cpu = ggml_init(params_cpu);
-
-    struct ggml_tensor * cpu_x = ggml_new_tensor_3d(ctx_cpu, GGML_TYPE_F32, d_model, 1, 1);
-    memcpy(cpu_x->data, sched->cpu_sched_act_x.data(), in_bytes);
-
-    struct ggml_tensor * cpu_ids = ggml_new_tensor_2d(ctx_cpu, GGML_TYPE_I32, n_misses, 1);
-    memcpy(cpu_ids->data, miss_experts.data(), n_misses * sizeof(int32_t));
-
-    struct ggml_tensor * cpu_gate = nullptr;
-    struct ggml_tensor * cpu_up   = nullptr;
-
-    if (bplan->is_fused) {
-        struct ggml_tensor * cpu_gu = ggml_mul_mat_id(ctx_cpu, gu_node->src[0], cpu_x, cpu_ids);
-        cpu_gate = ggml_view_3d(ctx_cpu, cpu_gu, d_ff, n_misses, 1, cpu_gu->nb[1], cpu_gu->nb[2], 0);
-        cpu_up   = ggml_view_3d(ctx_cpu, cpu_gu, d_ff, n_misses, 1, cpu_gu->nb[1], cpu_gu->nb[2], d_ff * cpu_gu->nb[0]);
-    } else {
-        cpu_gate = ggml_mul_mat_id(ctx_cpu, gate_node->src[0], cpu_x, cpu_ids);
-        cpu_up   = ggml_mul_mat_id(ctx_cpu, up_node->src[0],   cpu_x, cpu_ids);
-    }
-
-    struct ggml_tensor * cpu_act  = ggml_swiglu_split(ctx_cpu, cpu_gate, cpu_up);
-    struct ggml_tensor * cpu_down = ggml_mul_mat_id(ctx_cpu, down_node->src[0], cpu_act, cpu_ids);
-
-    struct ggml_cgraph * gf_cpu = ggml_new_graph(ctx_cpu);
-    ggml_build_forward_expand(gf_cpu, cpu_down);
-    ggml_backend_graph_compute(sched->backends[cpu_backend_id], gf_cpu);
-
-    // Upload CPU miss results to GPU upload scratch
-    struct ggml_tensor upload_t = *down_node;
-    upload_t.buffer = sched->moe_scratch.gpu_upload_buf;
-    upload_t.data = sched->moe_scratch.gpu_cpu_upload_out;
-    upload_t.ne[1] = n_misses;
-    ggml_backend_tensor_set_async(split_backend, &upload_t, cpu_down->data, 0, n_misses * d_model * sizeof(float));
-
-    // Upload route index maps
-    struct ggml_tensor hit_idx_t = *gpu_ids;
-    hit_idx_t.buffer = sched->moe_scratch.gpu_indices_buf;
-    hit_idx_t.data = sched->moe_scratch.gpu_hit_indices;
-    hit_idx_t.ne[0] = n_hits;
-    ggml_backend_tensor_set_async(split_backend, &hit_idx_t, hit_route_indices.data(), 0, n_hits * sizeof(int32_t));
-
-    struct ggml_tensor miss_idx_t = *gpu_ids;
-    miss_idx_t.buffer = sched->moe_scratch.gpu_indices_buf;
-    miss_idx_t.data = sched->moe_scratch.gpu_miss_indices;
-    miss_idx_t.ne[0] = n_misses;
-    ggml_backend_tensor_set_async(split_backend, &miss_idx_t, miss_route_indices.data(), 0, n_misses * sizeof(int32_t));
-
-    // Scatter merge on GPU
-#if defined(GGML_USE_CUDA)
-    ggml_cuda_moe_scatter_routes(
-        (float *)down_node->data,
-        (const float *)gpu_down->data,
-        (const float *)sched->moe_scratch.gpu_cpu_upload_out,
-        (const int32_t *)sched->moe_scratch.gpu_hit_indices,
-        (const int32_t *)sched->moe_scratch.gpu_miss_indices,
-        n_hits,
-        n_misses,
-        (int)d_model,
-        down_node->nb[1] / sizeof(float),
-        nullptr);
-#else
-    std::vector<float> gpu_down_host(n_hits * d_model);
-    ggml_backend_tensor_get(gpu_down, gpu_down_host.data(), 0, n_hits * d_model * sizeof(float));
-    for (int32_t k = 0; k < n_hits; k++) {
-        const int32_t r = hit_route_indices[k];
-        ggml_backend_tensor_set_async(split_backend, down_node, gpu_down_host.data() + (size_t)k * d_model, (size_t)r * down_node->nb[1], d_model * sizeof(float));
-    }
-    for (int32_t m = 0; m < n_misses; m++) {
-        const int32_t r = miss_route_indices[m];
-        ggml_backend_tensor_set_async(split_backend, down_node, (const float *)cpu_down->data + (size_t)m * d_model, (size_t)r * down_node->nb[1], d_model * sizeof(float));
-    }
-#endif
-
-    ggml_backend_buffer_free(buf_gpu);
-    ggml_free(ctx_gpu);
-    ggml_free(ctx_cpu);
-
-    // Bypass nodes in GPU split
-    save_node_for_restore(down_node);
-    down_node->op = GGML_OP_NONE;
-    if (gate_node) { save_node_for_restore(gate_node); gate_node->op = GGML_OP_NONE; }
-    if (up_node)   { save_node_for_restore(up_node);   up_node->op = GGML_OP_NONE; }
-    if (gu_node)   { save_node_for_restore(gu_node);   gu_node->op = GGML_OP_NONE; }
-    if (act_node)  { save_node_for_restore(act_node);  act_node->op = GGML_OP_NONE; }
-
-    // Update telemetry
-    sched->route_census_stats.hetero_layers++;
-    sched->route_census_stats.hetero_partial_layers++;
-    sched->route_census_stats.hetero_gpu_routes += n_hits;
-    sched->route_census_stats.hetero_cpu_routes += n_misses;
-    sched->route_census_stats.hetero_d2h_activation_bytes += in_bytes;
-    sched->route_census_stats.hetero_h2d_result_bytes += n_misses * d_model * sizeof(float);
-    if (n_hits < 8) sched->route_census_stats.hetero_partial_distribution[n_hits]++;
-
-    return true;
-}
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
@@ -2383,9 +2089,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         };
         std::vector<ggml_restored_node> restored_nodes;
 
-        // snapshot a node's original state before mutating it, so the scheduler can
-        // restore the graph after this split executes (idempotency across decode calls)
         auto save_node_for_restore = [&](struct ggml_tensor * node) {
+            if (node == nullptr) return;
+            for (const auto & rn : restored_nodes) {
+                if (rn.node == node) return;
+            }
             restored_nodes.push_back({
                 node,
                 node->src[0],
@@ -2393,6 +2101,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 node->op,
             });
         };
+
+        struct active_hetero_bundle {
+            const ggml_backend_sched::ggml_backend_sched_route_bundle_plan * plan;
+            std::vector<int32_t> ids;
+            int32_t top_k;
+            int j_first = -1;
+            int j_last = -1;
+        };
+        std::vector<active_hetero_bundle> split_hetero_bundles;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -2444,7 +2161,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     cache != NULL &&
                     ggml_backend_expert_cache_can_store(cache, input->nb[2]);
 
-
                 if (is_eligible && cache == NULL &&
                     ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                     for (int b = 0; b < sched->n_backends; ++b) {
@@ -2472,7 +2188,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t t_sync_start = ggml_time_us();
                     int64_t t_host_start = 0;
 
-
                     const int64_t n_expert   = input->ne[2];
                     const size_t expert_size = input->nb[2];
 
@@ -2490,6 +2205,53 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
                             break;
                         }
+                    }
+
+                    const ggml_backend_sched::ggml_backend_sched_route_bundle_plan * bplan = nullptr;
+                    for (const auto & bp : sched->bundle_plans) {
+                        if (bp.route_ids == ids_tensor && bp.valid) {
+                            bplan = &bp;
+                            break;
+                        }
+                    }
+
+                    bool used_zero_copy = false;
+
+                    if (bplan && bplan->valid && ids_tensor->ne[1] == 1) {
+                        used_zero_copy = true;
+
+                        bool already_registered = false;
+                        for (const auto & ex : split_hetero_bundles) {
+                            if (ex.plan == bplan) {
+                                already_registered = true;
+                                break;
+                            }
+                        }
+
+                        if (!already_registered) {
+                            int j_gate = -1, j_up = -1, j_down = -1, j_act = -1;
+                            for (int j = 0; j < split->graph.n_nodes; j++) {
+                                struct ggml_tensor * nd = split->graph.nodes[j];
+                                if (nd == (bplan->is_fused ? bplan->gate_up_node : bplan->gate_node)) j_gate = j;
+                                if (!bplan->is_fused && nd == bplan->up_node) j_up = j;
+                                if (nd == bplan->down_node) j_down = j;
+                                if (bplan->down_node && nd == bplan->down_node->src[1]) j_act = j;
+                            }
+
+                            int j_first = j_gate;
+                            if (j_up >= 0 && (j_first < 0 || j_up < j_first)) j_first = j_up;
+                            if (j_act >= 0 && (j_first < 0 || j_act < j_first)) j_first = j_act;
+
+                            int j_last = j_down;
+                            if (j_gate > j_last) j_last = j_gate;
+                            if (j_up > j_last) j_last = j_up;
+                            if (j_act > j_last) j_last = j_act;
+
+                            if (j_first >= 0 && j_last >= j_first) {
+                                split_hetero_bundles.push_back({ bplan, {}, (int32_t)ids_tensor->ne[0], j_first, j_last });
+                            }
+                        }
+                        continue;
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
@@ -2515,18 +2277,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
-                        prev_ids_tensor = ids_tensor;
-                    }
-                    ggml_backend_expert_cache_record_probe_sync(cache, ggml_time_us() - t_sync_start);
-
-
-                    // the cache was checked before router IDs were copied from the backend
-
-                    {
-                        ggml_backend_expert_cache_record_probe_layer(cache);
-                        t_host_start = ggml_time_us();
-
-                        expert_counts.assign(n_expert, 0);
+                        // find the usage count of each expert
+                        expert_counts.assign((size_t)n_expert, 0);
+                        requested_experts.clear();
                         for (int64_t i3 = 0; i3 < ids_tensor->ne[3]; i3++) {
                             for (int64_t i2 = 0; i2 < ids_tensor->ne[2]; i2++) {
                                 for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
@@ -2535,6 +2288,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                         if (off < ids.size()) {
                                             int32_t id = ids[off];
                                             if (id >= 0 && id < n_expert) {
+                                                if (expert_counts[id] == 0) {
+                                                    requested_experts.push_back(id);
+                                                }
                                                 expert_counts[id]++;
                                             }
                                         }
@@ -2543,17 +2299,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
-                        // find all requested expert IDs
-                        requested_experts.clear();
-                        pinned_keys.clear();
-                        requested_experts.reserve(n_expert);
-                        pinned_keys.reserve(n_expert);
-                        for (int64_t e = 0; e < n_expert; e++) {
-                            if (ggml_bitset_get(used_ids.data(), e)) {
-                                requested_experts.push_back((int32_t)e);
-                                pinned_keys.push_back({ input, (int32_t)e });
-                                const enum ggml_expert_cache_phase phase = (ids_tensor->ne[1] > 8) ?
-                                    GGML_EXPERT_CACHE_PHASE_PP : GGML_EXPERT_CACHE_PHASE_TG;
+                        prev_ids_tensor = ids_tensor;
+                    }
+
+                    if (ids_tensor->ne[1] > 0) {
+                        t_host_start = ggml_time_us();
+                        ggml_backend_expert_cache_record_probe_sync(cache, t_host_start - t_sync_start);
+                        enum ggml_expert_cache_phase phase = (ids_tensor->ne[1] > 1) ?
+                            GGML_EXPERT_CACHE_PHASE_PP : GGML_EXPERT_CACHE_PHASE_TG;
+
+                        if (phase == GGML_EXPERT_CACHE_PHASE_TG) {
+                            for (const int32_t e : requested_experts) {
                                 if (expert_counts[e] > 0) {
                                     const uint32_t inc = (phase == GGML_EXPERT_CACHE_PHASE_PP) ?
                                         (uint32_t)expert_counts[e] :
@@ -2584,12 +2340,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             if (bp.route_ids == ids_tensor && bp.valid) {
                                 bplan = &bp;
                                 break;
-                            }
-                        }
-
-                        if (bplan && bplan->valid && ids_tensor->ne[1] == 1 && (node == bplan->gate_node || node == bplan->gate_up_node)) {
-                            if (ggml_backend_sched_execute_moe_bundle(sched, bplan, split_backend, cache, ids.data(), (int32_t)ids_tensor->ne[0], save_node_for_restore)) {
-                                continue;
                             }
                         }
 
@@ -2660,6 +2410,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                                 used_zero_copy = true;
                                 continue;
+                            } else if (bplan && bplan->valid && ids_tensor->ne[1] == 1) {
+                                // Heterogeneous Partial-Hit / Miss: Avoid transferring weights across PCIe
+                                used_zero_copy = true;
+
+                                bool already_registered = false;
+                                for (const auto & ex : split_hetero_bundles) {
+                                    if (ex.plan == bplan) {
+                                        already_registered = true;
+                                        break;
+                                    }
+                                }
+
+                                if (!already_registered) {
+                                    int j_gate = -1, j_up = -1, j_down = -1, j_act = -1;
+                                    for (int j = 0; j < split->graph.n_nodes; j++) {
+                                        struct ggml_tensor * nd = split->graph.nodes[j];
+                                        if (nd == (bplan->is_fused ? bplan->gate_up_node : bplan->gate_node)) j_gate = j;
+                                        if (!bplan->is_fused && nd == bplan->up_node) j_up = j;
+                                        if (nd == bplan->down_node) j_down = j;
+                                        if (bplan->down_node && nd == bplan->down_node->src[1]) j_act = j;
+                                    }
+
+                                    int j_first = j_gate;
+                                    if (j_up >= 0 && (j_first < 0 || j_up < j_first)) j_first = j_up;
+                                    if (j_act >= 0 && (j_first < 0 || j_act < j_first)) j_first = j_act;
+
+                                    int j_last = j_down;
+                                    if (j_gate > j_last) j_last = j_gate;
+                                    if (j_up > j_last) j_last = j_up;
+                                    if (j_act > j_last) j_last = j_act;
+
+                                    if (j_first >= 0 && j_last >= j_first) {
+                                        split_hetero_bundles.push_back({ bplan, ids, (int32_t)ids_tensor->ne[0], j_first, j_last });
+                                    }
+                                }
+                                continue;
                             }
                         }
 
@@ -2689,12 +2475,94 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // evaluate graph
         if (sched->callback_eval == NULL) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
-            if (ec != GGML_STATUS_SUCCESS) {
-                return ec;
+            if (split_hetero_bundles.empty()) {
+                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+            } else {
+                std::sort(split_hetero_bundles.begin(), split_hetero_bundles.end(),
+                    [](const active_hetero_bundle & a, const active_hetero_bundle & b) {
+                        return a.j_first < b.j_first;
+                    });
+
+                int cur_j = 0;
+                for (const auto & hb : split_hetero_bundles) {
+                    if (hb.j_first > cur_j) {
+                        struct ggml_cgraph gv_pre = ggml_graph_view(&split->graph, cur_j, hb.j_first);
+                        enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv_pre);
+                        if (ec != GGML_STATUS_SUCCESS) {
+                            fprintf(stderr, "[ERROR] gv_pre failed: ec=%d cur_j=%d j_first=%d\n", ec, cur_j, hb.j_first);
+                            return ec;
+                        }
+                        ggml_backend_synchronize(split_backend);
+                    }
+
+                    // Execute heterogeneous MoE bundle
+                    int cpu_backend_id = -1;
+                    for (int b = 0; b < sched->n_backends; b++) {
+                        if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            cpu_backend_id = b;
+                            break;
+                        }
+                    }
+
+                    if (cpu_backend_id >= 0) {
+                        ggml_backend_t cpu_backend = sched->backends[cpu_backend_id];
+                        const int64_t d_model = hb.plan->down_node->ne[0];
+                        const int64_t d_ff = hb.plan->is_fused ? (hb.plan->gate_up_node->ne[0] / 2) : (hb.plan->gate_node ? hb.plan->gate_node->ne[0] : 0);
+                        if (sched->hetero_scratch == nullptr) {
+                            sched->hetero_scratch = ggml_moe_hetero_scratch_init(split_backend, d_model, d_ff, 32);
+                        }
+                        struct ggml_moe_bundle_plan plan = {};
+                        plan.layer = hb.plan->layer;
+                        plan.kind = hb.plan->is_fused ? GGML_MOE_BUNDLE_FUSED_GATE_UP : GGML_MOE_BUNDLE_SEPARATE_GATE_UP;
+                        plan.route_ids = hb.plan->route_ids;
+                        plan.gate_node = hb.plan->gate_node;
+                        plan.up_node = hb.plan->up_node;
+                        plan.gate_up_node = hb.plan->gate_up_node;
+                        plan.act_node = hb.plan->down_node ? hb.plan->down_node->src[1] : nullptr;
+                        plan.down_node = hb.plan->down_node;
+                        plan.layer_input = hb.plan->gate_up_node ? hb.plan->gate_up_node->src[1] : (hb.plan->gate_node ? hb.plan->gate_node->src[1] : nullptr);
+                        plan.canonical_route_output = hb.plan->down_node;
+                        plan.is_fused = hb.plan->is_fused;
+                        plan.valid = hb.plan->valid;
+
+                        ggml_backend_expert_cache_t cache = sched->expert_caches[split_backend_id];
+
+                        std::vector<int32_t> live_ids(hb.top_k);
+                        if (plan.route_ids) {
+                            ggml_backend_tensor_get(plan.route_ids, live_ids.data(), 0, hb.top_k * sizeof(int32_t));
+                        }
+
+                        enum ggml_status ec = ggml_backend_moe_hetero_execute_serial(
+                            split_backend,
+                            cpu_backend,
+                            &plan,
+                            cache,
+                            live_ids.data(),
+                            hb.top_k,
+                            sched->hetero_scratch,
+                            &sched->route_census_stats);
+                        if (ec != GGML_STATUS_SUCCESS) {
+                            fprintf(stderr, "[ERROR] hetero_execute_serial failed: ec=%d layer=%d\n", ec, plan.layer);
+                            return ec;
+                        }
+                        ggml_backend_synchronize(split_backend);
+                    }
+
+                    cur_j = hb.j_last + 1;
+                }
+
+                if (cur_j < split->graph.n_nodes) {
+                    struct ggml_cgraph gv_post = ggml_graph_view(&split->graph, cur_j, split->graph.n_nodes);
+                    enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv_post);
+                    if (ec != GGML_STATUS_SUCCESS) {
+                        fprintf(stderr, "[ERROR] gv_post failed: ec=%d cur_j=%d n_nodes=%d\n", ec, cur_j, split->graph.n_nodes);
+                        return ec;
+                    }
+                }
             }
-            // No full-device barrier here: inter-split ordering is handled by the
-            // scheduler's event dependencies so splits can overlap/queue on the stream.
         } else {
             // similar to ggml_backend_compare_graph_backend
             int j0 = 0;
@@ -2849,17 +2717,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         sched->remapped_ids_buf[b].buffers.clear();
         sched->remapped_ids_buf[b].tensors.clear();
     }
-    if (sched->moe_scratch.gpu_hit_buf) {
-        ggml_backend_buffer_free(sched->moe_scratch.gpu_hit_buf);
-        sched->moe_scratch.gpu_hit_buf = nullptr;
-    }
-    if (sched->moe_scratch.gpu_upload_buf) {
-        ggml_backend_buffer_free(sched->moe_scratch.gpu_upload_buf);
-        sched->moe_scratch.gpu_upload_buf = nullptr;
-    }
-    if (sched->moe_scratch.gpu_indices_buf) {
-        ggml_backend_buffer_free(sched->moe_scratch.gpu_indices_buf);
-        sched->moe_scratch.gpu_indices_buf = nullptr;
+    if (sched->hetero_scratch) {
+        ggml_moe_hetero_scratch_free(sched->hetero_scratch);
+        sched->hetero_scratch = nullptr;
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
@@ -3136,8 +2996,12 @@ bool ggml_backend_sched_get_expert_cache_stats(
     out_stats->hetero_d2h_activation_bytes += sched->route_census_stats.hetero_d2h_activation_bytes;
     out_stats->hetero_h2d_result_bytes += sched->route_census_stats.hetero_h2d_result_bytes;
     out_stats->hetero_weight_upload_bytes += sched->route_census_stats.hetero_weight_upload_bytes;
-    for (int k = 0; k < 8; k++) {
-        out_stats->hetero_partial_distribution[k] += sched->route_census_stats.hetero_partial_distribution[k];
+    out_stats->hetero_weight_h2d_bytes += sched->route_census_stats.hetero_weight_h2d_bytes;
+    for (int k = 0; k <= 8; k++) {
+        out_stats->hetero_hit_histogram[k] += sched->route_census_stats.hetero_hit_histogram[k];
+        if (k < 8) {
+            out_stats->hetero_partial_distribution[k] += sched->route_census_stats.hetero_partial_distribution[k];
+        }
     }
     return found;
 }

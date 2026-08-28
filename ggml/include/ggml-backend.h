@@ -424,11 +424,21 @@ extern "C" {
         uint64_t hetero_partial_layers;
         uint64_t hetero_gpu_routes;
         uint64_t hetero_cpu_routes;
+        uint64_t hetero_hit_histogram[9];
+
+        size_t   hetero_route_desc_d2h_bytes;
         size_t   hetero_d2h_activation_bytes;
         size_t   hetero_h2d_result_bytes;
+        size_t   hetero_slot_map_h2d_bytes;
+        size_t   hetero_bg_dma_h2d_bytes;
         size_t   hetero_weight_upload_bytes;
+        size_t   hetero_weight_h2d_bytes;
+
+        uint64_t hetero_partition_us;
         uint64_t hetero_gpu_compute_us;
+        uint64_t hetero_d2h_us;
         uint64_t hetero_cpu_compute_us;
+        uint64_t hetero_h2d_us;
         uint64_t hetero_merge_us;
         uint64_t hetero_wait_us;
         uint64_t hetero_partial_distribution[8];

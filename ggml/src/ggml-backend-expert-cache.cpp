@@ -66,6 +66,7 @@ struct ggml_expert_cache_slot_entry {
     bool is_pinned = false;
     ggml_backend_event_t last_use_event = nullptr;
     ggml_backend_event_t load_event = nullptr;
+    int32_t  reservation_count = 0;
 };
 
 struct ggml_expert_cache_slot_pool {
@@ -602,7 +603,7 @@ void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache, int 
                     break;
                 }
             }
-            if (!keep && pool.slots[s].state != GGML_EXPERT_CACHE_SLOT_LOADING) {
+            if (!keep && pool.slots[s].state != GGML_EXPERT_CACHE_SLOT_LOADING && pool.slots[s].reservation_count <= 0) {
                 slots_to_evict.push_back(s);
             }
         }
@@ -1009,7 +1010,7 @@ int32_t ggml_backend_expert_cache_claim_slot_idx(
 
     for (int32_t s = 0; s < pool->max_slots; s++) {
         const auto & slot = pool->slots[s];
-        if (slot.tensor == NULL || slot.state == GGML_EXPERT_CACHE_SLOT_LOADING || slot.is_pinned) continue;
+        if (slot.tensor == NULL || slot.state == GGML_EXPERT_CACHE_SLOT_LOADING || slot.is_pinned || slot.reservation_count > 0) continue;
 
         bool is_pinned = false;
         if (pinned_keys != NULL && n_pinned > 0) {
@@ -1031,7 +1032,7 @@ int32_t ggml_backend_expert_cache_claim_slot_idx(
     if (victim_slot == -1) {
         for (int32_t s = 0; s < pool->max_slots; s++) {
             const auto & slot = pool->slots[s];
-            if (slot.tensor == NULL || slot.state == GGML_EXPERT_CACHE_SLOT_LOADING || slot.is_pinned) continue;
+            if (slot.tensor == NULL || slot.state == GGML_EXPERT_CACHE_SLOT_LOADING || slot.is_pinned || slot.reservation_count > 0) continue;
 
             bool is_pinned = false;
             if (pinned_keys != NULL && n_pinned > 0) {
@@ -1392,6 +1393,25 @@ void ggml_backend_expert_cache_register_fused_bundle(
             }
         }
     }
+}
+
+bool ggml_backend_expert_cache_get_bundle_weights(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        struct ggml_expert_bundle_weights * out_weights) {
+    if (!cache || !out_weights || layer < 0) {
+        return false;
+    }
+    auto it = cache->bundle_registrations.find(layer);
+    if (it == cache->bundle_registrations.end()) {
+        return false;
+    }
+    out_weights->gate = const_cast<struct ggml_tensor *>(it->second.gate);
+    out_weights->up = const_cast<struct ggml_tensor *>(it->second.up);
+    out_weights->down = const_cast<struct ggml_tensor *>(it->second.down);
+    out_weights->gate_up = const_cast<struct ggml_tensor *>(it->second.gate_up);
+    out_weights->is_fused = it->second.is_fused;
+    return true;
 }
 
 bool ggml_backend_expert_cache_is_bundle_resident(
@@ -2207,3 +2227,117 @@ const int32_t * ggml_backend_expert_cache_get_gpu_slot_map(
     }
     return cache->gpu_slot_map_table.data() + (size_t)layer * 512;
 }
+
+void ggml_backend_expert_cache_reserve_bundle_slots(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const struct ggml_cache_route_bundle * hit_routes,
+        int32_t n_hits) {
+    if (cache == NULL || hit_routes == NULL || n_hits <= 0) {
+        return;
+    }
+    const auto it_bundle = cache->bundle_registrations.find(layer);
+    if (it_bundle == cache->bundle_registrations.end()) {
+        return;
+    }
+    const auto & reg = it_bundle->second;
+
+    for (int32_t i = 0; i < n_hits; i++) {
+        const auto & route = hit_routes[i];
+        if (!route.bundle_resident) continue;
+
+        if (reg.is_fused) {
+            if (reg.gate_up && route.gate_up_slot >= 0) {
+                ggml_expert_cache_pool_key k_gu = { reg.gate_up->ne[0], reg.gate_up->ne[1], reg.gate_up->type, reg.gate_up->nb[2] };
+                auto pool_it = cache->slot_pools.find(k_gu);
+                if (pool_it != cache->slot_pools.end() && route.gate_up_slot < (int32_t)pool_it->second.slots.size()) {
+                    pool_it->second.slots[route.gate_up_slot].reservation_count++;
+                }
+            }
+        } else {
+            if (reg.gate && route.gate_slot >= 0) {
+                ggml_expert_cache_pool_key k_g = { reg.gate->ne[0], reg.gate->ne[1], reg.gate->type, reg.gate->nb[2] };
+                auto pool_it = cache->slot_pools.find(k_g);
+                if (pool_it != cache->slot_pools.end() && route.gate_slot < (int32_t)pool_it->second.slots.size()) {
+                    pool_it->second.slots[route.gate_slot].reservation_count++;
+                }
+            }
+            if (reg.up && route.up_slot >= 0) {
+                ggml_expert_cache_pool_key k_u = { reg.up->ne[0], reg.up->ne[1], reg.up->type, reg.up->nb[2] };
+                auto pool_it = cache->slot_pools.find(k_u);
+                if (pool_it != cache->slot_pools.end() && route.up_slot < (int32_t)pool_it->second.slots.size()) {
+                    pool_it->second.slots[route.up_slot].reservation_count++;
+                }
+            }
+        }
+        if (reg.down && route.down_slot >= 0) {
+            ggml_expert_cache_pool_key k_d = { reg.down->ne[0], reg.down->ne[1], reg.down->type, reg.down->nb[2] };
+            auto pool_it = cache->slot_pools.find(k_d);
+            if (pool_it != cache->slot_pools.end() && route.down_slot < (int32_t)pool_it->second.slots.size()) {
+                pool_it->second.slots[route.down_slot].reservation_count++;
+            }
+        }
+    }
+}
+
+void ggml_backend_expert_cache_release_bundle_slots(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        const struct ggml_cache_route_bundle * hit_routes,
+        int32_t n_hits,
+        ggml_backend_event_t completion_event) {
+    if (cache == NULL || hit_routes == NULL || n_hits <= 0) {
+        return;
+    }
+    const auto it_bundle = cache->bundle_registrations.find(layer);
+    if (it_bundle == cache->bundle_registrations.end()) {
+        return;
+    }
+    const auto & reg = it_bundle->second;
+
+    for (int32_t i = 0; i < n_hits; i++) {
+        const auto & route = hit_routes[i];
+        if (!route.bundle_resident) continue;
+
+        if (reg.is_fused) {
+            if (reg.gate_up && route.gate_up_slot >= 0) {
+                ggml_expert_cache_pool_key k_gu = { reg.gate_up->ne[0], reg.gate_up->ne[1], reg.gate_up->type, reg.gate_up->nb[2] };
+                auto pool_it = cache->slot_pools.find(k_gu);
+                if (pool_it != cache->slot_pools.end() && route.gate_up_slot < (int32_t)pool_it->second.slots.size()) {
+                    auto & slot_entry = pool_it->second.slots[route.gate_up_slot];
+                    if (slot_entry.reservation_count > 0) slot_entry.reservation_count--;
+                    if (completion_event) slot_entry.last_use_event = completion_event;
+                }
+            }
+        } else {
+            if (reg.gate && route.gate_slot >= 0) {
+                ggml_expert_cache_pool_key k_g = { reg.gate->ne[0], reg.gate->ne[1], reg.gate->type, reg.gate->nb[2] };
+                auto pool_it = cache->slot_pools.find(k_g);
+                if (pool_it != cache->slot_pools.end() && route.gate_slot < (int32_t)pool_it->second.slots.size()) {
+                    auto & slot_entry = pool_it->second.slots[route.gate_slot];
+                    if (slot_entry.reservation_count > 0) slot_entry.reservation_count--;
+                    if (completion_event) slot_entry.last_use_event = completion_event;
+                }
+            }
+            if (reg.up && route.up_slot >= 0) {
+                ggml_expert_cache_pool_key k_u = { reg.up->ne[0], reg.up->ne[1], reg.up->type, reg.up->nb[2] };
+                auto pool_it = cache->slot_pools.find(k_u);
+                if (pool_it != cache->slot_pools.end() && route.up_slot < (int32_t)pool_it->second.slots.size()) {
+                    auto & slot_entry = pool_it->second.slots[route.up_slot];
+                    if (slot_entry.reservation_count > 0) slot_entry.reservation_count--;
+                    if (completion_event) slot_entry.last_use_event = completion_event;
+                }
+            }
+        }
+        if (reg.down && route.down_slot >= 0) {
+            ggml_expert_cache_pool_key k_d = { reg.down->ne[0], reg.down->ne[1], reg.down->type, reg.down->nb[2] };
+            auto pool_it = cache->slot_pools.find(k_d);
+            if (pool_it != cache->slot_pools.end() && route.down_slot < (int32_t)pool_it->second.slots.size()) {
+                auto & slot_entry = pool_it->second.slots[route.down_slot];
+                if (slot_entry.reservation_count > 0) slot_entry.reservation_count--;
+                if (completion_event) slot_entry.last_use_event = completion_event;
+            }
+        }
+    }
+}
+
