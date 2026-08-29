@@ -1600,6 +1600,8 @@ static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_ba
     EXPERT_CACHE_SUBTRACT(n_route_ready_actions);
     EXPERT_CACHE_SUBTRACT(n_route_ready_dispatches);
     EXPERT_CACHE_SUBTRACT(n_route_ready_classifications);
+    EXPERT_CACHE_SUBTRACT(n_route_ready_full_hits);
+    EXPERT_CACHE_SUBTRACT(n_route_ready_fallbacks);
 #undef EXPERT_CACHE_SUBTRACT
     return delta;
 }
@@ -1792,7 +1794,9 @@ struct test {
             "expert_cache_route_census_plans",
             "expert_cache_route_ready_actions",
             "expert_cache_route_ready_dispatches",
-            "expert_cache_route_ready_classifications"
+            "expert_cache_route_ready_classifications",
+            "expert_cache_route_ready_full_hits",
+            "expert_cache_route_ready_fallbacks"
 
         };
         return fields;
@@ -1862,7 +1866,9 @@ struct test {
             field == "expert_cache_route_census_plans" ||
             field == "expert_cache_route_ready_actions" ||
             field == "expert_cache_route_ready_dispatches" ||
-            field == "expert_cache_route_ready_classifications") {
+            field == "expert_cache_route_ready_classifications" ||
+            field == "expert_cache_route_ready_full_hits" ||
+            field == "expert_cache_route_ready_fallbacks") {
             return INT;
         }
         return STRING;
@@ -1993,7 +1999,9 @@ struct test {
                                             std::to_string(expert_cache_stats.n_route_census_plans),
                                             std::to_string(expert_cache_stats.n_route_ready_actions),
                                             std::to_string(expert_cache_stats.n_route_ready_dispatches),
-                                            std::to_string(expert_cache_stats.n_route_ready_classifications) };
+                                            std::to_string(expert_cache_stats.n_route_ready_classifications),
+                                            std::to_string(expert_cache_stats.n_route_ready_full_hits),
+                                            std::to_string(expert_cache_stats.n_route_ready_fallbacks) };
         return values;
     }
 
