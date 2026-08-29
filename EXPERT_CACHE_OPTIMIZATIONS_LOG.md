@@ -2343,3 +2343,59 @@ The generator is correct against its input, but the input is wrong. `profiler_cb
 ### Next diagnostic
 
 The scheduler reads decode routes synchronously right after submitting the producing split (`ggml_backend_synchronize(ids_backend)` following `ggml_backend_tensor_get_async`, `ggml-backend.cpp:2657`). The profiler's `llama_model_get_tensor`-based census and `ggml_backend_tensor_get` go through no such sync. Before trusting any generated manifest, capture routes the way the scheduler does: either (a) add a `ggml_backend_synchronize` on the CUDA device backend immediately before the argsort/topk read and confirm non-zero ids, or (b) instrument `GGML_OP_ARGSORT`/topk production directly. Do not ship a manifest generated from the current degenerate capture.
+
+## Dynamic 128 MiB Period-32 Re-Measurement After Fallback Fix (2026-08-29)
+
+### Why
+
+The pre-fix +3.305% for this operating point was measured while every fallback decode step
+folded a stale activation into the residual stream (see "Route-Ready Fallback
+Stale-Activation Fix"). Throughput was real but the outputs were corrupt, so the number was
+not trustworthy. Re-measured after commit 60e52b380, whose coherence check restored valid
+output on the same seed and prompt.
+
+### Method
+
+`run-tg-matrix.py --runs 3 --cache-mib 128 --cache-period 32 --fit-target 256 --load-mode
+mmap --n-gen 128` on Qwen3.6-35B-A3B-APEX-Compact, GTX 1080, Ryzen 7 5700X, `GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL=0`.
+`mmap` load (not `mlock`) after earlier memory-pressure crashes. Paired alternating
+control/cache; throughput from `n_gen / (avg_ns / 1e9)`.
+
+### Result
+
+| Pair | Control t/s | Cache t/s | Delta |
+|---|---|---|---|
+| 1 | 20.35 | 23.61 | +16.05% |
+| 2 | 17.18 | 19.13 | +11.35% |
+| 3 | 23.14 | 29.00 | +25.33% |
+| Mean | 20.22 | 23.91 | +18.26% |
+
+The paired interval is positive in all three pairs, so the sign is robust, but the spread
+(+11% to +25%) and the control range (17.2-23.1 t/s) are wide; three pairs is not enough to
+put a tight number on the gain. Treat "+18%, direction certain, magnitude imprecise" as the
+claim. Raw files: `2026-08-29-dynamic-postfix-{control,cache}-{1,2,3}.jsonl`.
+
+### The decisive telemetry
+`Route-Ready Admission` for the three cache runs (Classifications 3483 each):
+
+| Run | Full-Hit (8/8) | Fallbacks | Mask histogram |
+|---|---|---|---|
+| 1 | 0 | 3482 | `0:1618 1:638 2:623 3:354 4:181 5:52 6:16 7:1 8:0` |
+| 2 | 1 | 3478 | `0:1604 1:608 2:646 3:403 4:166 5:37 6:14 7:4 8:1` |
+| 3 | 1 | 3481 | `0:1754 1:667 2:507 3:353 4:140 5:52 6:8 7:1 8:1` |
+
+Full 8/8 sidecar admissions are essentially nil (0-1 per run of ~3483). The entire +18%
+comes from the partial-admission **fallback** path (the CPU-base path fixed this session).
+About 46% of classified steps have a 0/8 mask (no route pinned at all), and the 7/8 bucket
+is single-digit. Automatic-fit placement at 128 MiB never forms a usable 7/8-or-8/8 bundle.
+It also means the current win is a partial-route CPU-base effect that survives on the fixed
+fallback ordering, and that fixing the fallback was load-bearing for the only positive
+dynamic number we have.
+
+### Bench columns completed
+
+`expert_cache_route_ready_full_hits` and `expert_cache_route_ready_fallbacks` were wired
+into all four llama-bench sites (subtract helper, field list, INT predicate, values). The
+earlier claim that they existed was incomplete - only `n_route_ready_actions` was emitted;
+the admission read above came from the scheduler print, not a column. Alignment test still
+passes.

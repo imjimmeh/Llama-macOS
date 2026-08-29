@@ -173,16 +173,28 @@ session's changes.
 
 ## 7. Remaining plan work (Task 3/4 of the v2 plan)
 
-- Task 3 (generator v2): code DONE, but **gated on the route-capture blocker above**.
-- Task 2 (loader accounting): DONE, committed, tested.
+- Task 2 (loader accounting): DONE, committed (`60e52b380`), tested.
+- Task 3 (generator v2): code DONE (`a66ac1cf7`), but **gated on the route-capture blocker
+  in section 5** - it produces correct manifests only from correct routes.
+- Dynamic 128 MiB period-32 re-measured after the fallback fix: **+18.3% paired mean
+  (20.22 -> 23.91 t/s), positive in all 3 pairs, coherence verified.** See the
+  optimization log "Dynamic 128 MiB Period-32 Re-Measurement After Fallback Fix". The old
+  +3.305%-on-corrupt-output number is superseded; the win is now real.
+  - **Strategic finding:** the cache run reports **Full-Hit (8/8) = 0, Fallbacks = 3482**,
+    mask histogram `0:1618 1:638 2:623 3:354 4:181 5:52 6:16 7:1 8:0`. The entire +18% at
+    this operating point comes from the partial-admission **fallback / CPU-base** path, not
+    from any GPU sidecar full hit. Automatic-fit placement never forms a complete 7/8-or-8/8
+    bundle here. This is precisely the gap bundle-admission manifest v2 (Task 3) targets, so
+    unblocking section 5 is the highest-value next step: it should raise the full-hit share
+    from ~0 and convert the sidecar path's known +8% (3 GiB) into a larger, additive win.
 - Task 4 (validation matrix): blocked until v2 manifests are trustworthy.
-- Re-measure the **dynamic** 128 MiB period-32 operating point for *quality* after the
-  stale-activation fix. The old +3.305% was measured on corrupt output. The explicit 3 GiB
-  sidecar (+8.176%) is unaffected - it is always full-hit, never falls back.
 
-Benchmark config (repo rule): mirror the `qwen3.6-35b-a3b-presets-exc-latest.ini`
-compact preset; use `tools/results/expert-cache/run-tg-matrix.py`; keep
-`GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL` off. Target is >=20 TK/s.
+Benchmark config (repo rule): mirror the `qwen3.6-35b-a3b-presets-exc-latest.ini` compact
+preset; use `tools/results/expert-cache/run-tg-matrix.py`; keep
+`GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL` off; load with `mmap`. Target is >=20 TK/s (control
+sits right at that line; cache-on clears it). Throughput is `n_gen / (avg_ns/1e9)` from the
+first JSON record of each run file; the admission histogram is in the plain-text telemetry
+block appended after it.
 
 ---
 

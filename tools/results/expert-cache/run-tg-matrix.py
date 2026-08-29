@@ -111,7 +111,7 @@ def main() -> int:
             command = bench_command(args, cache_enabled)
             print(f"running {label} {run}/{args.runs}: {output_path}", file=sys.stderr)
             completed = subprocess.run(command, capture_output=True, text=True, env=environment)
-            output_path.write_text(completed.stdout, encoding="utf-8")
+            output_path.write_text(completed.stdout, encoding="utf-8", newline="\n")
             if completed.returncode:
                 print(completed.stderr, file=sys.stderr, end="")
                 return completed.returncode
