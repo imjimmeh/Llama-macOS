@@ -4171,12 +4171,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
-                cudaError_t err = cudaStreamSynchronize(cuda_ctx->stream());
-                if (err != cudaSuccess) {
-                    fprintf(stderr, "[CUDA FAIL] Op failed: %s (%s, node_idx=%d)\n", node->name ? node->name : "unnamed", ggml_op_name(node->op), i);
-                    fflush(stderr);
-                    CUDA_CHECK(err);
-                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);

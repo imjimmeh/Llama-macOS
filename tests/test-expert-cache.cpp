@@ -54,12 +54,22 @@ static void test_cache_node_selection() {
 static void test_route_census_classifies_original_graph() {
     printf("testing original-graph route census...\n");
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    require(backend != nullptr);
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
 
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
     ggml_backend_sched_t sched = ggml_backend_sched_new(
-        &backend, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
+        backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
     require(sched != nullptr);
+    ggml_backend_sched_set_expert_cache(sched, 1024 * 1024);
 
     struct ggml_init_params params = {
         /*.mem_size   =*/ 16 * 1024 * 1024,
@@ -76,7 +86,7 @@ static void test_route_census_classifies_original_graph() {
     ggml_set_name(experts, "blk.0.ffn_gate_exps.weight");
     ggml_set_name(output, "ffn_moe_gate");
 
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
     require(buffer != nullptr);
     ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
@@ -92,8 +102,10 @@ static void test_route_census_classifies_original_graph() {
     require(stats.n_route_census_split_inputs == 0);
 
     ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    ggml_backend_free(backend);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
 
     printf("  original-graph route census tests passed\n");
 }
@@ -101,11 +113,22 @@ static void test_route_census_classifies_original_graph() {
 static void test_route_plan_groups_shared_ids() {
     printf("testing shared route-ID plan discovery...\n");
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    require(backend != nullptr);
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
     ggml_backend_sched_t sched = ggml_backend_sched_new(
-        &backend, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, false);
+        backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, false);
     require(sched != nullptr);
+    ggml_backend_sched_set_expert_cache(sched, 1024 * 1024);
 
     struct ggml_init_params params = {
         /*.mem_size   =*/ 16 * 1024 * 1024,
@@ -123,7 +146,7 @@ static void test_route_plan_groups_shared_ids() {
     ggml_tensor * matmul_b = ggml_mul_mat_id(ctx, experts_b, input, ids);
     ggml_tensor * output = ggml_add(ctx, matmul_a, matmul_b);
 
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
     require(buffer != nullptr);
     ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
@@ -137,8 +160,10 @@ static void test_route_plan_groups_shared_ids() {
     require(stats.n_route_census_plans == 1);
 
     ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    ggml_backend_free(backend);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
 
     printf("  shared route-ID plan discovery tests passed\n");
 }
@@ -222,6 +247,20 @@ static void test_count_synchronize(ggml_backend_t backend) {
     test_original_synchronize(backend);
 }
 
+struct test_tensor_write {
+    size_t offset;
+    size_t size;
+};
+
+static const char * test_tracked_tensor_name = nullptr;
+static int test_tracked_cpy_tensor_async_calls = 0;
+static std::vector<test_tensor_write> test_tracked_set_tensor_async_writes;
+static bool (*test_original_cpy_tensor_async)(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const struct ggml_tensor * src,
+        struct ggml_tensor * dst) = nullptr;
+
 static int test_set_tensor_async_calls = 0;
 static void (*test_original_set_tensor_async)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) = nullptr;
 
@@ -232,8 +271,25 @@ static void test_count_set_tensor_async(
         size_t offset,
         size_t size) {
     test_set_tensor_async_calls++;
+    if (test_tracked_tensor_name != nullptr &&
+        strstr(tensor->name, test_tracked_tensor_name) != nullptr) {
+        test_tracked_set_tensor_async_writes.push_back({ offset, size });
+    }
     test_original_set_tensor_async(backend, tensor, data, offset, size);
 }
+
+static bool test_count_cpy_tensor_async(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const struct ggml_tensor * src,
+        struct ggml_tensor * dst) {
+    if (test_tracked_tensor_name != nullptr &&
+        strstr(src->name, test_tracked_tensor_name) != nullptr) {
+        test_tracked_cpy_tensor_async_calls++;
+    }
+    return test_original_cpy_tensor_async(backend_src, backend_dst, src, dst);
+}
+
 
 static int test_get_tensor_async_calls = 0;
 static void (*test_original_get_tensor_async)(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) = nullptr;
@@ -2018,9 +2074,173 @@ static void test_route_ready_cross_split_sidecar() {
 }
 
 
+static void test_cacheless_moe_subset_copy() {
+    printf("testing cacheless MoE subset copy...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    constexpr int64_t n_experts = 8;
+    constexpr int64_t n_embd = 4;
+    constexpr int64_t n_tokens = 32;
+    constexpr size_t expert_bytes = n_embd * n_embd * sizeof(float);
+    std::vector<float> input_data((size_t) n_embd * n_tokens);
+    std::vector<int32_t> route_data(2 * n_tokens);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        input_data[(size_t) token * n_embd + 0] = 1.0f;
+        input_data[(size_t) token * n_embd + 1] = 2.0f;
+        input_data[(size_t) token * n_embd + 2] = 3.0f;
+        input_data[(size_t) token * n_embd + 3] = 4.0f;
+        route_data[2 * token + 0] = 0;
+        route_data[2 * token + 1] = 4;
+    }
+    std::vector<float> weights((size_t) n_experts * n_embd * n_embd, 0.0f);
+    for (int64_t expert = 0; expert < n_experts; ++expert) {
+        for (int64_t diagonal = 0; diagonal < n_embd; ++diagonal) {
+            weights[(size_t) expert * n_embd * n_embd + diagonal * n_embd + diagonal] =
+                (float) expert + 1.0f;
+        }
+    }
+
+    struct ggml_init_params reference_params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * reference_ctx = ggml_init(reference_params);
+    require(reference_ctx != nullptr);
+    ggml_tensor * reference_weights =
+        ggml_new_tensor_3d(reference_ctx, GGML_TYPE_F32, n_embd, n_embd, n_experts);
+    ggml_tensor * reference_input =
+        ggml_new_tensor_3d(reference_ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+    ggml_tensor * reference_ids =
+        ggml_new_tensor_2d(reference_ctx, GGML_TYPE_I32, 2, n_tokens);
+    ggml_tensor * reference_output =
+        ggml_mul_mat_id(reference_ctx, reference_weights, reference_input, reference_ids);
+    ggml_cgraph * reference_graph = ggml_new_graph(reference_ctx);
+    ggml_build_forward_expand(reference_graph, reference_output);
+    ggml_backend_buffer_t reference_buffer =
+        ggml_backend_alloc_ctx_tensors(reference_ctx, cpu_backend);
+    require(reference_buffer != nullptr);
+    ggml_backend_tensor_set(reference_weights, weights.data(), 0, ggml_nbytes(reference_weights));
+    ggml_backend_tensor_set(
+        reference_input, input_data.data(), 0, input_data.size() * sizeof(float));
+    ggml_backend_tensor_set(
+        reference_ids, route_data.data(), 0, route_data.size() * sizeof(int32_t));
+    require(ggml_backend_graph_compute(cpu_backend, reference_graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> expected(ggml_nelements(reference_output));
+    ggml_backend_tensor_get(
+        reference_output, expected.data(), 0, ggml_nbytes(reference_output));
+
+    struct ggml_init_params weights_params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * weights_ctx = ggml_init(weights_params);
+    require(weights_ctx != nullptr);
+    ggml_tensor * expert_weights =
+        ggml_new_tensor_3d(weights_ctx, GGML_TYPE_F32, n_embd, n_embd, n_experts);
+    ggml_set_name(expert_weights, "blk.0.ffn_gate_exps.weight");
+    ggml_backend_buffer_t weights_buffer =
+        ggml_backend_alloc_ctx_tensors(weights_ctx, cpu_backend);
+    require(weights_buffer != nullptr);
+    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(expert_weights, weights.data(), 0, ggml_nbytes(expert_weights));
+
+    struct ggml_init_params graph_params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * graph_ctx = ggml_init(graph_params);
+    require(graph_ctx != nullptr);
+    ggml_tensor * input =
+        ggml_new_tensor_3d(graph_ctx, GGML_TYPE_F32, n_embd, 1, n_tokens);
+    ggml_tensor * route_ids =
+        ggml_new_tensor_2d(graph_ctx, GGML_TYPE_I32, 2, n_tokens);
+    ggml_set_input(input);
+    ggml_set_input(route_ids);
+    ggml_tensor * output = ggml_mul_mat_id(graph_ctx, expert_weights, input, route_ids);
+    ggml_cgraph * graph = ggml_new_graph(graph_ctx);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    require(sched != nullptr);
+    ggml_backend_sched_set_tensor_backend(sched, input, gpu_backend);
+    ggml_backend_sched_set_tensor_backend(sched, route_ids, gpu_backend);
+    require(ggml_backend_sched_alloc_graph(sched, graph));
+    ggml_backend_tensor_set(input, input_data.data(), 0, input_data.size() * sizeof(float));
+    ggml_backend_tensor_set(route_ids, route_data.data(), 0, route_data.size() * sizeof(int32_t));
+
+    test_tracked_tensor_name = "blk.0.ffn_gate_exps.weight";
+    test_tracked_cpy_tensor_async_calls = 0;
+    test_tracked_set_tensor_async_writes.clear();
+    test_original_cpy_tensor_async = gpu_backend->iface.cpy_tensor_async;
+    test_original_set_tensor_async = gpu_backend->iface.set_tensor_async;
+    require(test_original_cpy_tensor_async != nullptr);
+    require(test_original_set_tensor_async != nullptr);
+    gpu_backend->iface.cpy_tensor_async = test_count_cpy_tensor_async;
+    gpu_backend->iface.set_tensor_async = test_count_set_tensor_async;
+
+    const enum ggml_status status = ggml_backend_sched_graph_compute(sched, graph);
+
+    gpu_backend->iface.set_tensor_async = test_original_set_tensor_async;
+    gpu_backend->iface.cpy_tensor_async = test_original_cpy_tensor_async;
+    test_tracked_tensor_name = nullptr;
+    require(status == GGML_STATUS_SUCCESS);
+    require(test_tracked_cpy_tensor_async_calls == 0);
+    require(test_tracked_set_tensor_async_writes.size() == 2);
+    require(test_tracked_set_tensor_async_writes[0].offset == 0);
+    require(test_tracked_set_tensor_async_writes[0].size == 2 * expert_bytes);
+    require(test_tracked_set_tensor_async_writes[1].offset == 4 * expert_bytes);
+    require(test_tracked_set_tensor_async_writes[1].size == 2 * expert_bytes);
+
+    std::vector<float> actual(expected.size());
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+
+    ggml_backend_expert_cache_stats stats = {};
+    require(!ggml_backend_sched_get_expert_cache_stats(sched, -1, &stats));
+    require(stats.n_requests == 0);
+    require(stats.n_route_census_nodes == 0);
+    require(stats.n_route_census_plans == 0);
+    require(stats.n_route_census_split_inputs == 0);
+    require(stats.n_route_ready_dispatches == 0);
+    require(stats.n_route_ready_classifications == 0);
+    require(stats.n_route_ready_actions == 0);
+    require(stats.n_zero_copy_hits == 0);
+    require(stats.bytes_ram_to_gpu == 0);
+
+    ggml_backend_sched_free(sched);
+    ggml_free(graph_ctx);
+    ggml_backend_buffer_free(weights_buffer);
+    ggml_free(weights_ctx);
+    ggml_backend_buffer_free(reference_buffer);
+    ggml_free(reference_ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  cacheless MoE subset copy tests passed\n");
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
+    test_cacheless_moe_subset_copy();
     test_route_census_classifies_original_graph();
     test_event_query_contract();
     test_registered_bundle_keeps_cpu_base_placement();
