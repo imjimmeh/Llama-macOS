@@ -1,0 +1,44 @@
+User:
+Explain sparse expert routing in transformer models.
+
+Assistant:
+**Sparse Expert Routing** is a technique used in Transformer-based large language models (LLMs) to increase model capacity and efficiency without proportionally increasing the computational cost during inference. It is the core mechanism behind **Mixture of Experts (MoE)** architectures.
+
+Below is a detailed explanation of how it works, its components, advantages, and challenges.
+
+---
+
+### 1. Core Concept: Mixture of Experts (MoE)
+
+In a standard dense Transformer, every input token passes through the same Feed-Forward Network (FFN). This means the entire model is activated for every token, leading to high computational costs as the model scales.
+
+**Sparse Expert Routing** replaces the single FFN with **multiple parallel FFNs (Experts)**. For each token, only a small subset of experts is selected and activated. This makes the model **sparse** in activation, allowing it to scale to trillions of parameters while maintaining a low per-token compute cost.
+
+---
+
+### 2. Key Components
+
+#### A. Experts
+- **Parallel FFNs**: A set of $N$ feed-forward networks (FFNs). Each expert is essentially a small Transformer layer with its own weights.
+- **Specialization**: Different experts may learn to specialize in different types of data (e.g., one expert handles code, another handles poetry, another handles math).
+
+#### B. Gating Network (Router)
+- A small neural network (usually a linear layer or MLP) that determines which experts should handle each token.
+- **Input**: The hidden state representation of the token.
+- **Output**: A set of scores (logits) indicating how relevant each expert is to the current token.
+
+#### C. Top-K Selection
+- For each token, the gating network selects the **top-K** experts with the highest scores.
+- **K is small** (e.g., K=1, 2, or 4), hence "sparse."
+- Only these K experts are activated for that token.
+
+#### D. Weighted Combination
+- The output is not just the sum of the selected experts. Instead, it is a **weighted sum**:
+  $$
+  \text{Output} = \sum_{i \in \text{Top-K}} \text{GateScore}_i \times \text{Expert}_i(\text{Input})
+  $$
+- The gate scores are typically normalized (e.g., via softmax) to ensure stability.
+
+---
+
+###
