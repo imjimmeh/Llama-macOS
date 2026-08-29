@@ -1,7 +1,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "../ggml/src/ggml-backend-expert-cache.h"
+#include "../ggml/src/ggml-backend-moe-hetero.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <cassert>
 #include <cstdio>
@@ -9,12 +11,14 @@
 #include <cstring>
 #include <vector>
 
-static void require(bool condition) {
+static void require_impl(bool condition, const char * expression, const char * file, int line) {
     if (!condition) {
-        fprintf(stderr, "test requirement failed\n");
+        fprintf(stderr, "test requirement failed: %s:%d: %s\n", file, line, expression);
         abort();
     }
 }
+
+#define require(condition) require_impl((condition), #condition, __FILE__, __LINE__)
 
 
 static void test_cache_node_selection() {
@@ -139,11 +143,165 @@ static void test_route_plan_groups_shared_ids() {
     printf("  shared route-ID plan discovery tests passed\n");
 }
 
+static void test_registered_bundle_keeps_cpu_base_placement() {
+    printf("testing registered bundle CPU-base placement...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    require(sched != nullptr);
+    ggml_backend_sched_set_expert_cache(sched, 1024 * 1024);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * gate_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_tensor * up_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_tensor * down_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 1, 1);
+    ggml_tensor * route_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+    ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(up_weights, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down_weights, "blk.0.ffn_down_exps.weight");
+
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, input, route_ids);
+    ggml_tensor * up = ggml_mul_mat_id(ctx, up_weights, input, route_ids);
+    ggml_tensor * activation = ggml_add(ctx, gate, up);
+    ggml_tensor * output = ggml_mul_mat_id(ctx, down_weights, activation, route_ids);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
+    require(buffer != nullptr);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_sched_register_expert_bundle(
+        sched, 0, gate_weights, up_weights, down_weights);
+
+    ggml_backend_sched_set_tensor_backend(sched, input, gpu_backend);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_sched_split_graph(sched, graph);
+
+    require(ggml_backend_sched_get_tensor_backend(sched, gate) == cpu_backend);
+    require(ggml_backend_sched_get_tensor_backend(sched, up) == cpu_backend);
+    require(ggml_backend_sched_get_tensor_backend(sched, output) == cpu_backend);
+
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  registered bundle CPU-base placement tests passed\n");
+}
+
 static void test_event_query_contract() {
     printf("testing nonblocking event query contract...\n");
     require(!ggml_backend_event_query(nullptr));
     printf("  nonblocking event query contract tests passed\n");
 }
+static int test_synchronize_calls = 0;
+static void (*test_original_synchronize)(ggml_backend_t backend) = nullptr;
+
+static void test_count_synchronize(ggml_backend_t backend) {
+    test_synchronize_calls++;
+    test_original_synchronize(backend);
+}
+
+static int test_set_tensor_async_calls = 0;
+static void (*test_original_set_tensor_async)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) = nullptr;
+
+static void test_count_set_tensor_async(
+        ggml_backend_t backend,
+        struct ggml_tensor * tensor,
+        const void * data,
+        size_t offset,
+        size_t size) {
+    test_set_tensor_async_calls++;
+    test_original_set_tensor_async(backend, tensor, data, offset, size);
+}
+
+static int test_get_tensor_async_calls = 0;
+static void (*test_original_get_tensor_async)(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) = nullptr;
+
+static void test_count_get_tensor_async(
+        ggml_backend_t backend,
+        const struct ggml_tensor * tensor,
+        void * data,
+        size_t offset,
+        size_t size) {
+    test_get_tensor_async_calls++;
+    test_original_get_tensor_async(backend, tensor, data, offset, size);
+}
+
+static enum ggml_status (*test_original_graph_compute)(ggml_backend_t backend, struct ggml_cgraph * cgraph) = nullptr;
+
+static enum ggml_status test_fail_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    (void) backend;
+    (void) cgraph;
+    return GGML_STATUS_FAILED;
+}
+
+static void test_rebalance_does_not_synchronize_gpu() {
+    printf("testing nonblocking rebalance promotion...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(gpu_backend, 4096);
+    require(cache != nullptr);
+    ggml_backend_expert_cache_set_period(cache, 1);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+    ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_set_name(weights, "blk.0.ffn_gate_exps.weight");
+    ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
+    require(weights_buffer != nullptr);
+    memset(weights->data, 0xA5, ggml_nbytes(weights));
+
+    ggml_backend_expert_cache_record_access(cache, weights, 0);
+    test_original_synchronize = gpu_backend->iface.synchronize;
+    require(test_original_synchronize != nullptr);
+    test_synchronize_calls = 0;
+    gpu_backend->iface.synchronize = test_count_synchronize;
+    ggml_backend_expert_cache_begin_step(cache);
+    gpu_backend->iface.synchronize = test_original_synchronize;
+    require(test_synchronize_calls == 0);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_buffer_free(weights_buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  nonblocking rebalance promotion tests passed\n");
+}
+
+
 
 
 
@@ -424,6 +582,38 @@ static void test_pinned_host_buffer() {
 
     printf("  pinned host buffer tests passed\n");
 }
+
+
+
+static void test_rebalance_tracks_staging_memcpy() {
+    printf("testing rebalance staging memcpy telemetry...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 4096);
+    require(cache != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+    ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_set_name(weights, "blk.0.ffn_gate_exps.weight");
+    memset(weights->data, 0xA5, ggml_nbytes(weights));
+
+    ggml_backend_expert_cache_record_access(cache, weights, 0);
+    ggml_backend_expert_cache_rebalance(cache, -1);
+
+    ggml_backend_expert_cache_stats stats = {};
+    ggml_backend_expert_cache_get_stats(cache, &stats);
+    require(stats.staging_memcpy_bytes == weights->nb[2]);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  rebalance staging memcpy telemetry tests passed\n");
+}
+
 
 static void test_prefetch() {
     printf("testing explicit expert prefetch...\n");
@@ -1148,11 +1338,693 @@ static void test_dynamic_map_metadata_and_device_maps() {
     printf("  dynamic map metadata and device maps tests passed\n");
 }
 
+static void test_route_ready_sidecar_full_hit() {
+    printf("testing route-ready full-hit sidecar...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * gate_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 3);
+    ggml_tensor * up_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 3);
+    ggml_tensor * down_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 3);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 1, 1);
+    ggml_tensor * route_input = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+    ggml_tensor * route_ids = ggml_dup(ctx, route_input);
+    ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(up_weights, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down_weights, "blk.0.ffn_down_exps.weight");
+
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, input, route_ids);
+    ggml_tensor * up = ggml_mul_mat_id(ctx, up_weights, input, route_ids);
+    ggml_tensor * activation = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * output = ggml_mul_mat_id(ctx, down_weights, activation, route_ids);
+    ggml_tensor * unrelated = ggml_dup(ctx, input);
+    ggml_tensor * zero = ggml_scale(ctx, unrelated, 0.0f);
+    ggml_tensor * noncontiguous_activation = ggml_add(ctx, activation, zero);
+    ggml_tensor * noncontiguous_output = ggml_mul_mat_id(ctx, down_weights, noncontiguous_activation, route_ids);
+    ggml_backend_buffer_type_t host_buffer_type = ggml_backend_dev_host_buffer_type(gpu_device);
+    require(host_buffer_type != nullptr);
+    ggml_backend_buffer_t cpu_buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, host_buffer_type);
+    require(cpu_buffer != nullptr);
+    ggml_backend_buffer_set_usage(cpu_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    const float gate_data[] = {
+        1.0f, 0.0f, 0.0f, 1.0f,
+        0.5f, 0.0f, 0.0f, 0.5f,
+        0.25f, 0.0f, 0.0f, 0.25f,
+    };
+    const float up_data[] = {
+        0.75f, 0.0f, 0.0f, 0.75f,
+        1.25f, 0.0f, 0.0f, 1.25f,
+        1.5f, 0.0f, 0.0f, 1.5f,
+    };
+    const float down_data[] = {
+        1.0f, 0.0f, 0.0f, 1.0f,
+        2.0f, 0.0f, 0.0f, 2.0f,
+        3.0f, 0.0f, 0.0f, 3.0f,
+    };
+    const float input_data[] = { 1.0f, 2.0f };
+    const int32_t ids[] = { 0, 1 };
+    const int32_t stale_ids[] = { 1, 2 };
+    const int32_t inactive_ids[] = { 0, -1 };
+    ggml_backend_tensor_set(gate_weights, gate_data, 0, sizeof(gate_data));
+    ggml_backend_tensor_set(up_weights, up_data, 0, sizeof(up_data));
+    ggml_backend_tensor_set(down_weights, down_data, 0, sizeof(down_data));
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    ggml_cgraph * noncontiguous_graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(noncontiguous_graph, noncontiguous_output);
+    require(ggml_backend_graph_compute(cpu_backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> expected(ggml_nelements(output));
+    ggml_backend_tensor_get(output, expected.data(), 0, ggml_nbytes(output));
+    ggml_backend_tensor_set(route_input, stale_ids, 0, sizeof(stale_ids));
+    require(ggml_backend_graph_compute(cpu_backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> stale_expected(ggml_nelements(output));
+    ggml_backend_tensor_get(output, stale_expected.data(), 0, ggml_nbytes(output));
+    ggml_backend_tensor_set(route_input, inactive_ids, 0, sizeof(inactive_ids));
+    require(ggml_backend_graph_compute(cpu_backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> inactive_expected(ggml_nelements(output));
+    ggml_backend_tensor_get(output, inactive_expected.data(), 0, ggml_nbytes(output));
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(gpu_backend, 4096);
+    require(cache != nullptr);
+    ggml_backend_expert_cache_register_bundle(cache, 0, gate_weights, up_weights, down_weights);
+    require(ggml_backend_graph_compute(cpu_backend, noncontiguous_graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> noncontiguous_expected(ggml_nelements(noncontiguous_output));
+    ggml_backend_tensor_get(noncontiguous_output, noncontiguous_expected.data(), 0, ggml_nbytes(noncontiguous_output));
+    for (int32_t expert_id : ids) {
+        ggml_backend_expert_cache_seed(cache, gate_weights, expert_id, 1);
+        ggml_backend_expert_cache_seed(cache, up_weights, expert_id, 1);
+        ggml_backend_expert_cache_seed(cache, down_weights, expert_id, 1);
+    }
+    ggml_backend_synchronize(gpu_backend);
+    require(ggml_backend_expert_cache_is_bundle_resident(cache, 0, 0));
+    require(ggml_backend_expert_cache_is_bundle_resident(cache, 0, 1));
+
+    struct ggml_moe_bundle_plan bundle = {};
+    bundle.layer = 0;
+    bundle.kind = GGML_MOE_BUNDLE_SEPARATE_GATE_UP;
+    bundle.route_ids = route_ids;
+    bundle.gate_node = gate;
+    bundle.up_node = up;
+    bundle.act_node = activation;
+    bundle.down_node = output;
+    bundle.layer_input = input;
+    bundle.is_fused = false;
+    bundle.valid = true;
+
+    const float sentinel = -99.0f;
+    std::vector<float> actual(expected.size(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    ggml_moe_route_ready_sidecar_t sidecar = ggml_moe_route_ready_sidecar_new(
+        gpu_backend, cpu_backend, 2, 2, 2, false);
+    ggml_backend_expert_cache_stats stats = {};
+    test_original_synchronize = gpu_backend->iface.synchronize;
+    test_original_set_tensor_async = gpu_backend->iface.set_tensor_async;
+    test_original_get_tensor_async = gpu_backend->iface.get_tensor_async;
+    require(test_original_synchronize != nullptr);
+    require(test_original_set_tensor_async != nullptr);
+    require(test_original_get_tensor_async != nullptr);
+    test_synchronize_calls = 0;
+    test_set_tensor_async_calls = 0;
+    test_get_tensor_async_calls = 0;
+    gpu_backend->iface.synchronize = test_count_synchronize;
+    gpu_backend->iface.set_tensor_async = test_count_set_tensor_async;
+    gpu_backend->iface.get_tensor_async = test_count_get_tensor_async;
+    const enum ggml_status status = ggml_moe_route_ready_sidecar_execute_full_hit(
+        sidecar, &bundle, cache, ids, 2, &stats);
+    gpu_backend->iface.get_tensor_async = test_original_get_tensor_async;
+    gpu_backend->iface.set_tensor_async = test_original_set_tensor_async;
+    gpu_backend->iface.synchronize = test_original_synchronize;
+    require(test_synchronize_calls == 1);
+    require(test_set_tensor_async_calls == 4);
+    require(test_get_tensor_async_calls == 1);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    require(stats.bytes_ram_to_gpu == 0);
+    require(stats.n_zero_copy_hits == 6);
+
+    test_synchronize_calls = 0;
+    test_original_graph_compute = gpu_backend->iface.graph_compute;
+    require(test_original_graph_compute != nullptr);
+    gpu_backend->iface.synchronize = test_count_synchronize;
+    gpu_backend->iface.graph_compute = test_fail_graph_compute;
+    require(ggml_moe_route_ready_sidecar_execute_full_hit(
+        sidecar, &bundle, cache, ids, 2, &stats) == GGML_STATUS_FAILED);
+    gpu_backend->iface.graph_compute = test_original_graph_compute;
+    gpu_backend->iface.synchronize = test_original_synchronize;
+    require(test_synchronize_calls == 1);
+    ggml_backend_buffer_type failed_buft = {};
+    failed_buft.iface.get_name = [](ggml_backend_buffer_type_t) { return "failed"; };
+    failed_buft.iface.alloc_buffer = [](ggml_backend_buffer_type_t, size_t) { return static_cast<ggml_backend_buffer_t>(nullptr); };
+    failed_buft.iface.get_alignment = [](ggml_backend_buffer_type_t) { return (size_t) 1; };
+    ggml_backend_device failed_device = {};
+    failed_device.context = &failed_buft;
+    failed_device.iface.get_buffer_type = [](ggml_backend_dev_t device) {
+        return static_cast<ggml_backend_buffer_type_t>(device->context);
+    };
+    failed_buft.device = &failed_device;
+    ggml_backend failed_backend = {};
+    failed_backend.device = &failed_device;
+    ggml_moe_route_ready_sidecar_t failed_sidecar = ggml_moe_route_ready_sidecar_new(
+        &failed_backend, cpu_backend, 2, 2, 2, false);
+    require(failed_sidecar != nullptr);
+    require(ggml_moe_route_ready_sidecar_execute_full_hit(
+        failed_sidecar, &bundle, cache, ids, 2, &stats) == GGML_STATUS_FAILED);
+    require(ggml_moe_route_ready_sidecar_execute_full_hit(
+        failed_sidecar, &bundle, cache, ids, 2, &stats) == GGML_STATUS_FAILED);
+    ggml_moe_route_ready_sidecar_free(failed_sidecar);
+
+    ggml_backend_expert_cache_t incomplete_cache = ggml_backend_expert_cache_new(gpu_backend, 4096);
+    require(incomplete_cache != nullptr);
+    ggml_backend_expert_cache_register_bundle(incomplete_cache, 0, gate_weights, up_weights, down_weights);
+    for (int32_t expert_id : ids) {
+        ggml_backend_expert_cache_seed(incomplete_cache, gate_weights, expert_id, 1);
+        ggml_backend_expert_cache_seed(incomplete_cache, up_weights, expert_id, 1);
+    }
+    ggml_backend_synchronize(gpu_backend);
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    ggml_backend_expert_cache_stats incomplete_stats = {};
+    require(ggml_moe_route_ready_sidecar_execute_full_hit(
+        sidecar, &bundle, incomplete_cache, ids, 2, &incomplete_stats) == GGML_STATUS_FAILED);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (float value : actual) {
+        require(value == sentinel);
+    }
+    require(incomplete_stats.n_zero_copy_hits == 0);
+    ggml_backend_expert_cache_free(incomplete_cache);
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    require(sched != nullptr);
+    ggml_backend_sched_set_expert_cache(sched, 4096);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
+    for (int32_t expert_id : ids) {
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_weights, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, up_weights, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, down_weights, expert_id, 1));
+    }
+    ggml_backend_sched_expert_cache_sync(sched);
+    const uint64_t epoch_before_full_hit = ggml_backend_sched_expert_cache_epoch(sched, 0);
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    const enum ggml_status scheduler_status = ggml_backend_sched_graph_compute(sched, graph);
+    require(scheduler_status == GGML_STATUS_SUCCESS);
+    require(ggml_backend_sched_expert_cache_epoch(sched, 0) == epoch_before_full_hit);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats sched_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &sched_stats));
+    require(sched_stats.n_route_ready_dispatches == 1);
+    require(sched_stats.n_route_ready_classifications == 1);
+    require(sched_stats.n_route_ready_actions == 1);
+    require(sched_stats.bytes_ram_to_gpu == 0);
+    require(sched_stats.n_zero_copy_hits == 6);
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats reuse_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &reuse_stats));
+    require(reuse_stats.n_route_ready_dispatches == 1);
+    require(reuse_stats.n_route_ready_classifications == 2);
+    require(reuse_stats.n_route_ready_actions == 2);
+    require(reuse_stats.n_zero_copy_hits == 12);
+    require(reuse_stats.bytes_ram_to_gpu == 0);
+    ggml_backend_sched_set_expert_cache(sched, 4096);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
+    for (int32_t expert_id : ids) {
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_weights, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, up_weights, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, down_weights, expert_id, 1));
+    }
+    ggml_backend_sched_expert_cache_sync(sched);
+    ggml_backend_tensor_set(route_input, stale_ids, 0, sizeof(stale_ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    test_original_synchronize = gpu_backend->iface.synchronize;
+    require(test_original_synchronize != nullptr);
+    test_synchronize_calls = 0;
+    gpu_backend->iface.synchronize = test_count_synchronize;
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    gpu_backend->iface.synchronize = test_original_synchronize;
+    require(test_synchronize_calls == 2);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - stale_expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats stale_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &stale_stats));
+    require(stale_stats.n_route_ready_classifications == reuse_stats.n_route_ready_classifications + 1);
+    require(stale_stats.n_route_ready_actions == reuse_stats.n_route_ready_actions + 1);
+    require(stale_stats.n_zero_copy_hits == 0);
+    require(stale_stats.hetero_partial_layers == 1);
+    require(stale_stats.hetero_gpu_routes == 1);
+    require(stale_stats.hetero_cpu_routes == 1);
+    require(stale_stats.bytes_ram_to_gpu == 0);
+    ggml_backend_sched_set_expert_cache(sched, 4096);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
+    const uint64_t epoch_before_seed = ggml_backend_sched_expert_cache_epoch(sched, 0);
+    require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_weights, 0, 1));
+    require(ggml_backend_sched_expert_cache_epoch(sched, 0) > epoch_before_seed);
+    ggml_backend_sched_expert_cache_sync(sched);
+    const uint64_t epoch_before_partial_miss = ggml_backend_sched_expert_cache_epoch(sched, 0);
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    require(ggml_backend_sched_expert_cache_epoch(sched, 0) == epoch_before_partial_miss);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats partial_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &partial_stats));
+    require(partial_stats.n_route_ready_classifications == stale_stats.n_route_ready_classifications + 1);
+    require(partial_stats.n_route_ready_actions == stale_stats.n_route_ready_actions);
+    require(partial_stats.n_zero_copy_hits == 0);
+    require(partial_stats.bytes_ram_to_gpu == 0);
+    ggml_backend_sched_set_expert_cache(sched, 4096);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats miss_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &miss_stats));
+    require(miss_stats.n_route_ready_classifications == partial_stats.n_route_ready_classifications + 1);
+    require(miss_stats.n_route_ready_actions == partial_stats.n_route_ready_actions);
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats miss_reuse_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &miss_reuse_stats));
+    require(miss_reuse_stats.n_route_ready_classifications == miss_stats.n_route_ready_classifications + 1);
+    require(miss_reuse_stats.n_route_ready_actions == miss_stats.n_route_ready_actions);
+    require(miss_reuse_stats.n_zero_copy_hits == 0);
+    require(miss_reuse_stats.bytes_ram_to_gpu == 0);
+    ggml_backend_sched_set_expert_cache(sched, 4096);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
+    ggml_backend_sched_set_expert_cache_period(sched, 1);
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats learning_first_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &learning_first_stats));
+    require(learning_first_stats.n_route_ready_actions == miss_reuse_stats.n_route_ready_actions);
+    require(learning_first_stats.n_zero_copy_hits == 0);
+    require(learning_first_stats.bytes_ram_to_gpu == 0);
+    ggml_backend_sched_expert_cache_rebalance(sched);
+    ggml_backend_sched_expert_cache_sync(sched);
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats learning_second_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &learning_second_stats));
+    require(learning_second_stats.n_route_ready_actions == learning_first_stats.n_route_ready_actions + 1);
+    require(learning_second_stats.n_zero_copy_hits == 6);
+    require(learning_second_stats.bytes_ram_to_gpu == 0);
+    ggml_backend_sched_set_expert_cache(sched, 4096);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
+    for (int32_t expert_id : ids) {
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_weights, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, up_weights, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, down_weights, expert_id, 1));
+    }
+    ggml_backend_sched_expert_cache_sync(sched);
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    ggml_backend_sched_reset(sched);
+    std::vector<float> noncontiguous_actual(noncontiguous_expected.size(), sentinel);
+    ggml_backend_tensor_set(noncontiguous_output, noncontiguous_actual.data(), 0, ggml_nbytes(noncontiguous_output));
+    require(ggml_backend_sched_graph_compute(sched, noncontiguous_graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(noncontiguous_output, noncontiguous_actual.data(), 0, ggml_nbytes(noncontiguous_output));
+    for (size_t i = 0; i < noncontiguous_actual.size(); ++i) {
+        require(fabsf(noncontiguous_actual[i] - noncontiguous_expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats noncontiguous_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &noncontiguous_stats));
+    require(noncontiguous_stats.n_route_ready_actions == learning_second_stats.n_route_ready_actions);
+    require(noncontiguous_stats.n_zero_copy_hits == 0);
+    require(noncontiguous_stats.bytes_ram_to_gpu == 0);
+    ggml_backend_sched_set_expert_cache(sched, 4096);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
+    require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_weights, 0, 1));
+    require(ggml_backend_sched_expert_cache_seed(sched, 0, up_weights, 0, 1));
+    require(ggml_backend_sched_expert_cache_seed(sched, 0, down_weights, 0, 1));
+    ggml_backend_sched_expert_cache_sync(sched);
+    ggml_backend_sched_reset(sched);
+    ggml_backend_tensor_set(route_input, inactive_ids, 0, sizeof(inactive_ids));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < (size_t) output->ne[0]; ++i) {
+        require(fabsf(actual[i] - inactive_expected[i]) < 1e-5f);
+    }
+    for (size_t i = (size_t) output->ne[0]; i < actual.size(); ++i) {
+        require(actual[i] == sentinel);
+    }
+    ggml_backend_expert_cache_stats inactive_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &inactive_stats));
+    require(inactive_stats.n_route_ready_actions == noncontiguous_stats.n_route_ready_actions);
+    ggml_backend_sched_free(sched);
+    ggml_moe_route_ready_sidecar_free(sidecar);
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_buffer_free(cpu_buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  route-ready full-hit sidecar tests passed\n");
+}
+
+
+static void test_route_ready_two_bundles_same_split_gap() {
+    printf("testing route-ready two-bundle same-split gap...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * gate_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_tensor * up_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_tensor * down_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_tensor * gate_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_tensor * up_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_tensor * down_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_set_name(gate_a, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(up_a, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down_a, "blk.0.ffn_down_exps.weight");
+    ggml_set_name(gate_b, "blk.1.ffn_gate_exps.weight");
+    ggml_set_name(up_b, "blk.1.ffn_up_exps.weight");
+    ggml_set_name(down_b, "blk.1.ffn_down_exps.weight");
+
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 1, 1);
+    ggml_tensor * route_input_a = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+    ggml_tensor * route_input_b = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+    ggml_set_input(input);
+    ggml_set_input(route_input_a);
+    ggml_set_input(route_input_b);
+
+    ggml_tensor * ids_a = ggml_dup(ctx, route_input_a);
+    ggml_tensor * gate_out_a = ggml_mul_mat_id(ctx, gate_a, input, ids_a);
+    ggml_tensor * up_out_a = ggml_mul_mat_id(ctx, up_a, input, ids_a);
+    ggml_tensor * activation_a = ggml_swiglu_split(ctx, gate_out_a, up_out_a);
+    ggml_tensor * output_a = ggml_mul_mat_id(ctx, down_a, activation_a, ids_a);
+
+    ggml_tensor * j0 = ggml_scale(ctx, input, 0.5f);
+    ggml_tensor * j1 = ggml_scale(ctx, j0, 0.5f);
+    ggml_tensor * j2 = ggml_scale(ctx, j1, 0.5f);
+    ggml_tensor * j3 = ggml_scale(ctx, j2, 0.5f);
+    ggml_tensor * j4 = ggml_scale(ctx, j3, 0.5f);
+    ggml_tensor * ids_b = ggml_dup(ctx, route_input_b);
+    ggml_tensor * gate_out_b = ggml_mul_mat_id(ctx, gate_b, j4, ids_b);
+    ggml_tensor * up_out_b = ggml_mul_mat_id(ctx, up_b, j4, ids_b);
+    ggml_tensor * activation_b = ggml_swiglu_split(ctx, gate_out_b, up_out_b);
+    ggml_tensor * output_b = ggml_mul_mat_id(ctx, down_b, activation_b, ids_b);
+    ggml_tensor * output = ggml_add(ctx, output_a, output_b);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
+    require(buffer != nullptr);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    const float gate_data[] = {
+        1.0f, 0.0f, 0.0f, 1.0f,
+        0.5f, 0.0f, 0.0f, 0.5f,
+    };
+    const float up_data[] = {
+        0.75f, 0.0f, 0.0f, 0.75f,
+        1.25f, 0.0f, 0.0f, 1.25f,
+    };
+    const float down_data[] = {
+        1.0f, 0.0f, 0.0f, 1.0f,
+        2.0f, 0.0f, 0.0f, 2.0f,
+    };
+    const float input_data[] = { 1.0f, 2.0f };
+    const float zero_input[] = { 0.0f, 0.0f };
+    const int32_t ids[] = { 0, 1 };
+    const int32_t sentinel_ids[] = { 1, 0 };
+    ggml_backend_tensor_set(gate_a, gate_data, 0, sizeof(gate_data));
+    ggml_backend_tensor_set(up_a, up_data, 0, sizeof(up_data));
+    ggml_backend_tensor_set(down_a, down_data, 0, sizeof(down_data));
+    ggml_backend_tensor_set(gate_b, gate_data, 0, sizeof(gate_data));
+    ggml_backend_tensor_set(up_b, up_data, 0, sizeof(up_data));
+    ggml_backend_tensor_set(down_b, down_data, 0, sizeof(down_data));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    ggml_backend_tensor_set(route_input_a, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(route_input_b, ids, 0, sizeof(ids));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    require(ggml_backend_graph_compute(cpu_backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> expected(ggml_nelements(output));
+    ggml_backend_tensor_get(output, expected.data(), 0, ggml_nbytes(output));
+
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    require(sched != nullptr);
+    ggml_backend_sched_set_expert_cache(sched, 1024 * 1024);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_a, up_a, down_a);
+    ggml_backend_sched_register_expert_bundle(sched, 1, gate_b, up_b, down_b);
+    for (int32_t expert_id : ids) {
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_a, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, up_a, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, down_a, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_b, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, up_b, expert_id, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, down_b, expert_id, 1));
+    }
+    ggml_backend_sched_expert_cache_sync(sched);
+    require(ggml_backend_sched_alloc_graph(sched, graph));
+
+    ggml_backend_expert_cache_stats planned_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &planned_stats));
+    require(planned_stats.n_route_ready_dispatches == 2);
+
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    ggml_backend_tensor_set(route_input_a, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(route_input_b, ids, 0, sizeof(ids));
+    ggml_backend_tensor_set(j4, zero_input, 0, sizeof(zero_input));
+    ggml_backend_tensor_set(ids_b, sentinel_ids, 0, sizeof(sentinel_ids));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+
+    std::vector<float> actual(expected.size());
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+
+    ggml_backend_expert_cache_stats stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &stats));
+    require(stats.n_route_ready_dispatches == 2);
+    require(stats.n_route_ready_classifications == 2);
+    require(stats.n_route_ready_actions == 2);
+    require(stats.n_zero_copy_hits == 12);
+    require(stats.bytes_ram_to_gpu == 0);
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  route-ready two-bundle same-split gap tests passed\n");
+}
+static void test_route_ready_cross_split_sidecar() {
+    printf("testing route-ready cross-split sidecar...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    require(sched != nullptr);
+    ggml_backend_sched_set_expert_cache(sched, 4096);
+    ggml_backend_sched_set_expert_cache_period(sched, 1);
+
+    struct ggml_init_params weights_params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * weights_ctx = ggml_init(weights_params);
+    require(weights_ctx != nullptr);
+
+    ggml_tensor * gate_weights = ggml_new_tensor_3d(weights_ctx, GGML_TYPE_F32, 3, 2, 2);
+    ggml_tensor * up_weights = ggml_new_tensor_3d(weights_ctx, GGML_TYPE_F32, 3, 2, 2);
+    ggml_tensor * down_weights = ggml_new_tensor_3d(weights_ctx, GGML_TYPE_F32, 2, 3, 2);
+    ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(up_weights, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down_weights, "blk.0.ffn_down_exps.weight");
+
+    ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(weights_ctx, cpu_backend);
+    require(weights_buffer != nullptr);
+    ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    struct ggml_init_params graph_params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(graph_params);
+    require(ctx != nullptr);
+
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 1, 1);
+    ggml_tensor * route_input = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+    ggml_set_input(input);
+    ggml_set_input(route_input);
+    ggml_tensor * route_ids_source = ggml_dup(ctx, route_input);
+    ggml_tensor * route_ids = ggml_view_2d(
+        ctx, route_ids_source, route_ids_source->ne[0], route_ids_source->ne[1], route_ids_source->nb[1], 0);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, input, route_ids);
+    ggml_tensor * up = ggml_mul_mat_id(ctx, up_weights, input, route_ids);
+    ggml_tensor * activation = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * output = ggml_mul_mat_id(ctx, down_weights, activation, route_ids);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+
+    const float gate_data[] = {
+        1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f,
+        0.5f, 0.0f, 0.0f, 0.0f, 0.5f, 0.0f,
+    };
+    const float up_data[] = {
+        0.75f, 0.0f, 0.0f, 0.0f, 0.75f, 0.0f,
+        1.25f, 0.0f, 0.0f, 0.0f, 1.25f, 0.0f,
+    };
+    const float down_data[] = {
+        1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+        2.0f, 0.0f, 0.0f, 2.0f, 0.0f, 0.0f,
+    };
+    const float input_data[] = { 1.0f, 2.0f, 3.0f };
+    const int32_t ids[] = { 0, 1 };
+    ggml_backend_tensor_set(gate_weights, gate_data, 0, sizeof(gate_data));
+    ggml_backend_tensor_set(up_weights, up_data, 0, sizeof(up_data));
+    ggml_backend_tensor_set(down_weights, down_data, 0, sizeof(down_data));
+
+    ggml_backend_sched_register_expert_bundle(
+        sched, 0, gate_weights, up_weights, down_weights);
+    ggml_backend_sched_set_tensor_backend(sched, route_ids_source, gpu_backend);
+    require(ggml_backend_sched_alloc_graph(sched, graph));
+    ggml_backend_expert_cache_stats planned_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &planned_stats));
+    require(planned_stats.n_route_ready_dispatches == 1);
+
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+
+    std::vector<float> expected(ggml_nelements(output));
+    ggml_backend_tensor_get(output, expected.data(), 0, ggml_nbytes(output));
+    ggml_backend_expert_cache_stats first_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &first_stats));
+    require(first_stats.n_route_ready_dispatches == 1);
+    require(first_stats.n_route_ready_classifications == 1);
+
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+
+    std::vector<float> actual(expected.size());
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats second_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &second_stats));
+    require(second_stats.n_route_ready_dispatches == 1);
+    require(second_stats.n_route_ready_classifications == 2);
+    require(second_stats.n_route_ready_actions == 1);
+    require(second_stats.n_zero_copy_hits == 6);
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(weights_buffer);
+    ggml_free(ctx);
+    ggml_free(weights_ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  route-ready cross-split sidecar tests passed\n");
+}
+
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
     test_route_census_classifies_original_graph();
     test_event_query_contract();
+    test_registered_bundle_keeps_cpu_base_placement();
+    test_rebalance_does_not_synchronize_gpu();
     test_route_plan_groups_shared_ids();
     test_slot_pools_and_remapping();
     test_multi_token_slot_remapping();
@@ -1162,6 +2034,7 @@ int main() {
     test_slru_and_admission_policy();
     test_expert_bundles();
     test_pinned_host_buffer();
+    test_rebalance_tracks_staging_memcpy();
     test_prefetch();
     test_prefetch_deduplicates_expert_ids();
     test_route_prefetch_telemetry();
@@ -1177,6 +2050,9 @@ int main() {
     test_hit_mask_matrix_partitioning();
     test_multi_token_repeated_experts();
     test_dynamic_map_metadata_and_device_maps();
+    test_route_ready_sidecar_full_hit();
+    test_route_ready_two_bundles_same_split_gap();
+    test_route_ready_cross_split_sidecar();
 
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;

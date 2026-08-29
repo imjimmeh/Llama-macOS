@@ -122,6 +122,9 @@ GGML_API void ggml_backend_expert_cache_rebalance(
     ggml_backend_expert_cache_t cache,
     int max_swaps);
 
+GGML_API uint64_t ggml_backend_expert_cache_get_residency_epoch(
+    ggml_backend_expert_cache_t cache);
+
 enum ggml_expert_cache_phase {
     GGML_EXPERT_CACHE_PHASE_TG = 0,
     GGML_EXPERT_CACHE_PHASE_PP = 1,
@@ -190,6 +193,9 @@ GGML_API size_t ggml_backend_expert_cache_find_offset(
 
 // Phase 1: Zero-Copy Slot Pools & ID Remapping
 GGML_API struct ggml_tensor * ggml_backend_expert_cache_get_slot_tensor(
+    ggml_backend_expert_cache_t cache,
+    const struct ggml_tensor * weight_tensor);
+GGML_API struct ggml_tensor * ggml_backend_expert_cache_find_slot_tensor(
     ggml_backend_expert_cache_t cache,
     const struct ggml_tensor * weight_tensor);
 

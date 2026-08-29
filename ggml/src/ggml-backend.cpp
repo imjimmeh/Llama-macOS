@@ -892,6 +892,18 @@ struct ggml_backend_sched {
         bool valid = false;
     };
     std::vector<ggml_backend_sched_route_bundle_plan> bundle_plans;
+    struct ggml_backend_sched_route_ready_dispatch {
+        const ggml_backend_sched_route_bundle_plan * bundle = nullptr;
+        int gpu_cache_backend_id = -1;
+        int producer_split = -1;
+        int producer_node_idx = -1;
+        int bundle_split = -1;
+        int first_bundle_node_idx = -1;
+        int last_bundle_node_idx = -1;
+        ggml_moe_route_ready_sidecar_t sidecar = nullptr;
+    };
+    std::vector<ggml_backend_sched_route_ready_dispatch> route_ready_dispatches;
+
 
     // Dedicated Heterogeneous Scratch Owner
     ggml_moe_hetero_scratch_t hetero_scratch = nullptr;
@@ -1006,6 +1018,34 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #endif
 
 // returns the backend that should be used for the node based on the current locations
+static bool ggml_backend_sched_is_registered_host_expert_weight(
+        ggml_backend_sched_t sched,
+        int backend_id,
+        const struct ggml_tensor * tensor);
+
+static bool ggml_backend_sched_has_registered_host_expert_weight(
+        ggml_backend_sched_t sched,
+        const struct ggml_tensor * tensor) {
+    for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+        if (ggml_backend_sched_is_registered_host_expert_weight(sched, backend_id, tensor)) {
+            return true;
+        }
+    }
+    return false;
+}
+static bool ggml_backend_sched_is_registered_host_expert_weight(
+        ggml_backend_sched_t sched,
+        int backend_id,
+        const struct ggml_tensor * tensor) {
+    const ggml_backend_expert_cache_t cache = sched->expert_caches[backend_id];
+    return cache != nullptr &&
+        tensor != nullptr &&
+        tensor->buffer != nullptr &&
+        ggml_backend_buffer_is_host(tensor->buffer) &&
+        ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_expert_cache_has_tensor(cache, tensor);
+}
+
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
@@ -1059,19 +1099,13 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-                // cache-driven offload is only valid for single-token decode graphs,
-                // where sparse expert selection makes resident experts valuable.
-                // Prompt processing touches nearly all experts and must keep the normal
-                // bulk placement (op_offload only) - do not force MUL_MAT_ID onto GPU.
-                const bool is_decode_mul_mat_id =
-                    tensor->op == GGML_OP_MUL_MAT_ID &&
-                    tensor->src[2] != NULL &&
-                    tensor->src[2]->ne[1] == 1;
                 if (src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
-                        const bool has_cache = (sched->expert_caches[b] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[b], src));
+                        if (ggml_backend_sched_is_registered_host_expert_weight(sched, b, src)) {
+                            continue;
+                        }
                         if (ggml_backend_supports_op(sched->backends[b], tensor) &&
-                            (has_cache ? is_decode_mul_mat_id : (sched->op_offload && ggml_backend_offload_op(sched->backends[b], tensor)))) {
+                            sched->op_offload && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
                             return b;
                         }
@@ -1287,6 +1321,121 @@ static void ggml_backend_sched_record_route_census(
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+static void ggml_backend_sched_build_route_ready_dispatches(ggml_backend_sched_t sched) {
+    for (auto & dispatch : sched->route_ready_dispatches) {
+        ggml_moe_route_ready_sidecar_free(dispatch.sidecar);
+    }
+    sched->route_ready_dispatches.clear();
+
+    for (const auto & bundle : sched->bundle_plans) {
+        if (!bundle.valid || bundle.route_ids == nullptr || bundle.route_ids->ne[1] != 1) {
+            continue;
+        }
+
+        int gpu_cache_backend_id = -1;
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (sched->expert_caches[b] != nullptr) {
+                gpu_cache_backend_id = b;
+                break;
+            }
+        }
+        if (gpu_cache_backend_id < 0) {
+            continue;
+        }
+
+        int producer_split = -1;
+        int producer_node_idx = -1;
+        int bundle_split = -1;
+        int first_bundle_node_idx = INT_MAX;
+        int last_bundle_node_idx = -1;
+        const ggml_tensor * consumers[] = {
+            bundle.gate_node,
+            bundle.up_node,
+            bundle.gate_up_node,
+            bundle.down_node,
+        };
+
+        for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+            const auto & split = sched->splits[split_id];
+            for (int node_idx = 0; node_idx < split.graph.n_nodes; ++node_idx) {
+                const ggml_tensor * node = split.graph.nodes[node_idx];
+                if (node == bundle.route_ids) {
+                    producer_split = split_id;
+                    producer_node_idx = node_idx;
+                }
+                for (const ggml_tensor * consumer : consumers) {
+                    if (consumer == nullptr || node != consumer) {
+                        continue;
+                    }
+                    if (bundle_split >= 0 && bundle_split != split_id) {
+                        bundle_split = -2;
+                    } else {
+                        bundle_split = split_id;
+                    }
+                    first_bundle_node_idx = std::min(first_bundle_node_idx, node_idx);
+                    last_bundle_node_idx = std::max(last_bundle_node_idx, node_idx);
+                }
+            }
+        }
+
+        if (producer_split < 0 || bundle_split < 0 || producer_split > bundle_split ||
+            first_bundle_node_idx == INT_MAX ||
+            (producer_split == bundle_split && producer_node_idx >= first_bundle_node_idx)) {
+            continue;
+        }
+
+        const int bundle_backend_id = sched->splits[bundle_split].backend_id;
+        if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[bundle_backend_id])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        if (producer_split < bundle_split &&
+            tensor_copy(const_cast<struct ggml_tensor *>(bundle.route_ids), bundle_backend_id, sched->cur_copy) == nullptr) {
+            continue;
+        }
+        bool contiguous = true;
+        const ggml_tensor * activation = bundle.down_node->src[1];
+        const auto & split = sched->splits[bundle_split];
+        for (int node_idx = first_bundle_node_idx; node_idx <= last_bundle_node_idx; ++node_idx) {
+            const ggml_tensor * node = split.graph.nodes[node_idx];
+            const bool consumer = node == bundle.gate_node || node == bundle.up_node ||
+                node == bundle.gate_up_node || node == bundle.down_node;
+            if (!consumer && node != activation && !ggml_is_view_op(node->op)) {
+                contiguous = false;
+                break;
+            }
+        }
+        if (!contiguous) {
+            continue;
+        }
+
+        const int64_t d_model = bundle.down_node->ne[0];
+        const int64_t d_ff = bundle.is_fused ? bundle.gate_up_node->ne[0] / 2 : bundle.gate_node->ne[0];
+        const int32_t top_k = (int32_t) bundle.route_ids->ne[0];
+        ggml_moe_route_ready_sidecar_t sidecar = ggml_moe_route_ready_sidecar_new(
+            sched->backends[gpu_cache_backend_id],
+            sched->backends[bundle_backend_id],
+            d_model,
+            d_ff,
+            top_k,
+            bundle.is_fused);
+        if (sidecar == nullptr) {
+            continue;
+        }
+
+        sched->route_ready_dispatches.push_back({
+            &bundle,
+            gpu_cache_backend_id,
+            producer_split,
+            producer_node_idx,
+            bundle_split,
+            first_bundle_node_idx,
+            last_bundle_node_idx,
+            sidecar,
+        });
+        sched->route_census_stats.n_route_ready_dispatches++;
+    }
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1344,6 +1493,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 #endif
         }
     }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr &&
+            ggml_backend_sched_has_registered_host_expert_weight(sched, node->src[0])) {
+            tensor_backend_id(node) = sched->n_backends - 1;
+            SET_CAUSE(node, "1.route-ready-cpu");
+        }
+    }
 
     // pass 2: expand current backend assignments
     // assign the same backend to adjacent nodes
@@ -1368,12 +1525,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             } else if (cur_backend_id != -1) {
                 if (node->src[0] && node->src[0]->buffer && ggml_backend_buffer_is_host(node->src[0]->buffer)) {
-                    const bool is_decode_mul_mat_id =
-                        node->op == GGML_OP_MUL_MAT_ID &&
-                        node->src[2] != NULL &&
-                        node->src[2]->ne[1] == 1;
-                    const bool has_cache = (sched->expert_caches[cur_backend_id] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[cur_backend_id], node->src[0]));
-                    if (!(has_cache ? is_decode_mul_mat_id : (sched->op_offload && ggml_backend_offload_op(sched->backends[cur_backend_id], node)))) {
+                    if (ggml_backend_sched_is_registered_host_expert_weight(sched, cur_backend_id, node->src[0]) ||
+                        !(sched->op_offload && ggml_backend_offload_op(sched->backends[cur_backend_id], node))) {
                         continue;
                     }
                 }
@@ -1399,12 +1552,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             } else if (cur_backend_id != -1) {
                 if (node->src[0] && node->src[0]->buffer && ggml_backend_buffer_is_host(node->src[0]->buffer)) {
-                    const bool is_decode_mul_mat_id =
-                        node->op == GGML_OP_MUL_MAT_ID &&
-                        node->src[2] != NULL &&
-                        node->src[2]->ne[1] == 1;
-                    const bool has_cache = (sched->expert_caches[cur_backend_id] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[cur_backend_id], node->src[0]));
-                    if (!(has_cache ? is_decode_mul_mat_id : (sched->op_offload && ggml_backend_offload_op(sched->backends[cur_backend_id], node)))) {
+                    if (ggml_backend_sched_is_registered_host_expert_weight(sched, cur_backend_id, node->src[0]) ||
+                        !(sched->op_offload && ggml_backend_offload_op(sched->backends[cur_backend_id], node))) {
                         continue;
                     }
                 }
@@ -1457,12 +1606,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             int n_supported_best = -1;
             for (int b = 0; b < sched->n_backends; b++) {
                 if (node->src[0] && node->src[0]->buffer && ggml_backend_buffer_is_host(node->src[0]->buffer) && b < sched->n_backends - 1) {
-                    const bool is_decode_mul_mat_id =
-                        node->op == GGML_OP_MUL_MAT_ID &&
-                        node->src[2] != NULL &&
-                        node->src[2]->ne[1] == 1;
-                    const bool has_cache = (sched->expert_caches[b] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[b], node->src[0]));
-                    if (!(has_cache ? is_decode_mul_mat_id : (sched->op_offload && ggml_backend_offload_op(sched->backends[b], node)))) {
+                    if (ggml_backend_sched_is_registered_host_expert_weight(sched, b, node->src[0]) ||
+                        !(sched->op_offload && ggml_backend_offload_op(sched->backends[b], node))) {
                         continue;
                     }
                 }
@@ -1488,12 +1633,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             // assigned node: upgrade to higher prio backend if possible
             for (int b = 0; b < *node_backend_id; b++) {
                 if (node->src[0] && node->src[0]->buffer && ggml_backend_buffer_is_host(node->src[0]->buffer)) {
-                    const bool is_decode_mul_mat_id =
-                        node->op == GGML_OP_MUL_MAT_ID &&
-                        node->src[2] != NULL &&
-                        node->src[2]->ne[1] == 1;
-                    const bool has_cache = (sched->expert_caches[b] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[b], node->src[0]));
-                    if (!(has_cache ? is_decode_mul_mat_id : (sched->op_offload && ggml_backend_offload_op(sched->backends[b], node)))) {
+                    if (ggml_backend_sched_is_registered_host_expert_weight(sched, b, node->src[0]) ||
+                        !(sched->op_offload && ggml_backend_offload_op(sched->backends[b], node))) {
                         continue;
                     }
                 }
@@ -1563,6 +1704,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     ggml_backend_sched_discover_route_plans(sched, graph);
     ggml_backend_sched_record_route_census(sched, graph);
+
 
     // pass 5: split graph, find tensors that need to be copied
     {
@@ -1787,6 +1929,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             graph_copy->nodes[graph_copy->n_nodes++] = graph->nodes[j];
         }
     }
+    ggml_backend_sched_build_route_ready_dispatches(sched);
 
     if (sched->n_copies > 1) {
         // add input copies as leafs so that they are allocated first
@@ -2051,15 +2194,101 @@ static void ggml_backend_sched_record_host_route_snapshots(
 
 
 
+static const struct ggml_tensor * ggml_backend_sched_canonical_bundle_weight(
+        const ggml_backend_sched::ggml_backend_sched_route_bundle_plan & bundle,
+        const struct ggml_expert_bundle_weights & weights,
+        const struct ggml_tensor * node) {
+    if (node == bundle.gate_node && node->src[0] == weights.gate) {
+        return weights.gate;
+    }
+    if (node == bundle.up_node && node->src[0] == weights.up) {
+        return weights.up;
+    }
+    if (node == bundle.gate_up_node && node->src[0] == weights.gate_up) {
+        return weights.gate_up;
+    }
+    if (node == bundle.down_node && node->src[0] == weights.down) {
+        return weights.down;
+    }
+    return nullptr;
+}
+
+static void ggml_backend_sched_record_route_ready_accesses(
+        const ggml_backend_sched::ggml_backend_sched_route_bundle_plan & bundle,
+        ggml_backend_expert_cache_t cache,
+        const int32_t * route_ids,
+        int32_t n_route_ids) {
+    if (cache == nullptr || route_ids == nullptr || n_route_ids <= 0) {
+        return;
+    }
+
+    struct ggml_expert_bundle_weights weights = {};
+    if (!ggml_backend_expert_cache_get_bundle_weights(cache, bundle.layer, &weights)) {
+        return;
+    }
+
+    const struct ggml_tensor * nodes[] = {
+        bundle.gate_node,
+        bundle.up_node,
+        bundle.gate_up_node,
+        bundle.down_node,
+    };
+    std::vector<const struct ggml_tensor *> canonical_weights;
+    canonical_weights.reserve(3);
+    for (const struct ggml_tensor * node : nodes) {
+        const struct ggml_tensor * weight =
+            node ? ggml_backend_sched_canonical_bundle_weight(bundle, weights, node) : nullptr;
+        if (weight != nullptr &&
+            std::find(canonical_weights.begin(), canonical_weights.end(), weight) == canonical_weights.end()) {
+            canonical_weights.push_back(weight);
+        }
+    }
+
+    std::vector<int32_t> requested_experts;
+    requested_experts.reserve(n_route_ids);
+    for (int32_t i = 0; i < n_route_ids; ++i) {
+        const int32_t expert_id = route_ids[i];
+        if (expert_id >= 0 &&
+            std::find(requested_experts.begin(), requested_experts.end(), expert_id) == requested_experts.end()) {
+            requested_experts.push_back(expert_id);
+        }
+    }
+
+    for (const struct ggml_tensor * weights_tensor : canonical_weights) {
+        if (!ggml_backend_expert_cache_can_store(cache, weights_tensor->nb[2])) {
+            continue;
+        }
+        for (const int32_t expert_id : requested_experts) {
+            if (expert_id >= weights_tensor->ne[2]) {
+                continue;
+            }
+            ggml_backend_expert_cache_record_access_count(
+                cache,
+                weights_tensor,
+                expert_id,
+                1,
+                GGML_EXPERT_CACHE_PHASE_TG);
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
     const uint64_t route_step = ++sched->expert_cache_route_step;
     ggml_backend_sched_prefetch_carry_forward(sched, route_step);
+    const char * debug_epoch_env = getenv("GGML_EXPERT_CACHE_DEBUG_EPOCH");
+    const bool debug_epoch = debug_epoch_env != nullptr && atoi(debug_epoch_env) != 0;
+    uint64_t residency_epochs[GGML_SCHED_MAX_BACKENDS] = {};
 
     for (int b = 0; b < sched->n_backends; b++) {
         if (sched->expert_caches[b]) {
             ggml_backend_expert_cache_begin_step(sched->expert_caches[b]);
+        }
+    }
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (sched->expert_caches[b] != nullptr) {
+            residency_epochs[b] = ggml_backend_expert_cache_get_residency_epoch(sched->expert_caches[b]);
         }
     }
 
@@ -2491,12 +2720,122 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // evaluate graph
         if (sched->callback_eval == NULL) {
-            if (split_hetero_bundles.empty()) {
-                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
-                if (ec != GGML_STATUS_SUCCESS) {
-                    return ec;
+            std::vector<ggml_backend_sched::ggml_backend_sched_route_ready_dispatch *> route_ready_dispatches;
+            for (auto & dispatch : sched->route_ready_dispatches) {
+                if (dispatch.bundle_split == split_id) {
+                    route_ready_dispatches.push_back(&dispatch);
                 }
-            } else {
+            }
+            std::sort(route_ready_dispatches.begin(), route_ready_dispatches.end(),
+                [](const auto * a, const auto * b) {
+                    return a->first_bundle_node_idx < b->first_bundle_node_idx;
+                });
+
+            if (!route_ready_dispatches.empty()) {
+                int cur_j = 0;
+                for (const auto * dispatch : route_ready_dispatches) {
+                    enum ggml_status ec;
+                    if (dispatch->first_bundle_node_idx < cur_j) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    if (dispatch->producer_split == split_id &&
+                        (dispatch->producer_node_idx < cur_j ||
+                         dispatch->producer_node_idx >= dispatch->first_bundle_node_idx)) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    if (cur_j < dispatch->first_bundle_node_idx) {
+                        struct ggml_cgraph prefix_view = ggml_graph_view(
+                            &split->graph, cur_j, dispatch->first_bundle_node_idx);
+                        ec = ggml_backend_graph_compute_async(split_backend, &prefix_view);
+                        if (ec != GGML_STATUS_SUCCESS) {
+                            return ec;
+                        }
+                        ggml_backend_synchronize(split_backend);
+                    }
+
+                    const auto & bundle = *dispatch->bundle;
+                    const struct ggml_tensor * ids_tensor = bundle.route_ids;
+                    if (dispatch->producer_split != split_id) {
+                        ids_tensor = tensor_copy(
+                            const_cast<struct ggml_tensor *>(bundle.route_ids), split_backend_id, sched->cur_copy);
+                        if (ids_tensor == nullptr) {
+                            return GGML_STATUS_FAILED;
+                        }
+                    }
+                    const int32_t top_k = (int32_t) bundle.route_ids->ne[0];
+                    std::vector<int32_t> route_ids(top_k);
+                    ggml_backend_tensor_get(ids_tensor, route_ids.data(), 0, route_ids.size() * sizeof(int32_t));
+
+                    std::vector<ggml_cache_route_bundle> hits(top_k);
+                    std::vector<ggml_cache_route_bundle> misses(top_k);
+                    int32_t n_hits = 0;
+                    int32_t n_misses = 0;
+                    ggml_backend_expert_cache_t cache = sched->expert_caches[dispatch->gpu_cache_backend_id];
+                    ggml_backend_expert_cache_partition_bundle_routes(
+                        cache, bundle.layer, route_ids.data(), top_k, 1,
+                        hits.data(), &n_hits, misses.data(), &n_misses);
+                    ggml_backend_sched_record_route_ready_accesses(
+                        bundle, cache, route_ids.data(), top_k);
+                    sched->route_census_stats.n_route_ready_classifications++;
+
+                    struct ggml_moe_bundle_plan plan = {};
+                    plan.layer = bundle.layer;
+                    plan.kind = bundle.is_fused ? GGML_MOE_BUNDLE_FUSED_GATE_UP : GGML_MOE_BUNDLE_SEPARATE_GATE_UP;
+                    plan.route_ids = bundle.route_ids;
+                    plan.gate_node = bundle.gate_node;
+                    plan.up_node = bundle.up_node;
+                    plan.gate_up_node = bundle.gate_up_node;
+                    plan.act_node = bundle.down_node->src[1];
+                    plan.down_node = bundle.down_node;
+                    plan.layer_input = bundle.is_fused ? bundle.gate_up_node->src[1] : bundle.gate_node->src[1];
+                    plan.canonical_route_output = bundle.down_node;
+                    plan.is_fused = bundle.is_fused;
+                    plan.valid = true;
+
+                    if (n_hits == top_k && n_misses == 0) {
+                        ec = ggml_moe_route_ready_sidecar_execute_full_hit(
+                            dispatch->sidecar, &plan, cache, route_ids.data(), top_k, nullptr);
+                        if (ec != GGML_STATUS_SUCCESS) {
+                            return ec;
+                        }
+                        sched->route_census_stats.n_route_ready_actions++;
+                        cur_j = dispatch->last_bundle_node_idx + 1;
+                    } else if (n_hits > 0 && n_hits == top_k - 1 && n_hits + n_misses == top_k) {
+                        const int64_t d_model = bundle.down_node->ne[0];
+                        const int64_t d_ff = bundle.is_fused ? bundle.gate_up_node->ne[0] / 2 : bundle.gate_node->ne[0];
+                        if (sched->hetero_scratch == nullptr) {
+                            sched->hetero_scratch = ggml_moe_hetero_scratch_init(
+                                sched->backends[dispatch->gpu_cache_backend_id], d_model, d_ff, 32);
+                        }
+                        if (sched->hetero_scratch == nullptr) {
+                            return GGML_STATUS_FAILED;
+                        }
+                        ec = ggml_backend_moe_hetero_execute_serial(
+                            sched->backends[dispatch->gpu_cache_backend_id],
+                            split_backend,
+                            &plan,
+                            cache,
+                            route_ids.data(),
+                            top_k,
+                            sched->hetero_scratch,
+                            &sched->route_census_stats);
+                        if (ec != GGML_STATUS_SUCCESS) {
+                            return ec;
+                        }
+                        sched->route_census_stats.n_route_ready_actions++;
+                        cur_j = dispatch->last_bundle_node_idx + 1;
+                    } else {
+                        cur_j = dispatch->first_bundle_node_idx;
+                    }
+                }
+                if (cur_j < split->graph.n_nodes) {
+                    struct ggml_cgraph suffix_view = ggml_graph_view(&split->graph, cur_j, split->graph.n_nodes);
+                    enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &suffix_view);
+                    if (ec != GGML_STATUS_SUCCESS) {
+                        return ec;
+                    }
+                }
+            } else if (!split_hetero_bundles.empty()) {
                 std::sort(split_hetero_bundles.begin(), split_hetero_bundles.end(),
                     [](const active_hetero_bundle & a, const active_hetero_bundle & b) {
                         return a.j_first < b.j_first;
@@ -2581,6 +2920,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+            else {
+                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+                if (ec != GGML_STATUS_SUCCESS) {
+                    return ec;
+                }
+            }
         } else {
             // similar to ggml_backend_compare_graph_backend
             int j0 = 0;
@@ -2636,6 +2981,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            }
+        }
+    }
+
+    if (debug_epoch) {
+        for (int b = 0; b < sched->n_backends; ++b) {
+            if (sched->expert_caches[b] != nullptr &&
+                ggml_backend_expert_cache_get_residency_epoch(sched->expert_caches[b]) != residency_epochs[b]) {
+                GGML_ABORT("%s: expert cache residency changed during compute\n", __func__);
             }
         }
     }
@@ -2718,6 +3072,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    for (auto & dispatch : sched->route_ready_dispatches) {
+        ggml_moe_route_ready_sidecar_free(dispatch.sidecar);
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -3005,22 +3362,6 @@ bool ggml_backend_sched_get_expert_cache_stats(
             out_stats->n_route_prefetch_rejected += s.n_route_prefetch_rejected;
         }
     }
-    out_stats->hetero_layers += sched->route_census_stats.hetero_layers;
-    out_stats->hetero_full_hit_layers += sched->route_census_stats.hetero_full_hit_layers;
-    out_stats->hetero_full_miss_layers += sched->route_census_stats.hetero_full_miss_layers;
-    out_stats->hetero_partial_layers += sched->route_census_stats.hetero_partial_layers;
-    out_stats->hetero_gpu_routes += sched->route_census_stats.hetero_gpu_routes;
-    out_stats->hetero_cpu_routes += sched->route_census_stats.hetero_cpu_routes;
-    out_stats->hetero_d2h_activation_bytes += sched->route_census_stats.hetero_d2h_activation_bytes;
-    out_stats->hetero_h2d_result_bytes += sched->route_census_stats.hetero_h2d_result_bytes;
-    out_stats->hetero_weight_upload_bytes += sched->route_census_stats.hetero_weight_upload_bytes;
-    out_stats->hetero_weight_h2d_bytes += sched->route_census_stats.hetero_weight_h2d_bytes;
-    for (int k = 0; k <= 8; k++) {
-        out_stats->hetero_hit_histogram[k] += sched->route_census_stats.hetero_hit_histogram[k];
-        if (k < 8) {
-            out_stats->hetero_partial_distribution[k] += sched->route_census_stats.hetero_partial_distribution[k];
-        }
-    }
     return found;
 }
 
@@ -3047,6 +3388,16 @@ size_t ggml_backend_sched_expert_cache_export_entries(
         }
     }
     return total;
+}
+
+uint64_t ggml_backend_sched_expert_cache_epoch(
+        ggml_backend_sched_t sched,
+        int backend_idx) {
+    if (sched == nullptr || backend_idx < 0 || backend_idx >= sched->n_backends ||
+        sched->expert_caches[backend_idx] == nullptr) {
+        return 0;
+    }
+    return ggml_backend_expert_cache_get_residency_epoch(sched->expert_caches[backend_idx]);
 }
 
 bool ggml_backend_sched_expert_cache_seed(

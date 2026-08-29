@@ -36,6 +36,28 @@ struct ggml_moe_hetero_scratch {
 
 typedef struct ggml_moe_hetero_scratch * ggml_moe_hetero_scratch_t;
 
+struct ggml_moe_route_ready_sidecar;
+typedef struct ggml_moe_route_ready_sidecar * ggml_moe_route_ready_sidecar_t;
+
+GGML_API ggml_moe_route_ready_sidecar_t ggml_moe_route_ready_sidecar_new(
+    ggml_backend_t gpu_backend,
+    ggml_backend_t cpu_backend,
+    int64_t d_model,
+    int64_t d_ff,
+    int32_t top_k,
+    bool is_fused);
+
+GGML_API void ggml_moe_route_ready_sidecar_free(
+    ggml_moe_route_ready_sidecar_t sidecar);
+
+GGML_API enum ggml_status ggml_moe_route_ready_sidecar_execute_full_hit(
+    ggml_moe_route_ready_sidecar_t sidecar,
+    const struct ggml_moe_bundle_plan * bundle,
+    ggml_backend_expert_cache_t cache,
+    const int32_t * route_ids,
+    int32_t n_route_ids,
+    struct ggml_backend_expert_cache_stats * stats);
+
 GGML_API ggml_moe_hetero_scratch_t ggml_moe_hetero_scratch_init(
     ggml_backend_t gpu_backend,
     int64_t d_model,

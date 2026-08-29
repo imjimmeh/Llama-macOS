@@ -1,0 +1,1543 @@
+{
+  "tier_mb": 1024,
+  "bundle_bytes": 1998848,
+  "max_bundles": 256,
+  "pinned_experts": [
+    {
+      "layer": 0,
+      "expert_id": 0,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 1,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 2,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 3,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 4,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 5,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 6,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 7,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 8,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 9,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 10,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 11,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 12,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 13,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 14,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 15,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 16,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 17,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 18,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 19,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 20,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 21,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 22,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 23,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 24,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 25,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 26,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 27,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 28,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 29,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 30,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 31,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 32,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 33,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 34,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 35,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 36,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 37,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 38,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 39,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 40,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 41,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 42,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 43,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 44,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 45,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 46,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 47,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 48,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 49,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 50,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 51,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 52,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 53,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 54,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 55,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 56,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 57,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 58,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 59,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 60,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 61,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 62,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 63,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 64,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 65,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 66,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 67,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 68,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 69,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 70,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 71,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 72,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 73,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 74,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 75,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 76,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 77,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 78,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 79,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 80,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 81,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 82,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 83,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 84,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 85,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 86,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 87,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 88,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 89,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 90,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 91,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 92,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 93,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 94,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 95,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 96,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 97,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 98,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 99,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 100,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 101,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 102,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 103,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 104,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 105,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 106,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 107,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 108,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 109,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 110,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 111,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 112,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 113,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 114,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 115,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 116,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 117,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 118,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 119,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 120,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 121,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 122,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 123,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 124,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 125,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 126,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 127,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 128,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 129,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 130,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 131,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 132,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 133,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 134,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 135,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 136,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 137,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 138,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 139,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 140,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 141,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 142,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 143,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 144,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 145,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 146,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 147,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 148,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 149,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 150,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 151,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 152,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 153,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 154,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 155,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 156,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 157,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 158,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 159,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 160,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 161,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 162,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 163,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 164,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 165,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 166,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 167,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 168,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 169,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 170,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 171,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 172,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 173,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 174,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 175,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 176,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 177,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 178,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 179,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 180,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 181,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 182,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 183,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 184,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 185,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 186,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 187,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 188,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 189,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 190,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 191,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 192,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 193,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 194,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 195,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 196,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 197,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 198,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 199,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 200,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 201,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 202,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 203,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 204,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 205,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 206,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 207,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 208,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 209,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 210,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 211,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 212,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 213,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 214,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 215,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 216,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 217,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 218,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 219,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 220,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 221,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 222,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 223,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 224,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 225,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 226,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 227,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 228,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 229,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 230,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 231,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 232,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 233,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 234,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 235,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 236,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 237,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 238,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 239,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 240,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 241,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 242,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 243,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 244,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 245,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 246,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 247,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 248,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 249,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 250,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 251,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 252,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 253,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 254,
+      "activations": 0,
+      "value_per_byte": 0.0
+    },
+    {
+      "layer": 0,
+      "expert_id": 255,
+      "activations": 0,
+      "value_per_byte": 0.0
+    }
+  ]
+}

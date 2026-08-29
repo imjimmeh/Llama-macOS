@@ -135,6 +135,7 @@ struct ggml_backend_expert_cache {
     int32_t  period_tokens = 64;
     int32_t  max_swaps = -1;
     uint64_t decode_step = 0;
+    uint64_t residency_epoch = 0;
 
     // Frequency counters: separated TG (decode) vs PP (prefill) (Phase 6)
     std::unordered_map<ggml_expert_cache_key, uint32_t, ggml_expert_cache_key_hash, ggml_expert_cache_key_eq> tg_access_freq;
@@ -193,6 +194,10 @@ struct ggml_backend_expert_cache {
 
     struct ggml_backend_expert_cache_stats stats;
 };
+
+static void ggml_expert_cache_advance_residency_epoch(ggml_backend_expert_cache_t cache) {
+    cache->residency_epoch++;
+}
 
 static int ggml_expert_cache_get_tensor_layer(const struct ggml_tensor * tensor) {
     if (tensor == NULL || tensor->name[0] == '\0') {
@@ -356,6 +361,21 @@ static ggml_expert_cache_slot_pool * ggml_backend_expert_cache_get_or_create_poo
     cache->slot_pools[pkey] = std::move(pool);
     return &cache->slot_pools[pkey];
 }
+static ggml_expert_cache_slot_pool * ggml_backend_expert_cache_find_pool(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * weight_tensor) {
+    if (cache == NULL || weight_tensor == NULL) {
+        return NULL;
+    }
+    const ggml_expert_cache_pool_key pkey = {
+        weight_tensor->ne[0],
+        weight_tensor->ne[1],
+        weight_tensor->type,
+        (size_t) weight_tensor->nb[2],
+    };
+    auto it = cache->slot_pools.find(pkey);
+    return it != cache->slot_pools.end() ? &it->second : NULL;
+}
 
 ggml_backend_expert_cache_t ggml_backend_expert_cache_new(
         ggml_backend_t backend,
@@ -451,7 +471,17 @@ static bool ggml_expert_cache_poll_slot(
         }
         cache->gpu_slot_map_table[slot.layer * 512 + slot.expert_id] = slot_idx;
     }
+    ggml_expert_cache_advance_residency_epoch(cache);
     return true;
+}
+
+
+static void ggml_expert_cache_poll_residency(ggml_backend_expert_cache_t cache) {
+    for (auto & pool : cache->slot_pools) {
+        for (auto & slot : pool.second.slots) {
+            ggml_expert_cache_poll_slot(cache, slot);
+        }
+    }
 }
 
 bool ggml_backend_expert_cache_can_store(
@@ -552,6 +582,11 @@ int32_t ggml_backend_expert_cache_get_period(
     return cache->period_tokens;
 }
 
+uint64_t ggml_backend_expert_cache_get_residency_epoch(
+        ggml_backend_expert_cache_t cache) {
+    return cache != nullptr ? cache->residency_epoch : 0;
+}
+
 void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache, int max_swaps) {
     if (cache == NULL || cache->tg_access_freq.empty()) {
         return;
@@ -565,6 +600,12 @@ void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache, int 
     };
 
     cache->stats.n_rebalances++;
+    for (const auto & fkv : cache->tg_access_freq) {
+        if (fkv.second > 0) {
+            ggml_backend_expert_cache_get_or_create_pool(cache, fkv.first.tensor);
+        }
+    }
+
 
     for (auto & pkv : cache->slot_pools) {
         auto & pool = pkv.second;
@@ -665,6 +706,7 @@ void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache, int 
                     sm.resize((size_t)load_cand.key.expert_id + 1, -1);
                 }
                 sm[load_cand.key.expert_id] = slot;
+                ggml_expert_cache_advance_residency_epoch(cache);
 
                 pool.probationary_used++;
                 if (layer >= 0) cache->layer_slots[layer]++;
@@ -675,11 +717,12 @@ void ggml_backend_expert_cache_rebalance(ggml_backend_expert_cache_t cache, int 
 
                 void * pinned_buf = ggml_backend_expert_cache_stage_acquire(cache, load_cand.key.tensor, slot, expert_size);
                 if (pinned_buf != NULL && load_cand.key.tensor->data != NULL) {
-                    memcpy(pinned_buf, (const uint8_t *)load_cand.key.tensor->data + src_off, expert_size);
+                    memcpy(pinned_buf, (const uint8_t *) load_cand.key.tensor->data + src_off, expert_size);
                     ggml_backend_tensor_set_async(cache->backend, pool.tensor, pinned_buf, dst_off, expert_size);
+                    ggml_backend_expert_cache_record_staging_memcpy(cache, expert_size);
                     ggml_backend_expert_cache_stage_commit(cache, load_cand.key.tensor, slot);
                 } else if (load_cand.key.tensor->data != NULL) {
-                    ggml_backend_tensor_set_async(cache->backend, pool.tensor, (const uint8_t *)load_cand.key.tensor->data + src_off, dst_off, expert_size);
+                    ggml_backend_tensor_set_async(cache->backend, pool.tensor, (const uint8_t *) load_cand.key.tensor->data + src_off, dst_off, expert_size);
                 }
                 ggml_backend_expert_cache_promote_slot(cache, load_cand.key.tensor, load_cand.key.expert_id, slot);
                 swaps_done++;
@@ -700,6 +743,7 @@ void ggml_backend_expert_cache_begin_step(ggml_backend_expert_cache_t cache) {
     if (cache->period_tokens > 0 && (cache->decode_step % (uint64_t)cache->period_tokens == 0)) {
         ggml_backend_expert_cache_rebalance(cache, cache->max_swaps);
     }
+    ggml_expert_cache_poll_residency(cache);
 }
 
 void ggml_backend_expert_cache_record_access(
@@ -738,6 +782,7 @@ void ggml_backend_expert_cache_process_jit_swaps(
     if (layer >= 0) {
         auto it = cache->pending_layer_swaps.find(layer);
         if (it != cache->pending_layer_swaps.end()) {
+            bool committed = false;
             for (const auto & swap : it->second) {
                 if (swap.tensor == NULL || swap.tensor->data == NULL) continue;
                 auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, swap.tensor);
@@ -755,6 +800,10 @@ void ggml_backend_expert_cache_process_jit_swaps(
                 } else {
                     ggml_backend_tensor_set_async(backend ? backend : cache->backend, pool->tensor, (const uint8_t *)swap.tensor->data + src_off, dst_off, expert_size);
                 }
+                committed = true;
+            }
+            if (committed) {
+                ggml_expert_cache_advance_residency_epoch(cache);
             }
             cache->pending_layer_swaps.erase(it);
         }
@@ -911,6 +960,12 @@ struct ggml_tensor * ggml_backend_expert_cache_get_slot_tensor(
     auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, weight_tensor);
     return pool != NULL ? pool->tensor : NULL;
 }
+struct ggml_tensor * ggml_backend_expert_cache_find_slot_tensor(
+        ggml_backend_expert_cache_t cache,
+        const struct ggml_tensor * weight_tensor) {
+    auto * pool = ggml_backend_expert_cache_find_pool(cache, weight_tensor);
+    return pool != NULL ? pool->tensor : NULL;
+}
 
 int32_t ggml_backend_expert_cache_find_slot(
         ggml_backend_expert_cache_t cache,
@@ -919,7 +974,7 @@ int32_t ggml_backend_expert_cache_find_slot(
     if (cache == NULL || tensor == NULL || expert_id < 0) {
         return -1;
     }
-    auto * pool = ggml_backend_expert_cache_get_or_create_pool(cache, tensor);
+    auto * pool = ggml_backend_expert_cache_find_pool(cache, tensor);
     if (pool == NULL) {
         return -1;
     }
@@ -976,6 +1031,7 @@ int32_t ggml_backend_expert_cache_claim_slot_idx(
                 sm.resize((size_t)expert_id + 1, -1);
             }
             sm[expert_id] = s;
+            ggml_expert_cache_advance_residency_epoch(cache);
             pool->used_slots++;
             pool->probationary_used++;
             if (layer >= 0) cache->layer_slots[layer]++;
@@ -1081,6 +1137,7 @@ int32_t ggml_backend_expert_cache_claim_slot_idx(
             sm.resize((size_t)expert_id + 1, -1);
         }
         sm[expert_id] = victim_slot;
+        ggml_expert_cache_advance_residency_epoch(cache);
         pool->probationary_used++;
         if (layer >= 0) cache->layer_slots[layer]++;
         if (out_needs_load != nullptr) {
@@ -2013,6 +2070,7 @@ void ggml_backend_expert_cache_promote_slot(
             if (slot_entry.layer >= 0 && slot_entry.layer < 128 && expert_id >= 0 && expert_id < 512) {
                 cache->gpu_slot_map_table[slot_entry.layer * 512 + expert_id] = slot;
             }
+            ggml_expert_cache_advance_residency_epoch(cache);
         }
     }
 }
@@ -2054,6 +2112,7 @@ void ggml_backend_expert_cache_sync(ggml_backend_expert_cache_t cache) {
         return;
     }
     ggml_backend_synchronize(cache->backend);
+    ggml_expert_cache_poll_residency(cache);
 }
 
 bool ggml_backend_expert_cache_load_pinned_manifest(

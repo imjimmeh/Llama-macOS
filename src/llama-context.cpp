@@ -277,7 +277,7 @@ llama_context::llama_context(
         }
     }
 
-    cparams.op_offload = params.op_offload || (params.expert_cache_size > 0);
+    cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
     // initialized later

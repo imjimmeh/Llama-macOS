@@ -113,43 +113,32 @@ int main(int argc, char ** argv) {
     params.cache_type_k = GGML_TYPE_Q8_0;
     params.cache_type_v = GGML_TYPE_Q8_0;
     params.kv_unified = true;
-    params.expert_cache_size = 1024ULL * 1024 * 1024;
     params.expert_cache_period = 256;
     params.expert_cache_profile = "coder";
     params.expert_cache_persist = false;
     params.expert_cache_stats = true;
-    params.pinned_experts_manifest = "G:/code/AI/llamacpptuned/llama.cpp/pinned_experts_1024mb.json";
     params.warmup = true;
 
-    printf("Initializing model and context via common_init_from_params...\n");
-    fflush(stdout);
+    for (const size_t cache_size : { 0ULL, 128ULL * 1024 * 1024 }) {
+        params.expert_cache_size = cache_size;
+        params.pinned_experts_manifest.clear();
+        printf("Initializing model and context with expert cache size %zu MiB...\n", cache_size / (1024 * 1024));
+        fflush(stdout);
 
-    common_init_result_ptr init = common_init_from_params(params);
-    if (!init || !init->model() || !init->context()) {
-        fprintf(stderr, "ERROR: Failed to initialize model\n");
-        return 1;
+        common_init_result_ptr init = common_init_from_params(params);
+        if (!init || !init->model() || !init->context()) {
+            fprintf(stderr, "ERROR: Failed to initialize model\n");
+            return 1;
+        }
+
+        const auto * vocab = llama_model_get_vocab(init->model());
+        std::vector<llama_token> tokens = common_tokenize(vocab, "Hello, this is a test prompt to verify multi-token prefill decoding with MoE expert cache enabled.", true, true);
+        llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
+        if (llama_decode(init->context(), batch) != 0) {
+            fprintf(stderr, "ERROR: Prompt batch decode failed\n");
+            return 1;
+        }
     }
-
-    printf("Model and context initialized and warmed up successfully!\n");
-    fflush(stdout);
-
-    printf("Testing prompt batch decode with 20 tokens...\n");
-    fflush(stdout);
-
-    const auto * vocab = llama_model_get_vocab(init->model());
-    std::vector<llama_token> tokens = common_tokenize(vocab, "Hello, this is a test prompt to verify multi-token prefill decoding with MoE expert cache enabled.", true, true);
-    printf("Tokenized prompt into %zu tokens\n", tokens.size());
-    fflush(stdout);
-
-    llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t)tokens.size());
-    int decode_res = llama_decode(init->context(), batch);
-    if (decode_res != 0) {
-        fprintf(stderr, "ERROR: llama_decode failed with code %d\n", decode_res);
-        return 1;
-    }
-
-    printf("Prompt batch decoded successfully!\n");
-    fflush(stdout);
 
     printf("=== SUCCESS ===\n");
     return 0;

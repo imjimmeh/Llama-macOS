@@ -4,34 +4,42 @@ The **Expert Cache** provides high-performance heterogeneous inference for Mixtu
 
 ---
 
-## 1. Current Status & Implementation Matrix (Updated 2026-08-28)
+## 1. Current Status & Implementation Matrix (Updated 2026-08-29)
 
 ```text
 CURRENT IMPLEMENTATION STATUS:
-- Full-hit slot execution: Implemented & Verified.
-- Zero-copy heterogeneous MoE execution (TG1): Implemented & Verified (100% test pass).
-- CUDA scatter-merge kernel (ggml_cuda_moe_scatter_tg1): Implemented & Verified.
-- Multi-token prompt processing (PP) CPU backend decoupling: Implemented & Verified.
-- Windows WDDM & pre-Hopper GPU stability safeguards: Implemented & Verified.
-- In-band PCIe weight upload elimination: Strictly 0 bytes during decode.
-- Event-driven dual-device concurrency (Phase 2): Staged.
+- Route-ready full-hit GPU sidecar: Implemented, tested, and measured.
+- Route-ready one-miss serial heterogeneous execution: Implemented and tested.
+- Other incomplete route-ready bundles: CPU-base execution.
+- Multi-token prompt processing CPU backend decoupling: Implemented and tested.
+- Windows WDDM and pre-Hopper GPU stability safeguards: Implemented.
+- Timed decode expert-weight upload: 0 bytes in the active route-ready paths.
+- Event-driven dual-device concurrency: Staged.
 ```
 
-The canonical per-route heterogeneous execution for single-token generation (TG1) is fully operational:
+For the Compact model's `top_k = 8` single-token route-ready workload, production dispatch is intentionally selective:
 ```text
-0 hits / 8 misses -> CPU routes = 8, GPU routes = 0 (Full CPU execution)
-1 hit  / 7 misses -> CPU routes = 7, GPU routes = 1 (1 GPU slot + 7 CPU routes, scatter merged)
-...
-7 hits / 1 miss   -> CPU routes = 1, GPU routes = 7 (7 GPU slots + 1 CPU route, scatter merged)
-8 hits / 0 misses -> CPU routes = 0, GPU routes = 8 (Full GPU slot execution)
+0-6 hits / 2-8 misses -> CPU-base execution
+7 hits   / 1 miss     -> serial GPU-hit plus CPU-miss heterogeneous execution
+8 hits   / 0 misses   -> full GPU route-ready sidecar execution
 ```
 
-- **Zero-Copy Heterogeneous Engine (Milestones 1-5)**: **100% COMPLETE & VERIFIED**. Validated across oracle suites (`test-moe-partial-hit-oracle`), isolated microbenchmarks (`test-moe-heterogeneous-bench`), and dynamic drift benchmarks (`test-moe-dynamic-drift-bench`) across all 9 hit masks (0/8 to 8/8).
+The partial-hit oracle covers every 0-8 hit mask. Runtime profiling found the 1-6-hit heterogeneous cases slower than the CPU-base path, so they are not admitted by the production route-ready dispatcher.
+
+- **Full-Hit Sidecar**: Uses persistent GPU graph storage and stable weight descriptors. Input, remapped IDs, graph execution, and output download are queued on the sidecar backend stream and synchronized once after the download.
+- **One-Miss Heterogeneous Path**: Retains GPU execution for seven resident routes and CPU execution for one miss. It synchronizes the GPU stream after CPU miss work and before reading the GPU result, which preserves graph-replay ordering.
 - **Prompt Processing (PP) Scaling**: Multi-token prompt batches use dynamic backend buffer allocation (`ggml_backend_alloc_ctx_tensors`), supporting arbitrary context lengths (tested to 32k+ tokens with 0 pool exhaustion).
-- **Production Server Verification**: Verified on `qwen3.6-35B-apex-compact` with `llama-server` on GTX 1080 (Pascal CC 6.1) with 128 MB expert cache and pinned experts.
-- **Native Tooling**: `llama-bench` natively supports `-pe / --pinned-experts <path0,path1,...>` alongside `-exc`, `-excp`, and `-fitt`.
-- **Background Promotion Pipeline (Epic 5)**: Non-blocking asynchronous promotion worker streams emerging hot experts from host pinned RAM into device slot pools without stalling active decode steps.
-- **GPU-Side Route Remapping (Epic 6)**: Compact 40.96 KiB device lookup table (`gpu_slot_map_table`) maps resident slot indices directly in GPU memory.
+- **Native Tooling**: `llama-bench` supports `-pe / --pinned-experts <path0,path1,...>` alongside `-exc`, `-excp`, and `-fitt`.
+- **Background Promotion Pipeline**: Non-blocking asynchronous promotion worker streams emerging hot experts from host pinned RAM into device slot pools without stalling active decode steps.
+
+### 1.1 Regression Safeguards (2026-08-29)
+
+- Cache residency can place a registered decode `MUL_MAT_ID` on an accelerator without changing general `op_offload` placement. Prompt processing retains normal placement.
+- A route-ready action executes the route-ID producer prefix, synchronizes its split backend, reads IDs once, and remaps every complete Gate/Up/Down slot bundle before any dependent GPU `MUL_MAT_ID` runs. The dispatch record follows the producer and all consumers across scheduler splits.
+- Full route-ready hits execute through the GPU sidecar. A bundle with exactly one missing route uses the serial heterogeneous path. Other incomplete bundles remain on the CPU-base path. None of these paths uploads expert weights during timed decode.
+- The full-hit sidecar test asserts one backend synchronization, four backend-stream uploads for an unfused bundle, one backend-stream output download, CPU-reference-equivalent output, and zero expert RAM-to-GPU bytes.
+- Sidecar error handling synchronizes queued uploads before slot release and resets failed GPU-buffer initialization for a retry. Regression coverage includes a failed graph submission, a repeated allocation failure, and two route-ready bundles in one split separated by non-bundle nodes.
+
 
 ---
 
@@ -130,6 +138,47 @@ Hardware: NVIDIA GeForce GTX 1080 (SM61, 8 GB VRAM) | CPU: 14 Threads | Model: `
 | **Pinned 1024 MiB** | `pinned_experts_1024mb.json` | 0 MiB | 340.04 tok/s | **17.71 tok/s** | 8 full layers + 1024M pinned experts (displaces 3 full layers). |
 | **Dynamic Cache 128 MiB** | none | 128 MiB | 324.55 tok/s | **16.39 tok/s** | 8 full layers + 128M dynamic LRU cache. |
 | **Hybrid Preset** | `pinned_experts_1024mb.json` | 128 MiB | 326.85 tok/s | **16.18 tok/s** | 8 full layers + hybrid dynamic/pinned cache. |
+
+### Regime C: Active Route-Ready Sidecar (2026-08-29)
+
+This is the current measured deployment result, not an isolation benchmark.
+
+- Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf`; GTX 1080; 14 CPU threads.
+- Workload: fresh `llama-bench` process per row with `-p 0 -n 512 -r 1 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mmap -ngl 99 -ncmoe 40 -fitt 0`.
+- Control: `-exc 0`.
+- Cache: `-exc 3072 -excp 65536 -excm 0 -pe tools/results/expert-cache/active-sidecar/pinned_layer03_all_256_3g.json`.
+- Manifest: 1024 static entries for expert IDs 0-255 in layers 0-3. It is a 3072 MiB tier with dynamic swaps disabled.
+- Method: twenty alternating pairs, with ten control-first and ten cache-first pairs across two independent five-pair matrices in each order.
+
+| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|:---|---:|---:|---:|---:|---:|---:|
+| Control first | 10 | 14.806427 | 15.530123 | +5.074% | +4.817% | 9/10 |
+| Cache first | 10 | 15.163974 | 15.951169 | +5.333% | +4.513% | 9/10 |
+| Combined | 20 | 14.985200 | 15.740646 | **+5.203%** | **+4.817%** | **18/20** |
+
+The combined paired-delta 95% Student-t interval is +2.175% to +8.231%; the one-sided paired sign-test probability under equal cache/control performance is 0.00020123. Cache-enabled rows recorded 1,070-1,091 route-ready actions, 20,480 classifications, 24,285-24,720 zero-copy hits, and zero expert RAM-to-GPU bytes. Every control row recorded zero for those counters.
+
+Raw result pairs are under `tools/results/expert-cache/active-sidecar/` with prefixes `2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-control-first-n512`, `2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-cache-first-n512`, `2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-repeat-control-first-n512`, and `2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-repeat-cache-first-n512`.
+
+### Regime D: Automatic Fit With 3 GiB Static Route-Ready Cache (2026-08-29)
+
+This measures the same TG512 cache profile as Regime C with automatic placement instead of explicit `-ngl 99 -ncmoe 40`.
+
+- Model and workload: the Regime C model, GPU, thread count, and `-p 0 -n 512 -r 1 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mmap` workload.
+- Placement: `-fitt 256` with no `-ngl` or `-ncmoe`. In `llama-bench`, a non-default fit target enables `common_fit_params()` and resets `n_gpu_layers` to its default before automatic placement.
+- Control: `-exc 0`.
+- Cache: the Regime C `-exc 3072 -excp 65536 -excm 0` static layers 0-3 manifest.
+- Method: ten alternating fresh-process pairs, five control-first and five cache-first.
+
+| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|:---|---:|---:|---:|---:|---:|---:|
+| Control first | 5 | 16.704502 | 9.966571 | -39.901% | -43.366% | 0/5 |
+| Cache first | 5 | 16.463109 | 10.769035 | -34.076% | -36.477% | 0/5 |
+| Combined | 10 | 16.583806 | 10.367803 | **-36.988%** | **-36.954%** | **0/10** |
+
+The paired-delta 95% Student-t interval is -42.025% to -31.952%; the two-sided paired sign-test probability under equal cache/control performance is 0.001953125. Cache-enabled rows all recorded 24,720 requests and zero-copy hits, 1,091 route-ready actions, 80 dispatches, 20,480 classifications, and zero expert RAM-to-GPU bytes. Every control row recorded zero for those counters.
+
+This is a real active-cache regression, not an engagement failure. Do not combine the 3 GiB static route-ready profile with this automatic-fit placement for this model and GPU. Raw pairs are under `tools/results/expert-cache/fit-target-256/` with prefixes `2026-08-29-fit-target-256-control-first-n512` and `2026-08-29-fit-target-256-cache-first-n512`.
 
 ---
 

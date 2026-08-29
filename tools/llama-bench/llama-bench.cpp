@@ -1597,6 +1597,9 @@ static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_ba
     EXPERT_CACHE_SUBTRACT(n_route_census_batch_9_31);
     EXPERT_CACHE_SUBTRACT(n_route_census_batch_32_plus);
     EXPERT_CACHE_SUBTRACT(n_route_census_plans);
+    EXPERT_CACHE_SUBTRACT(n_route_ready_actions);
+    EXPERT_CACHE_SUBTRACT(n_route_ready_dispatches);
+    EXPERT_CACHE_SUBTRACT(n_route_ready_classifications);
 #undef EXPERT_CACHE_SUBTRACT
     return delta;
 }
@@ -1786,7 +1789,10 @@ struct test {
             "expert_cache_route_census_batch_2_8",
             "expert_cache_route_census_batch_9_31",
             "expert_cache_route_census_batch_32_plus",
-            "expert_cache_route_census_plans"
+            "expert_cache_route_census_plans",
+            "expert_cache_route_ready_actions",
+            "expert_cache_route_ready_dispatches",
+            "expert_cache_route_ready_classifications"
 
         };
         return fields;
@@ -1853,7 +1859,10 @@ struct test {
             field == "expert_cache_route_census_batch_2_8" ||
             field == "expert_cache_route_census_batch_9_31" ||
             field == "expert_cache_route_census_batch_32_plus" ||
-            field == "expert_cache_route_census_plans") {
+            field == "expert_cache_route_census_plans" ||
+            field == "expert_cache_route_ready_actions" ||
+            field == "expert_cache_route_ready_dispatches" ||
+            field == "expert_cache_route_ready_classifications") {
             return INT;
         }
         return STRING;
@@ -1981,7 +1990,10 @@ struct test {
                                             std::to_string(expert_cache_stats.n_route_census_batch_2_8),
                                             std::to_string(expert_cache_stats.n_route_census_batch_9_31),
                                             std::to_string(expert_cache_stats.n_route_census_batch_32_plus),
-                                            std::to_string(expert_cache_stats.n_route_census_plans) };
+                                            std::to_string(expert_cache_stats.n_route_census_plans),
+                                            std::to_string(expert_cache_stats.n_route_ready_actions),
+                                            std::to_string(expert_cache_stats.n_route_ready_dispatches),
+                                            std::to_string(expert_cache_stats.n_route_ready_classifications) };
         return values;
     }
 

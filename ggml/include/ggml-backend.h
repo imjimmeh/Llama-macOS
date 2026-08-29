@@ -416,6 +416,9 @@ extern "C" {
         uint64_t n_route_census_batch_9_31;
         uint64_t n_route_census_batch_32_plus;
         uint64_t n_route_census_plans;
+        uint64_t n_route_ready_actions;
+        uint64_t n_route_ready_dispatches;
+        uint64_t n_route_ready_classifications;
 
         // Epic 11: Heterogeneous MoE Route Execution Telemetry
         uint64_t hetero_layers;
@@ -452,6 +455,7 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_get_expert_cache_stats(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_stats * out_stats);
     GGML_API size_t               ggml_backend_sched_expert_cache_export_entries(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_export_entry * out_entries, size_t max_entries);
     GGML_API bool                 ggml_backend_sched_expert_cache_seed(ggml_backend_sched_t sched, int backend_idx, const struct ggml_tensor * tensor, int32_t expert_id, uint32_t frequency);
+    GGML_API uint64_t             ggml_backend_sched_expert_cache_epoch(ggml_backend_sched_t sched, int backend_idx);
     GGML_API void                 ggml_backend_sched_register_expert_bundle(ggml_backend_sched_t sched, int32_t layer, const struct ggml_tensor * gate_tensor, const struct ggml_tensor * up_tensor, const struct ggml_tensor * down_tensor);
     // Trigger an immediate rebalance of the expert cache (promote/demote experts based on access frequency)
     GGML_API void                 ggml_backend_sched_expert_cache_rebalance(ggml_backend_sched_t sched);

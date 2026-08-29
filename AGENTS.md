@@ -137,3 +137,7 @@ Chat template and parser:
 ## Expert cache work
 
 When working on the expert cache, benchmarking/tests should be done using the same settings (where appropriate) as the `qwen3.6-35B-apex-compact` model definition in the following llama-server config: [G:\qwen3.6-35b-a3b-presets-exc-latest.ini](G:\qwen3.6-35b-a3b-presets-exc-latest.ini)
+
+- Use `tools/results/expert-cache/run-tg-matrix.py` for repeated alternating TG cache-off/cache-on measurements. It fixes the compact preset's benchmark flags, disables `GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL`, and retains one raw JSONL file per run.
+
+Always keep the EXPERT_CACHE.md and EXPERT_CACHE_OPTIMIZATION_LOG.md files up-to-date. The optimisation log in particular should be updated after every attempt, every new change, etc.. Even if we undo that functionality - it is our record of what has/hasn't been tried.

@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <atomic>
@@ -10734,6 +10735,67 @@ static void show_test_coverage() {
     printf("  Coverage: %.1f%%\n", (double)covered_ops.size() / all_ops.size() * 100.0);
 }
 
+static bool test_gpu_cpu_tensor_copy() {
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        return true;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    if (gpu_backend == nullptr || cpu_backend == nullptr) {
+        if (gpu_backend != nullptr) {
+            ggml_backend_free(gpu_backend);
+        }
+        if (cpu_backend != nullptr) {
+            ggml_backend_free(cpu_backend);
+        }
+        return false;
+    }
+
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * gpu_ctx = ggml_init(params);
+    ggml_context * cpu_ctx = ggml_init(params);
+    ggml_backend_buffer_t gpu_buffer = nullptr;
+    ggml_backend_buffer_t cpu_buffer = nullptr;
+    bool ok = gpu_ctx != nullptr && cpu_ctx != nullptr;
+    if (ok) {
+        ggml_tensor * source = ggml_new_tensor_1d(gpu_ctx, GGML_TYPE_F32, 8);
+        ggml_tensor * destination = ggml_new_tensor_1d(cpu_ctx, GGML_TYPE_F32, 8);
+        gpu_buffer = ggml_backend_alloc_ctx_tensors(gpu_ctx, gpu_backend);
+        cpu_buffer = ggml_backend_alloc_ctx_tensors(cpu_ctx, cpu_backend);
+        ok = gpu_buffer != nullptr && cpu_buffer != nullptr;
+        if (ok) {
+            const std::array<float, 8> expected = { 0.0f, 1.0f, -2.0f, 3.0f, -4.0f, 5.0f, -6.0f, 7.0f };
+            std::array<float, 8> actual = {};
+            ggml_backend_tensor_set(source, expected.data(), 0, sizeof(expected));
+            ggml_backend_tensor_copy(source, destination);
+            ggml_backend_tensor_get(destination, actual.data(), 0, sizeof(actual));
+            ok = actual == expected;
+        }
+    }
+
+    if (gpu_buffer != nullptr) {
+        ggml_backend_buffer_free(gpu_buffer);
+    }
+    if (cpu_buffer != nullptr) {
+        ggml_backend_buffer_free(cpu_buffer);
+    }
+    if (gpu_ctx != nullptr) {
+        ggml_free(gpu_ctx);
+    }
+    if (cpu_ctx != nullptr) {
+        ggml_free(cpu_ctx);
+    }
+    ggml_backend_free(gpu_backend);
+    ggml_backend_free(cpu_backend);
+    return ok;
+}
+
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops]", argv[0]);
     printf(" [--show-coverage] [--test-file <path>] [-j <n>]\n");
@@ -10832,6 +10894,10 @@ int main(int argc, char ** argv) {
 
     // load and enumerate backends
     ggml_backend_load_all();
+    if (mode == MODE_TEST && !test_gpu_cpu_tensor_copy()) {
+        fprintf(stderr, "GPU-to-CPU tensor copy smoke test failed\n");
+        return 1;
+    }
 
     // Create printer for output format
     std::unique_ptr<printer> output_printer = create_printer(output_format);

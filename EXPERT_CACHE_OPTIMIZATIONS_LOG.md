@@ -1499,10 +1499,528 @@ Command: `llama-bench -m <model> -p 16 -n 64 -t 14 -r 1 -fitt 256 -exc 64`
   3. Server OOM occurred during TG graph reserve when the scheduler attempted to allocate 12.89 GB of VRAM copies for host MoE weights.
 - **Root Cause & Fixes**:
   1. **Slot Independence**: Gate, Up, and Down pools maintain independent slot assignments. Separated `gpu_gate_ids`, `gpu_up_ids`, and `gpu_down_ids` in `ggml-backend-moe-hetero.cpp` and loaded their corresponding slot indices.
-  2. **Prompt Processing Gating**: Enforced `is_decode_mul_mat_id` (`tensor->src[2]->ne[1] == 1`) across `ggml_backend_sched_backend_id_from_cur`, `sched_split_graph` (passes 1-4), and `sched_compute_splits`. Multi-token prompt batches remain on CPU threadpools (`n_threads_batch = 14`) with zero weight transfers over PCIe.
+  2. **Prompt Processing Gating**: Cache probing and slot remapping are decode-only (`tensor->src[2]->ne[1] == 1`). PP retains normal `op_offload` placement instead of being suppressed solely because its weights are cache-registered.
   3. **VRAM Weight Copy Bypass**: In `sched_split_graph` pass 5, added explicit bypass when tensors are managed by `expert_cache` to prevent `gallocr` from allocating 12.89 GB weight copies on GPU.
 - **Verification Results**:
   - `pp512`: **118.98 tok/s** (fully restored multi-token prompt throughput).
   - `tg32` / `tg128`: **4.86 tok/s** coherent deterministic reasoning output via `llama-server` and `curl`.
   - Speculative decoding (`ngram-mod`): **100% draft acceptance rate** (`draft_n: 26, draft_n_accepted: 26`).
   - Oracle unit tests: **100% pass across all 9 configurations ($N=0..8$)**.
+
+### 7. Scheduler Placement and Partial-Route Scatter Regression Repair (2026-08-28)
+
+- Fixed PP placement for cache-registered host MoE weights. Cache residency now forces accelerator placement only for single-token decode; PP can use normal `op_offload`.
+- Fixed the non-CUDA heterogeneous partial-hit scatter fallback. CPU-computed miss routes now write to their routed `down` output rows instead of leaving stale output data.
+- Added `test_hetero_partial_hit_scatter` to `test-expert-cache`. It seeds two of four routes, executes the production 2-hit/2-miss path, and compares all rows against an all-CPU reference.
+
+Verification on the GTX 1080 / Ryzen 7 5700X:
+
+- `cmake --build build --config Release --target test-expert-cache llama-bench` succeeded.
+- `build/bin/Release/test-expert-cache.exe` passed all tests, including `heterogeneous partial-hit scatter`.
+- `llama-bench` with the Compact Q4_K model, `-p 65536 -n 0 -fitt 256 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mlock -t 14`, measured 283.18 tok/s with `-exc 0` and 247.18 tok/s with `-exc 64`.
+- The corresponding `tg16` runs measured 17.43 tok/s with `-exc 0`, 22.15 tok/s with `-exc 64`, and 22.18 tok/s with `-exc 128 -excp 256 -pe pinned_experts_1024mb.json` plus `GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL=1`.
+- The long-context run used `n_cpu_moe=0`; its cache telemetry reported no eligible cache operations. It verifies the PP placement path, not a cache-hit workload, and does not reproduce a 600 tok/s baseline.
+
+### 8. Decode Route-ID Freshness Guard (2026-08-28)
+
+- Reproduced the slash-only output with the Compact Q4_K model, `-exc 128`, the 1024 MiB pinned manifest, and `-fitt 256`: after the first emitted token, CUDA faulted in `ffn_moe_down-13` (`MUL_MAT_ID`) with an illegal memory access.
+- Cause: scheduler cache interception read router IDs before the GPU split that produces them ran. Stale or uninitialized IDs were remapped to GPU slots; an invalid route could reach the CUDA `MUL_MAT_ID` kernel.
+- Fixed scheduler placement so cache-managed decode nodes whose route IDs are produced within the same split remain on CPU. PP normal `op_offload` placement is unchanged.
+- Added `test_pending_route_ids_stay_on_cpu`, which constructs a non-leaf route-ID tensor and asserts that the cache-managed `MUL_MAT_ID` stays on the CPU backend.
+- Rebuilt `llama-cli` and `test-expert-cache`. The cache-enabled CLI smoke completed without CUDA errors and emitted coherent reasoning text at 15.0 tok/s.
+
+## Route-Ready TG Recovery Decision Baseline (2026-08-28)
+
+### Immutable configuration
+
+- Model: `C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf`
+- Model SHA-256: `a2f6c7fdbe82113a2e48e2c38022b55bdcc4308a8002da96cf6d48dab67bb77d`
+- Source revision: `b4207a3e906ce1c29f9962ca0f4a17ed7eafdb59`
+- `llama-bench.exe` SHA-256: `726f86b65c0126716b5056cb724dccb166a51b7bd01c6eb8e0c5b8c5464c8b0f`
+- Common arguments: `-p 0 -n 128 -r 1 -t 14 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mlock -fitt 256 -o jsonl`
+- Deployment controls: one fresh process per row, `--parallel 1` is the server deployment setting, no pinned-expert manifest, no `GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL`.
+- Cache-off argument: `-exc 0`
+- Cache-enabled placement argument: `-exc 128 -excp 256`
+
+Raw rows and the per-row telemetry summary follow after alternating cache-off/cache-enabled TG128 runs.
+
+### Baseline TG128 rows
+
+| Pair | Cache-off tok/s | Cache-enabled tok/s | Eligible TG ops | Requests | Zero-copy hits | Misses | Probe sync us | Probe host us | Rebalances | RAM-to-GPU bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 18.466064 | 17.616776 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 2 | 14.949803 | 18.522095 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 3 | 18.737619 | 16.686056 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 4 | 17.203127 | 14.550579 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| 5 | 16.800270 | 17.920391 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+- Cache-off: mean 17.231377 tok/s, median 17.203127 tok/s, sample standard deviation 1.515375 tok/s.
+- Cache-enabled: mean 17.059179 tok/s, median 17.616776 tok/s, sample standard deviation 1.551211 tok/s.
+- `llama-bench` reports `n_gpu_layers = -1` for both configurations but does not export the resolved complete-GPU-MoE-layer count. Task 5's initialization smoke test records that placement directly.
+- Raw rows: `tools/results/expert-cache/2026-08-28-route-ready-control-{1,2,3,4,5}.jsonl` and `tools/results/expert-cache/2026-08-28-route-ready-cache-{1,2,3,4,5}.jsonl`.
+
+### Admission decision
+
+The cache-enabled baseline reports zero eligible TG operations and zero requests in every row. It therefore does not exercise cache remapping, meets Task 1's admission gate, and requires route-ready scheduler recovery.
+
+## Route-Ready Bundle Dispatch Recovery (2026-08-28)
+
+The scheduler now records each valid decode MoE bundle as one dispatch record. The record links the shared route-ID producer with every Gate/Up/Down consumer and stores the split and node index for each graph view.
+
+- Route-ready dispatch executes the producer prefix before reading route IDs.
+- The producer split backend is synchronized before the one host route-ID read.
+- A bundle is admitted only when every requested expert is resident in every consumer cache.
+- Complete bundles remap all dependent `MUL_MAT_ID` nodes to slot-pool tensors.
+- Incomplete bundles leave the normal graph intact. They do not invoke the CPU heterogeneous fallback and do not upload host expert weights.
+- Remapped ID host storage remains alive until the backend consumes each asynchronous upload.
+- Slot lookup now uses an existing-pool query, so a miss cannot allocate a new cache pool.
+
+The first topology trace attempt (`tools/results/expert-cache/2026-08-28-route-topology.{stdout,stderr}.log`) completed without a scheduler node-assignment trace. It is evidence that the requested trace gate was not satisfied, not evidence of a topology classification. The implementation therefore uses the existing split-graph route plan rather than claiming a trace-derived topology.
+
+Focused verification:
+
+```text
+cmake --build build --config Release --target test-expert-cache
+build/bin/Release/test-expert-cache.exe
+all test-expert-cache tests passed successfully!
+```
+
+The route-ready GPU regression asserts six zero-copy hits, six requests, one bundle action, zero RAM-to-GPU bytes, CPU-reference-equivalent output, and successful graph reuse. The miss-admission regression also verifies that lookup of an unseen tensor returns no slot tensor without creating a pool.
+
+The full cache test executable passed on GTX 1080. The real-model TG baseline above still reports zero eligible operations and zero requests; no throughput or deterministic-server acceptance claim is made for this recovery until a route-ready real-model run produces nonzero dispatch telemetry.
+
+## Route-Ready Producer-at-Split-Cursor Gate (2026-08-28)
+
+The route-ready bundle dispatcher executes the producer-inclusive graph view before reading route IDs. The cross-split producer loop only ran that view when the producer was strictly ahead of the split cursor (`producer_node_idx > cur_j`); a producer that was exactly the first unexecuted node (`producer_node_idx == cur_j`, e.g. node 0 of its split) was skipped, so classification read stale route IDs.
+
+The new focused regression `test_route_ready_producer_at_split_cursor` places a non-leaf route-ID producer (a dup of the route input, forced to the CPU backend) at node 0 of the CPU split while the cache-hosted Gate/Up/Down consumers run in the GPU split. Before the fix it failed inside `ggml-cuda.cu:1985` while executing the consumers, consistent with stale route IDs.
+
+Fix (`ggml/src/ggml-backend.cpp`): change the cross-split producer-view condition from strict to inclusive:
+
+```cpp
+// before
+if (dispatch->producer_node_idx > cur_j) {
+// after
+if (dispatch->producer_node_idx >= cur_j) {
+```
+
+The graph-view bounds `[cur_j, producer_node_idx + 1)` and the non-success `return ec` path are unchanged; `cur_j` advances past the producer before the suffix view, so the producer still executes exactly once.
+
+Focused verification (post-fix):
+
+```text
+cmake --build build --config Release --target test-expert-cache
+build/bin/Release/test-expert-cache.exe
+all test-expert-cache tests passed successfully!
+```
+
+The regression asserts scheduler success, CPU-reference-equivalent output, exactly one route-ready action, and exactly six zero-copy hits with the producer at the split cursor.
+
+## Route-Ready Dispatch Admission Telemetry (2026-08-28)
+
+Task 2 of `docs/superpowers/plans/2026-08-28-route-ready-runtime-eligibility.md`: low-volume counters proving a complete TG1 bundle is admitted and classified, independent of slot residency. This separates "the dispatcher never reaches a real bundle" from "classification works but nothing is resident" without full scheduler traces.
+
+Two scheduler-owned counters added to `ggml_backend_expert_cache_stats` adjacent to `n_route_ready_actions` (`ggml/include/ggml-backend.h`):
+
+- `n_route_ready_dispatches` — incremented only after `route_bundle_dispatches.push_back()` succeeds (structural admission: registered Gate/Up/Down bundle with every expected consumer projection located and a locatable producer split). No slot lookup is performed at admission.
+- `n_route_ready_classifications` — incremented immediately after `classify_route_dispatch()` returns in the complete-bundle cross-split producer loop, for both complete hits and normal misses (its one route-ID read plus slot classification). `dispatch.classified` is reset per compute, so the call-site increment counts exactly one classification per admitted bundle.
+
+Both increment `sched->route_census_stats` (`ggml/src/ggml-backend.cpp`); the legacy per-split route-ready action path (`apply_route_ready_action`) is untouched, so neither field counts legacy dispatches.
+
+Exported to llama-bench as `expert_cache_route_ready_dispatches` and `expert_cache_route_ready_classifications` — appended together to `get_fields()`, `get_values()`, the INT field-type list, and `subtract_expert_cache_stats()` in `tools/llama-bench/llama-bench.cpp`.
+
+Tests (`tests/test-expert-cache.cpp`): the route-ready all-hit fixture now asserts `n_route_ready_dispatches == 1` and `n_route_ready_classifications == 1` alongside its existing action/hit assertions; the new `test_route_ready_normal_miss_telemetry` registers the Gate/Up/Down bundle without seeding slots and asserts dispatches=1, classifications=1, actions=0 with CPU-reference-equivalent output on the untouched normal graph path. This is the first test observing a classified miss with zero resident slots; Task 4 builds the learned-residency regression on the same fixture shape.
+
+The counters map directly onto the Task 3 decision table: `plans > 0, dispatches == 0` (producer/consumer location failure), `dispatches > 0, classifications == 0` (producer/classifier ordering), `classifications > 0, actions == 0` (no complete resident bundle — proceed to Task 4).
+
+## Task 2 Outcome: Normal-Miss Cross-Split Blocking Defect (2026-08-28)
+
+Task 2 telemetry implementation builds: the two scheduler-owned counters (`n_route_ready_dispatches`, `n_route_ready_classifications`), the four llama-bench export lists, and the updated test file compile; the Step 1 red state is resolved.
+
+Focused test run outcome:
+
+- All-hit fixture `test_route_ready_ids_use_gpu_slots` (route_ids pinned to CPU for a cross-split dispatch) remains valid and passes its dispatch/classification/action assertions with six zero-copy hits.
+- The cross-split unseeded normal-miss regression `test_route_ready_normal_miss_telemetry` deterministically fails at `ggml-cuda.cu:1968`. After `classify_route_dispatch()` returns a miss (no seeded slots), the GPU suffix view executes the Gate/Up/Down MUL_MAT_ID consumers with cache-owned host weights and CPU route IDs. With no resident slots to remap and the route-ready CPU fallback disabled, the GPU kernel cannot run, so the classified-miss path is not yet safe for cross-split bundles. The fixture is a genuine red regression.
+- Because the miss path cannot execute, the plan's miss-equivalence gate is not met: it requires cache-off placement restoration (returning host weights and route-ID tensors to their pre-route-ready placement before the suffix executes) and a model-specific design decision. Consequently **no Task 3 real-model TG classification run was made**; the Task 3 row `classifications > 0, actions == 0` cannot be observed on a real model until this defect is fixed.
+
+Next step is a design pass for placement restoration on a classified miss before any Task 3/4 work can proceed.
+
+## Task 2 Rollback: Telemetry Slice Reverted (2026-08-28)
+
+The Task 2 code/test slice documented in the two sections above was reverted on 2026-08-28; the sections above are retained as evidence of the build status and the blocking defect. The revert keeps the repository in a testable Task 1-only state: the unseeded normal-miss fixture deterministically failed at `ggml-cuda.cu:1968`, because after a classified miss the GPU suffix view executes the Gate/Up/Down MUL_MAT_ID consumers with cache-owned host weights and CPU route IDs, and the plan forbids re-enabling the CPU route fallback. The required no-fallback repair — cache-off placement restoration (returning host weights and route-ID tensors to their pre-route-ready placement before the suffix executes) plus a model-specific design decision — is pending separate design approval, so the partial slice was removed rather than carried forward.
+
+Removed from the working tree:
+
+- `ggml/include/ggml-backend.h`: `n_route_ready_dispatches` and `n_route_ready_classifications` deleted from `ggml_backend_expert_cache_stats`; only Task 1's `n_route_ready_actions` remains.
+- `ggml/src/ggml-backend.cpp`: both scheduler increments deleted (the complete-bundle admission loop and the cross-split producer classification loop); the legacy `apply_route_ready_action` path and the Task 1 classification/remap code are untouched.
+- `tools/llama-bench/llama-bench.cpp`: `expert_cache_route_ready_dispatches` and `expert_cache_route_ready_classifications` removed from all four export lists (`get_fields()`, INT `get_field_type()` list, `get_values()`, `subtract_expert_cache_stats()`); `expert_cache_route_ready_actions` remains.
+- `tests/test-expert-cache.cpp`: the two telemetry assertions removed from the all-hit fixture (restoring its original action/hit assertions), and `test_route_ready_normal_miss_telemetry` — the unseeded cross-split normal-miss regression — deleted entirely along with its `main()` registration. Task 1's `test_route_ready_producer_at_split_cursor` and the all-hit fixture remain.
+
+No validation, commit, or push was performed. Re-landing this telemetry requires the approved cache-off-placement re-entry design (Task 3/4 work remains blocked on it).
+
+## Task 2 Cache-Off Placement Re-Entry (2026-08-28)
+
+The approved fix for the blocking defect above is per-step cache-off re-entry
+(design: `.superpowers/sdd/2026-08-28-route-ready-runtime-eligibility/task-2-reentry-report.md`).
+The scheduler classifies every complete-bundle route-ready dispatch first; if
+any dispatch is incomplete, it restarts scheduler allocation for the same
+graph with that bundle's original host expert weight tensors denied cache
+eligibility for the rest of the external compute call, so the retry places
+those consumers on the CPU backend and no GPU suffix ever executes
+cache-owned host weights or CPU route IDs.
+
+Implementation (uncommitted working tree, branch `feat/expert-cache-without-prediction`):
+
+- `ggml/include/ggml-backend.h`: `n_route_ready_dispatches` and
+  `n_route_ready_classifications` added to `ggml_backend_expert_cache_stats`
+  directly below `n_route_ready_actions`.
+- `ggml/src/ggml-backend.cpp`: scheduler-owned per-external-compute deny set
+  `route_ready_deny_weights` (keyed by original host expert weight tensors)
+  with helpers `ggml_backend_sched_route_ready_denied`,
+  `ggml_backend_sched_deny_route_ready_weight`,
+  `ggml_backend_sched_route_bundle_denied`,
+  `ggml_backend_sched_deny_route_ready_bundle`; the offload gate
+  `ggml_backend_sched_can_offload_host_weight` returns false for denied
+  weights; dispatch construction skips denied bundles and increments
+  `n_route_ready_dispatches` on admission; cross-split classification and
+  same-split action misses deny the bundle and request a retry;
+  `ggml_backend_sched_graph_compute_async` owns the once-per-compute route
+  step, prefetch carry-forward, and expert-cache `begin_step`, clears the deny
+  set, and loops: allocate (when needed), `compute_splits(sched,
+  &route_ready_retry)`, on retry reset the scheduler and rebuild, on success
+  reset after any retry so the next external compute re-admits denied
+  bundles.
+- `tools/llama-bench/llama-bench.cpp`: `expert_cache_route_ready_dispatches`
+  and `expert_cache_route_ready_classifications` appended together to all
+  four export lists (`get_fields()`, the INT field-type list, `get_values()`,
+  `subtract_expert_cache_stats()`).
+- `tests/test-expert-cache.cpp`: unchanged. The red regressions are the
+  acceptance surface: the all-hit fixture asserts dispatches=1,
+  classifications=1, actions=1 with six zero-copy hits and twice-compute
+  reuse; the unseeded normal-miss fixture asserts dispatches=1,
+  classifications=1, actions=0, hits=0, ram-to-GPU bytes=0 with
+  CPU-reference-equivalent output, then seeds all slots, recomputes the same
+  graph, and asserts cumulative actions=1 and hits=6 (re-admission of the
+  previously denied bundle on the next external compute).
+
+Initial red evidence (reused from the Task 2 Outcome section above, not
+re-run): the unseeded cross-split normal-miss regression deterministically
+failed at `ggml-cuda.cu:1968` because the GPU suffix view executed the
+Gate/Up/Down MUL_MAT_ID consumers with cache-owned host weights and CPU route
+IDs and no resident slots to remap.
+
+Expected verification (not yet run in this implementation): the red
+regressions above pass under the re-entry design — the miss path produces the
+CPU-reference output with zero cache actions/hits/uploads and exactly one
+dispatch and one classification, the seeded re-compute of the same graph
+re-admits the bundle and records one action and six hits, and Task 1
+behavior (all-hit remap, producer-at-split-cursor) is unchanged. No build,
+test run, commit, or push was performed with this implementation.
+
+## Route-Ready Re-Entry Rejection (2026-08-28)
+
+Rejected design: cache-off placement rebuild after route-ready miss.
+Observed behavior: unseeded cross-split dispatch classified a miss, then a reset/reallocation CPU retry terminated before returning GGML status.
+Rejected mechanism: changing scheduler backend assignments after gallocr allocation and reusing original graph tensor descriptors.
+Reason: `ggml_gallocr_reserve_n()` can replace virtual backend buffers while tensors with non-null data are treated as externally allocated on the next graph allocation.
+Decision: do not repair the retry. CPU placement is selected before allocation and full-hit GPU execution moves to a separate persistent sidecar.
+
+## CPU-Base Placement Gate (2026-08-28)
+
+Added `ggml_backend_sched_is_registered_host_expert_weight()` to keep registered host-backed expert weights on the CPU base path during initial scheduler placement. `test-expert-cache` passed with the CUDA device present; the registered Gate/Up/Down bundle remained CPU-placed.
+
+## Route-Ready Sidecar Gate (2026-08-28)
+
+Implemented a lazy-first-hit GPU sidecar for complete registered bundles. The focused CUDA regression verifies CPU-reference output for a two-expert Gate/Up/Down full hit, six zero-copy projection hits, and an incomplete Down bundle failure that leaves the CPU output sentinel unchanged.
+
+## Route-Ready Sidecar Descriptor Rebinding (2026-08-28)
+
+The first sidecar bound graph source pointers directly to slot tensors from its initial cache. Replacing the scheduler cache left those pointers dangling. The failure was timing-sensitive: the learned second-hit path produced CUDA `MUL_MAT_ID` stride assertions or illegal memory access.
+
+The sidecar now owns stable weight descriptor copies. Each full hit copies the current cache slot descriptors into those sidecar descriptors before GPU execution and clears their buffer/data bindings after completion. The scheduler graph is not mutated. The existing cache-replacement learning regression now executes a new cache's admitted slots under both normal execution and `GGML_EXPERT_CACHE_DEBUG_EPOCH=1`.
+
+## Route-Ready Binary Dispatch Gate (2026-08-28)
+
+Focused CUDA verification:
+
+```text
+cmake --build build --config Release --target test-expert-cache
+build/bin/Release/test-expert-cache.exe
+GGML_EXPERT_CACHE_DEBUG_EPOCH=1 build/bin/Release/test-expert-cache.exe
+```
+
+Passed. The synthetic CPU-base fixture now covers:
+
+- complete resident Gate/Up/Down sidecar output against CPU reference, six zero-copy projection hits, and graph reuse;
+- an unseeded CPU miss twice on the same graph with no route-ready action, zero zero-copy hits, and zero expert RAM-to-GPU bytes;
+- a partial bundle with only Gate expert 0 resident, which stays CPU-base;
+- a stale route change from `{0, 1}` to `{1, 2}` after the prior graph generation, which reads the producer's current IDs and stays CPU-base because expert 2 is absent;
+- an unsupported non-contiguous bundle range, which stays CPU-base even with all requested projections resident.
+
+All CPU-base and sidecar outputs matched their CPU references. No mixed bundle execution or cache-miss upload was observed.
+
+## Route-Ready Admission And Epoch Gate (2026-08-28)
+
+With cache period one and no explicit residency seed, the first classified route is an unchanged CPU miss. Its canonical Gate/Up/Down access counts are admitted at the next compute boundary, and the second compute is a complete sidecar hit with six zero-copy projection hits and zero expert RAM-to-GPU bytes.
+
+The residency epoch advances for committed slot bindings, resident promotion, CPU synchronous promotion, and committed JIT slot content replacement. The focused regression proves an explicit seed advances the epoch between computes, while complete sidecar hits and CPU misses leave it unchanged during compute. The debug epoch fence passed with `GGML_EXPERT_CACHE_DEBUG_EPOCH=1`.
+
+## Route-Ready Backend Handoff Gate (2026-08-28)
+
+Added a CUDA-gated GPU-to-CPU F32 tensor-copy smoke in `test-backend-ops`. The targeted verification:
+
+```text
+cmake --build build --config Release --target test-backend-ops
+build/bin/Release/test-backend-ops.exe test -o ADD -j 1
+```
+
+Passed on CUDA0. The smoke copied a known eight-element F32 tensor from GPU storage to CPU storage and compared every element; the targeted backend run reported `99/99 tests passed`.
+
+## Route-Ready Runtime Eligibility And Sidecar Gate (2026-08-28)
+
+The Compact TG1 smoke row is retained at:
+
+```text
+tools/results/expert-cache/route-ready-sidecar/tg1-exc128-excp256.jsonl
+```
+
+It reports 128 MiB cache capacity, 3.704258 TG tokens/s, 40 route-census plans,
+one route-ready dispatch, one route-ready classification, zero route-ready
+actions, 81 CPU-host census nodes, zero non-CPU-host census nodes, zero
+eligible operations, 81 CPU-backend bypasses, and zero expert RAM-to-GPU
+bytes. The dispatcher reaches a complete real-model decode bundle and
+classifies it, but the one-token row has no complete resident bundle.
+
+The first server replay comparison was excluded: its cache-off and cache-on
+processes used different locally rebuilt binaries during placement diagnosis.
+The valid fresh-pair replay used the final source state, identical non-cache
+options, `-exc 0` versus `-exc 128M`, greedy `top_k=1`, seed 42, one sequence,
+and 256 predicted tokens. The token-ID SHA-256 values are equal:
+
+```text
+59962193d7fdda5ad51433b6dbf16ee0993d96a987cf3465d3388d66066bc108
+```
+
+Replay artifacts:
+
+```text
+tools/results/expert-cache/route-ready-sidecar/replay-final-off.json
+tools/results/expert-cache/route-ready-sidecar/replay-final-on.json
+```
+
+The enabled server reported zero expert-cache requests, zero eligible
+operations, and zero expert RAM-to-GPU weight transfers during generation.
+Its census contained 560 plans, 1428 CPU-host nodes, zero non-CPU-host nodes,
+and 252 non-host nodes. This satisfies the deterministic replay gate without
+a timed route-ready action.
+
+`tools/results/expert-cache/run-tg-matrix.py` now has
+`--route-ready-sidecar`. The mode fixes the Compact sidecar matrix to five
+fresh cache-off/cache-on pairs, 128 MiB capacity, period 256, the existing
+Compact benchmark command, the route-ready raw-results directory, and
+`GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL=0`. The first invocation incorrectly
+passed `-excs`, which `llama-bench` does not support, and exited before model
+load. That option was removed; no measurement from that invocation is used.
+
+The successful alternating matrix is retained as:
+
+```text
+tools/results/expert-cache/route-ready-sidecar/2026-08-28-route-ready-sidecar-control-1.jsonl
+tools/results/expert-cache/route-ready-sidecar/2026-08-28-route-ready-sidecar-cache-1.jsonl
+tools/results/expert-cache/route-ready-sidecar/2026-08-28-route-ready-sidecar-control-2.jsonl
+tools/results/expert-cache/route-ready-sidecar/2026-08-28-route-ready-sidecar-cache-2.jsonl
+tools/results/expert-cache/route-ready-sidecar/2026-08-28-route-ready-sidecar-control-3.jsonl
+tools/results/expert-cache/route-ready-sidecar/2026-08-28-route-ready-sidecar-cache-3.jsonl
+tools/results/expert-cache/route-ready-sidecar/2026-08-28-route-ready-sidecar-control-4.jsonl
+tools/results/expert-cache/route-ready-sidecar/2026-08-28-route-ready-sidecar-cache-4.jsonl
+tools/results/expert-cache/route-ready-sidecar/2026-08-28-route-ready-sidecar-control-5.jsonl
+tools/results/expert-cache/route-ready-sidecar/2026-08-28-route-ready-sidecar-cache-5.jsonl
+```
+
+Control TG tokens/s: 18.708193, 17.627600, 18.134119, 18.074945, 17.384387.
+Cache TG tokens/s: 18.688460, 17.262850, 18.008909, 18.066710, 18.911013.
+The medians are 18.074945 and 18.066710 respectively, a -0.04556 percent
+difference within the observed variation. Every cache-on row reports zero
+route-ready dispatches, classifications, and actions; zero zero-copy hits;
+zero eligible operations; and zero expert RAM-to-GPU bytes.
+
+Decision: reject further sidecar policy work. The runtime gate has
+deterministic output and zero upload bytes, but it has no timed full-hit action
+and no measurable TG benefit. Keep the CPU-base miss behavior. `EXPERT_CACHE.md`
+remains unchanged because the plan's all-conditions update gate did not pass.
+
+## Final Route-Ready Verification (2026-08-28)
+
+```text
+cmake --build build --config Release --target test-expert-cache test-backend-ops llama-bench llama-server
+Result: PASS
+
+build/bin/Release/test-expert-cache.exe
+Result: PASS
+
+GGML_EXPERT_CACHE_DEBUG_EPOCH=1 build/bin/Release/test-expert-cache.exe
+Result: PASS
+
+build/bin/Release/test-backend-ops.exe test -o ADD -j 1
+Result: PASS, 99/99 CUDA ADD cases and both backends passed
+
+cmake --build build --config Release --target test-expert-cache-profile
+build/bin/Release/test-expert-cache-profile.exe
+Result: PASS
+
+python -m py_compile tools/results/expert-cache/run-tg-matrix.py
+Result: PASS
+```
+
+## Active Route-Ready Sidecar Performance Recovery (2026-08-29)
+
+### Problem
+
+The earlier route-ready sidecar runtime gate was correct but did not execute a timed action on the Compact model. Cache-enabled rows therefore showed zero route-ready actions and no measurable throughput benefit. The recovery required both active route residency and removal of host-to-device synchronization boundaries from the full-hit sidecar.
+
+### Retained implementation changes
+
+1. `ggml_moe_route_ready_sidecar_execute_full_hit()` now queues input upload, remapped-ID uploads, graph execution, and output download through the GPU backend asynchronous APIs. All work is ordered on the backend stream and one `ggml_backend_synchronize()` follows the download.
+   - The prior sequence used synchronous tensor-copy helpers for every transfer, `ggml_backend_graph_compute()` (which synchronizes), and a second explicit synchronization.
+   - The unfused full-hit regression asserts one synchronization, four asynchronous uploads, one asynchronous output download, CPU-reference output, six zero-copy projection hits, and zero expert RAM-to-GPU bytes.
+2. The one-miss serial heterogeneous path now synchronizes the GPU backend after CPU miss work and before reading `gpu_down` into host memory.
+   - Graph replay runs on the CUDA main stream while the synchronous tensor-get helper uses `cudaStreamPerThread`. Without the explicit main-stream synchronization, the output read had no required happens-before edge with graph execution.
+   - This is a correctness repair, not an independent performance claim. It preserves intended GPU/CPU overlap because it occurs after CPU miss computation.
+3. The full-hit sidecar now also synchronizes after a failed asynchronous graph submission and before it unbinds weight descriptors or releases slots.
+   - The queued asynchronous uploads borrow the route-ID vectors and layer input owned by the call. A graph error must drain that work before those objects leave scope.
+   - The full-hit regression replaces the backend graph callback with a failure and asserts that the sidecar still performs one synchronization. It failed before this repair and passes after it.
+4. Production route-ready dispatch retains only full hits and exactly-one-miss partial hits. Profiling found the 1-6-hit partial cases slower than CPU-base execution, so they remain CPU-base.
+
+### Rejected or inconclusive configurations
+
+| Configuration | Result | Decision |
+|---|---:|---|
+| Dynamic 1 GiB cache, period 64, TG64 | Mean paired delta -1.717%; 1/5 positive pairs | Rejected |
+| Partial heterogeneous execution with 1-7 hits | About -13.02% | Rejected |
+| Static 2 GiB profile, layers 0-3, TG256 after async transfer change | Mean paired delta -0.791%; median -0.346%; 2/5 positive pairs | Inconclusive, not retained |
+| Static 3 GiB profile, layers 0-3, TG256 | Combined mean +2.513%; median +2.294%; 7/10 positive pairs | Promising; extended to TG512 |
+
+### Pre-Prefix-Fix Active-Cache Benchmark
+
+Configuration:
+
+```text
+Model: C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf
+Workload: -p 0 -n 512 -r 1 -t 14 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mmap -ngl 99 -ncmoe 40 -fitt 0
+Control: -exc 0
+Cache: -exc 3072 -excp 65536 -excm 0 -pe tools/results/expert-cache/active-sidecar/pinned_layer03_all_256_3g.json
+Runner: tools/results/expert-cache/run-tg-matrix.py
+Environment: GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL=0
+```
+
+The static manifest has a 3072 MiB tier, `max_bundles = 1024`, and one entry for every expert ID 0-255 in each of layers 0-3. Dynamic swaps are disabled. Each row is a fresh process. Five pairs ran control-first and five pairs ran cache-first.
+
+| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|---|---:|---:|---:|---:|---:|---:|
+| Control first | 5 | 15.847198 | 16.243561 | +2.509% | +3.126% | 4/5 |
+| Cache first | 5 | 15.298685 | 15.819915 | +3.518% | +3.862% | 5/5 |
+| Combined | 10 | 15.572941 | 16.031738 | +3.013% | +3.151% | 9/10 |
+
+The combined paired-delta sample standard deviation is 1.884%. Its 95% Student-t interval is +1.666% to +4.361%. The one-sided paired sign-test probability under equal cache/control performance is 0.010742.
+
+The cache path was active in every cache-enabled row:
+
+```text
+route-ready actions:        1,057 to 1,091
+route-ready dispatches:     80
+route-ready classifications:20,480
+zero-copy hits:             24,024 to 24,720
+expert RAM-to-GPU bytes:    0
+```
+
+Every control row reported zero for these cache counters. The raw result pairs are:
+
+```text
+tools/results/expert-cache/active-sidecar/2026-08-29-active-sidecar-3072m-pinned-layer03-full-async-io-control-first-n512-{control,cache}-1..5.jsonl
+tools/results/expert-cache/active-sidecar/2026-08-29-active-sidecar-3072m-pinned-layer03-full-async-io-cache-first-n512-{control,cache}-1..4.jsonl
+tools/results/expert-cache/active-sidecar/2026-08-29-active-sidecar-3072m-pinned-layer03-full-async-io-cache-first-n512-repair-{control,cache}-1.jsonl
+```
+
+The original cache-first fifth cache row has no paired control row because that matrix was interrupted before control execution. It is excluded. The complete repair pair supplies the fifth cache-first observation.
+This measurement predates the same-split prefix-view correctness repair below. Its raw data is retained as investigation context but is not used as current performance evidence.
+
+### Correctness repairs before final matrix
+
+1. The route-ready split prefix passed `dispatch->first_bundle_node_idx - cur_j` as the third `ggml_graph_view()` argument. That API expects an exclusive end index, not a count.
+   - The error was latent for the first dispatch (`cur_j == 0`). A later bundle in the same split with non-bundle nodes in the gap could skip those nodes and use stale input or route IDs.
+   - `test_route_ready_two_bundles_same_split_gap` constructs two fully resident bundles in one CPU split. The second bundle is preceded by a six-node gap. It compares the final output with the CPU reference and asserts two dispatches, two classifications, two actions, twelve zero-copy hits, and zero expert RAM-to-GPU bytes.
+   - The test failed before the one-line end-index fix and passes after it.
+2. The full-hit sidecar now synchronizes after a failed asynchronous graph submission before it unbinds descriptors and releases reserved slots.
+   - The test replaces the backend graph callback with a failing callback and asserts exactly one synchronization. It failed before the change and passes after it.
+3. A failed sidecar GPU-buffer allocation now frees and clears the partial sidecar state.
+   - The initialization guard returns false unless both the context and buffer are live.
+   - The test uses a backend buffer type whose allocator always fails; two consecutive sidecar calls return `GGML_STATUS_FAILED` instead of asserting on an unallocated tensor.
+
+Review after these repairs found no remaining Critical or Important issue. The only deferred observation is a conservative `GGML_STATUS_FAILED` result for an exotic same-split topology whose route-ID producer predates the prior bundle cursor; it fails safe rather than using stale data.
+
+### Corrected sustained active-cache benchmark
+
+The final matrices use the same model, command, profile, and runner listed above, after the prefix-view and sidecar failure-path repairs. Twenty fresh cache/control pairs ran at TG512: ten control-first and ten cache-first pairs, split across two independent five-pair matrices in each order.
+
+| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|---|---:|---:|---:|---:|---:|---:|
+| Control first | 10 | 14.806427 | 15.530123 | +5.074% | +4.817% | 9/10 |
+| Cache first | 10 | 15.163974 | 15.951169 | +5.333% | +4.513% | 9/10 |
+| Combined | 20 | 14.985200 | 15.740646 | +5.203% | +4.817% | 18/20 |
+
+The paired-delta sample standard deviation is 6.470%. The 95% Student-t interval is +2.175% to +8.231%. The one-sided paired sign-test probability under equal cache/control performance is 0.00020123.
+
+The cache path was active in every cache-enabled row:
+
+```text
+route-ready actions:        1,070 to 1,091
+route-ready dispatches:     80
+route-ready classifications:20,480
+zero-copy hits:             24,285 to 24,720
+expert RAM-to-GPU bytes:    0
+```
+
+Every control row reported zero for these cache counters. Current-source raw pairs are:
+
+```text
+tools/results/expert-cache/active-sidecar/2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-control-first-n512-{control,cache}-1..5.jsonl
+tools/results/expert-cache/active-sidecar/2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-cache-first-n512-{control,cache}-1..5.jsonl
+tools/results/expert-cache/active-sidecar/2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-repeat-control-first-n512-{control,cache}-1..5.jsonl
+tools/results/expert-cache/active-sidecar/2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-repeat-cache-first-n512-{control,cache}-1..5.jsonl
+```
+
+### Decision
+
+The full-sidecar asynchronous transfer sequence, error-path cleanup, and 3 GiB static layers-0-3 profile deliver a measured sustained TG512 improvement for the stated GTX 1080 Compact workload. This result must not be generalized to other models, cache capacities, or placement regimes without another alternating matrix.
+
+### Final verification
+
+- `cmake --build build --config Release --target test-expert-cache llama-bench` rebuilt the affected test and benchmark binaries.
+- `test-expert-cache.exe` passed twice normally and once with `GGML_EXPERT_CACHE_DEBUG_EPOCH=1`. This includes the failed graph submission, repeated failed sidecar allocation, two-bundle same-split gap, and cross-split sidecar regressions.
+- `python tools/results/expert-cache/test_run_tg_matrix.py` passed its two runner tests.
+- A fresh `llama-bench -n 1` active-cache smoke loaded all 1,024 manifest entries and recorded 48 requests, 48 zero-copy hits, two route-ready actions, 40 classifications, and zero expert RAM-to-GPU bytes.
+
+## Automatic Fit Target 256 With 3 GiB Static Cache (2026-08-29)
+
+User-requested placement comparison: replace the prior explicit `-ngl 99 -ncmoe 40` settings with `-fitt 256`, leaving the TG512 workload and 3 GiB static layers 0-3 profile unchanged.
+
+`llama-bench` treats a non-default fit target as automatic fit: it resets `n_gpu_layers` to the default and calls `common_fit_params()`. No `-ngl` or `-ncmoe` was passed. The runner emitted fresh alternating cache-off/cache-on processes with `GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL=0`.
+
+| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|---|---:|---:|---:|---:|---:|---:|
+| Control first | 5 | 16.704502 | 9.966571 | -39.901% | -43.366% | 0/5 |
+| Cache first | 5 | 16.463109 | 10.769035 | -34.076% | -36.477% | 0/5 |
+| Combined | 10 | 16.583806 | 10.367803 | -36.988% | -36.954% | 0/10 |
+
+The paired-delta sample standard deviation is 7.040%. The 95% Student-t interval is -42.025% to -31.952%. The two-sided paired sign-test probability under equal cache/control performance is 0.001953125.
+
+All cache-enabled rows had 24,720 requests and zero-copy hits, 1,091 route-ready actions, 80 route-ready dispatches, 20,480 classifications, and zero expert RAM-to-GPU bytes. Every control row had zero for those counters. This is active-cache regression, not a cache engagement failure.
+
+Decision: reject the 3 GiB static route-ready profile under this automatic-fit placement on the GTX 1080 Compact workload. The existing positive result applies only to the explicitly constrained placement until another cache capacity or profile proves otherwise.
+
+Raw result pairs:
+
+```text
+tools/results/expert-cache/fit-target-256/2026-08-29-fit-target-256-control-first-n512-{control,cache}-1..5.jsonl
+tools/results/expert-cache/fit-target-256/2026-08-29-fit-target-256-cache-first-n512-{control,cache}-1..5.jsonl
+```

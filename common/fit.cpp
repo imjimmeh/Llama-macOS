@@ -742,8 +742,7 @@ static void common_params_fit_impl(
                 __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
         }
 
-        // try to fit at least part of one more layer (disabled for expert cache to keep MoE layers atomic)
-        const bool allow_split_moe_layers = (cparams == nullptr || cparams->expert_cache_size == 0);
+        const bool allow_split_moe_layers = true;
         if (allow_split_moe_layers && ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
             std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
             size_t id_dense_start_test = id_dense_start;
