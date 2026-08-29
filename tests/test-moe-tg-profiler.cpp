@@ -73,6 +73,9 @@ struct profiler_context {
 
     // layer -> token -> list of routed expert IDs
     std::vector<std::vector<std::vector<int32_t>>> layer_routes; // [layer][token][expert]
+    // device route ids are produced asynchronously; the callback only records
+    // the ids tensor and the value is copied after the decode call returns
+    std::vector<const ggml_tensor *> pending_ids; // [layer]
     std::vector<uint64_t> token_wall_times_us;
     std::vector<uint64_t> token_cpu_times_us;
     std::vector<uint64_t> token_gpu_times_us;
@@ -141,25 +144,20 @@ static bool profiler_cb_eval(struct ggml_tensor * t, bool ask, void * user_data)
             l_stat.combine_us += dt_us;
         }
 
-        // Capture expert routing IDs if this is MUL_MAT_ID
+        // Record the route ids tensor; values are copied after the decode
+        // call returns, when the producing kernels have landed.
         if (t->op == GGML_OP_MUL_MAT_ID && t->src[2] != nullptr) {
-            const ggml_tensor * ids_tensor = t->src[2];
-            const size_t n_ids = ggml_nelements(ids_tensor);
-            std::vector<int32_t> ids_vec(n_ids);
-            if (ggml_backend_buffer_is_host(ids_tensor->buffer)) {
-                memcpy(ids_vec.data(), ids_tensor->data, n_ids * sizeof(int32_t));
-            } else {
-                ggml_backend_tensor_get(ids_tensor, ids_vec.data(), 0, n_ids * sizeof(int32_t));
+            if (ctx->pending_ids.size() <= (size_t) layer_idx) {
+                ctx->pending_ids.resize(ctx->n_layers, nullptr);
             }
-
-            if (ctx->layer_routes.size() <= (size_t)layer_idx) {
+            if (ctx->pending_ids[layer_idx] == nullptr) {
+                ctx->pending_ids[layer_idx] = t->src[2];
+            }
+            if (ctx->layer_routes.size() <= (size_t) layer_idx) {
                 ctx->layer_routes.resize(ctx->n_layers);
             }
-            if (ctx->layer_routes[layer_idx].size() <= (size_t)ctx->current_token) {
+            if (ctx->layer_routes[layer_idx].size() <= (size_t) ctx->current_token) {
                 ctx->layer_routes[layer_idx].resize(ctx->current_token + 1);
-            }
-            if (ctx->layer_routes[layer_idx][ctx->current_token].empty()) {
-                ctx->layer_routes[layer_idx][ctx->current_token] = ids_vec;
             }
         }
     }
@@ -174,6 +172,10 @@ int main(int argc, char ** argv) {
     int n_gen = 128;
     size_t fit_target_bytes = 256 * 1024 * 1024; // 256 MiB
     std::string out_manifest_prefix = "pinned_experts";
+    size_t cache_mib = 0;              // deployment cache budget, mirrored into fit
+    double w_full = 1.0;               // admission objective weight: 8/8 bundle hit
+    double w_hetero = 0.4;             // admission objective weight: 7/8 bundle hit
+    std::string dump_routes_path;      // debug: raw captured routes
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -188,14 +190,22 @@ int main(int argc, char ** argv) {
             fit_target_bytes = (size_t)atoi(argv[++i]) * 1024 * 1024;
         } else if (strcmp(argv[i], "--out-manifest") == 0 && i + 1 < argc) {
             out_manifest_prefix = argv[++i];
+        } else if (strcmp(argv[i], "--cache-mib") == 0 && i + 1 < argc) {
+            cache_mib = (size_t) atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--w-full") == 0 && i + 1 < argc) {
+            w_full = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--w-hetero") == 0 && i + 1 < argc) {
+            w_hetero = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--dump-routes") == 0 && i + 1 < argc) {
+            dump_routes_path = argv[++i];
         }
     }
 
     printf("================================================================================\n");
     printf("MoE TG Decode Profiler & Static Residency Ranker (Epics 2 & 3)\n");
     printf("Model: %s\n", model_path.c_str());
-    printf("Threads: %d | Prompt: %d | Decode: %d | Fit Target: %zu MiB\n",
-        n_threads, n_prompt, n_gen, fit_target_bytes / (1024 * 1024));
+    printf("Threads: %d | Prompt: %d | Decode: %d | Fit Target: %zu MiB | Cache: %zu MiB\n",
+        n_threads, n_prompt, n_gen, fit_target_bytes / (1024 * 1024), cache_mib);
     printf("================================================================================\n\n");
 
     llama_backend_init();
@@ -214,7 +224,10 @@ int main(int argc, char ** argv) {
     params.cpuparams_batch.n_threads = n_threads;
     params.n_ctx = n_prompt + n_gen + 256;
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    params.expert_cache_size = 0; // Baseline control: CPU routed MoE
+    // mirror the deployment cache budget so fit reproduces deployment placement;
+    // period stays at its inert default and no manifest is loaded, so the
+    // profiling cache remains empty while cb_eval still records every route
+    params.expert_cache_size = cache_mib * 1024 * 1024;
     params.cb_eval = profiler_cb_eval;
     params.cb_eval_user_data = &pctx;
 
@@ -229,6 +242,21 @@ int main(int argc, char ** argv) {
 
     auto * model = init->model();
     auto * ctx = init->context();
+
+    // only host-resident MoE weights can ever be admitted by the cache
+    std::vector<bool> layer_eligible(pctx.n_layers, false);
+    int n_eligible_layers = 0;
+    for (int l = 0; l < pctx.n_layers; l++) {
+        char name[64];
+        snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", l);
+        const ggml_tensor * t = llama_model_get_tensor(model, name);
+        layer_eligible[l] = t != nullptr && ggml_backend_buffer_is_host(t->buffer);
+        if (layer_eligible[l]) {
+            n_eligible_layers++;
+        }
+    }
+    printf("Placement-eligible host MoE layers: %d of %d (cache-mib %zu)\n",
+        n_eligible_layers, pctx.n_layers, cache_mib);
     const auto * vocab = llama_model_get_vocab(model);
 
     // Warmup prompt
@@ -262,6 +290,47 @@ int main(int argc, char ** argv) {
 
         const int64_t t_tok1 = get_time_us();
         pctx.token_wall_times_us.push_back(t_tok1 - t_tok0);
+
+        // route ids are only valid once the submitted device work has landed
+        for (int l = 0; l < pctx.n_layers; l++) {
+            if (l >= (int) pctx.pending_ids.size() || pctx.pending_ids[l] == nullptr) {
+                continue;
+            }
+            const ggml_tensor * ids_tensor = pctx.pending_ids[l];
+            std::vector<int32_t> ids_vec(ggml_nelements(ids_tensor));
+            if (ggml_backend_buffer_is_host(ids_tensor->buffer)) {
+                memcpy(ids_vec.data(), ids_tensor->data, ids_vec.size() * sizeof(int32_t));
+            } else {
+                ggml_backend_tensor_get(ids_tensor, ids_vec.data(), 0, ids_vec.size() * sizeof(int32_t));
+            }
+            if (pctx.layer_routes[l].size() > (size_t) t && pctx.layer_routes[l][t].empty()) {
+                pctx.layer_routes[l][t] = std::move(ids_vec);
+            }
+        }
+
+        if (getenv("MOE_PROF_DIAG") && t < 2) {
+            for (int l = 0; l < 3; l++) {
+                const ggml_tensor * it = l < (int) pctx.pending_ids.size() ? pctx.pending_ids[l] : nullptr;
+                if (!it || !it->src[0]) {
+                    continue;
+                }
+                const ggml_tensor * prod = it->src[0];
+                std::vector<int32_t> v(ggml_nelements(prod));
+                if (ggml_backend_buffer_is_host(prod->buffer)) {
+                    memcpy(v.data(), prod->data, v.size() * sizeof(int32_t));
+                } else {
+                    ggml_backend_tensor_get(prod, v.data(), 0, v.size() * sizeof(int32_t));
+                }
+                fprintf(stderr, "[diag] t=%d L%d view ne=%lld offset=%zu prod='%s' type=%s ne=%lld vals[0..15]:",
+                    t, l, (long long) ggml_nelements(it), (size_t) ((char *) it->data - (char *) prod->data),
+                    prod->name, ggml_type_name(prod->type), (long long) ggml_nelements(prod));
+                for (size_t i = 0; i < v.size() && i < 16; i++) {
+                    fprintf(stderr, " %d", v[i]);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+        std::fill(pctx.pending_ids.begin(), pctx.pending_ids.end(), nullptr);
 
         // Simple argmax sample for deterministic stepping
         const float * logits = llama_get_logits_ith(ctx, 0);
@@ -481,42 +550,183 @@ int main(int argc, char ** argv) {
     }
 
     printf("\n================================================================================\n");
-    printf("Epic 3 Story 3.3: Static Pinned Expert Manifests for Memory Tiers\n");
+    printf("Manifest v2: placement-aware bundle-admission greedy selection\n");
     printf("================================================================================\n");
 
+    if (!dump_routes_path.empty()) {
+        std::ofstream dr(dump_routes_path);
+        for (int l = 0; l < pctx.n_layers; l++) {
+            for (size_t t = 0; t < pctx.layer_routes[l].size(); t++) {
+                dr << l << ' ' << t;
+                for (int32_t e : pctx.layer_routes[l][t]) {
+                    dr << ' ' << e;
+                }
+                dr << '\n';
+            }
+        }
+        printf("Raw routes written to %s\n", dump_routes_path.c_str());
+    }
+
+    const int top_k_model = top_k; // 8 routes per token for this model
+
+    // inverted index: occurrences[l][e] = decode token indices routing to expert e
+    std::vector<std::vector<std::vector<int>>> occurrences(pctx.n_layers,
+        std::vector<std::vector<int>>(n_experts));
+    std::vector<std::vector<int>> hit_count(pctx.n_layers);
+    for (int l = 0; l < pctx.n_layers; l++) {
+        const size_t n_tok = pctx.layer_routes[l].size();
+        hit_count[l].assign(n_tok, 0);
+        for (size_t t = 0; t < n_tok; t++) {
+            for (int exp : pctx.layer_routes[l][t]) {
+                if (exp >= 0 && exp < n_experts) {
+                    occurrences[l][exp].push_back((int) t);
+                }
+            }
+        }
+    }
+
+    // per (layer,expert) activation counts, for the manifest stats field
+    std::vector<std::vector<uint64_t>> acts(pctx.n_layers, std::vector<uint64_t>(n_experts, 0));
+    for (int l = 0; l < pctx.n_layers; l++) {
+        for (int e = 0; e < n_experts; e++) {
+            acts[l][e] = occurrences[l][e].size();
+        }
+    }
+
+    std::vector<std::set<int>> chosen(pctx.n_layers);
     const std::vector<size_t> tiers_mb = { 64, 128, 256, 512, 1024 };
     for (size_t tier_mb : tiers_mb) {
-        const size_t tier_bytes = tier_mb * 1024 * 1024;
-        const size_t max_bundles = tier_bytes / expert_bundle_bytes;
+        const size_t max_bundles = (tier_mb * 1024 * 1024) / expert_bundle_bytes;
+        std::vector<std::set<int>> sel = chosen;   // tiers are cumulative
+        std::vector<std::vector<int>> hc = hit_count; // scratch |routes_t intersect sel_l|
+        for (int l = 0; l < pctx.n_layers; l++) {
+            for (int e : chosen[l]) {
+                for (int t : occurrences[l][e]) {
+                    hc[l][t]++;
+                }
+            }
+        }
+        // potential per decode step, as a function of how many of its top_k
+        // routes are already pinned: linear progress below the admission
+        // thresholds, then the admission payout. A strictly-threshold gain
+        // cannot start - it only credits the 7th and 8th expert, so nothing is
+        // ever selectable from an empty selection.
+        const double boot_credit = 0.02;
+        auto phi = [&](int c) {
+            double p = boot_credit * (double) c;
+            if (c >= top_k_model - 1) p += w_hetero;
+            if (c >= top_k_model) p += w_full;
+            return p;
+        };
+        size_t used = 0;
+        while (used < max_bundles) {
+            int best_l = -1, best_e = -1;
+            double best_gain = 0.0;
+            for (int l = 0; l < pctx.n_layers; l++) {
+                if (!layer_eligible[l]) {
+                    continue;
+                }
+                for (int e = 0; e < n_experts; e++) {
+                    if (sel[l].count(e)) {
+                        continue;
+                    }
+                    double gain = 0.0;
+                    for (int t : occurrences[l][e]) {
+                        gain += phi(hc[l][t] + 1) - phi(hc[l][t]);
+                    }
+                    if (gain > best_gain) {
+                        best_gain = gain;
+                        best_l = l;
+                        best_e = e;
+                    }
+                }
+            }
+            if (best_l < 0 || best_gain <= 0.0) {
+                break;
+            }
+            for (int t : occurrences[best_l][best_e]) {
+                hc[best_l][t]++;
+            }
+            sel[best_l].insert(best_e);
+            used++;
+        }
+        chosen = sel;
+
+        // tier projections + per-entry bundle stats over the full selection
+        uint64_t proj_full = 0, proj_seven = 0;
+        std::vector<std::vector<uint64_t>> entry_full(pctx.n_layers, std::vector<uint64_t>(n_experts, 0));
+        std::vector<std::vector<uint64_t>> entry_seven(pctx.n_layers, std::vector<uint64_t>(n_experts, 0));
+        for (int l = 0; l < pctx.n_layers; l++) {
+            for (size_t t = 0; t < pctx.layer_routes[l].size(); t++) {
+                int c = 0;
+                for (int exp : pctx.layer_routes[l][t]) {
+                    if (exp >= 0 && exp < n_experts && sel[l].count(exp)) {
+                        c++;
+                    }
+                }
+                if (c == top_k_model) {
+                    proj_full++;
+                    for (int exp : pctx.layer_routes[l][t]) {
+                        if (exp >= 0 && exp < n_experts) entry_full[l][exp]++;
+                    }
+                } else if (c == top_k_model - 1) {
+                    proj_seven++;
+                    for (int exp : pctx.layer_routes[l][t]) {
+                        if (exp >= 0 && exp < n_experts && sel[l].count(exp)) entry_seven[l][exp]++;
+                    }
+                }
+            }
+        }
 
         std::string manifest_file = out_manifest_prefix + "_" + std::to_string(tier_mb) + "mb.json";
         std::ofstream ofs(manifest_file);
         ofs << "{\n";
+        ofs << "  \"format\": 2,\n";
+        ofs << "  \"admission\": \"7of8\",\n";
+        ofs << "  \"top_k\": " << top_k_model << ",\n";
+        ofs << "  \"w_full\": " << w_full << ",\n";
+        ofs << "  \"w_hetero\": " << w_hetero << ",\n";
+        ofs << "  \"placement_cache_mib\": " << cache_mib << ",\n";
         ofs << "  \"tier_mb\": " << tier_mb << ",\n";
         ofs << "  \"bundle_bytes\": " << expert_bundle_bytes << ",\n";
-        ofs << "  \"max_bundles\": " << max_bundles << ",\n";
-        ofs << "  \"pinned_experts\": [\n";
+        ofs << "  \"eligible_layers\": [";
+        bool first_l = true;
+        for (int l = 0; l < pctx.n_layers; l++) {
+            if (layer_eligible[l]) {
+                ofs << (first_l ? "" : ", ") << l;
+                first_l = false;
+            }
+        }
+        ofs << "],\n";
 
-        double total_value = 0.0;
-        uint64_t total_covered_activations = 0;
-        for (size_t i = 0; i < max_bundles && i < all_experts.size(); i++) {
-            const auto & u = all_experts[i];
-            total_value += u.value_per_byte;
-            total_covered_activations += u.activations;
-            ofs << "    {\"layer\": " << u.layer << ", \"expert_id\": " << u.expert_id
-                << ", \"activations\": " << u.activations << ", \"value_per_byte\": " << u.value_per_byte << "}"
-                << (i + 1 < max_bundles && i + 1 < all_experts.size() ? ",\n" : "\n");
+        // emit sorted by (layer, expert_id)
+        std::vector<std::pair<int, int>> entries;
+        for (int l = 0; l < pctx.n_layers; l++) {
+            for (int e : sel[l]) {
+                entries.push_back({ l, e });
+            }
+        }
+        std::sort(entries.begin(), entries.end());
+        ofs << "  \"pinned_experts\": [\n";
+        for (size_t i = 0; i < entries.size(); i++) {
+            const int l = entries[i].first;
+            const int e = entries[i].second;
+            ofs << "    {\"layer\": " << l << ", \"expert_id\": " << e
+                << ", \"activations\": " << acts[l][e]
+                << ", \"bundle_full_hits\": " << entry_full[l][e]
+                << ", \"bundle_seven_hits\": " << entry_seven[l][e] << "}"
+                << (i + 1 < entries.size() ? ",\n" : "\n");
         }
         ofs << "  ]\n}\n";
         ofs.close();
 
-        const double coverage_pct = (double)total_covered_activations / (double)(n_gen * top_k * 40) * 100.0;
-        printf("Tier %4zu MiB: %4zu pinned bundles (~%5.1f MiB) | Total Activations: %6llu (%5.1f%% of all decode routes) -> %s\n",
+        const double total_steps = (double) n_gen * pctx.n_layers;
+        printf("Tier %4zu MiB: %4zu pinned | projected 8/8 admissions %llu (%.1f%% of decode steps) | projected 7/8 admissions %llu -> %s\n",
             tier_mb,
-            max_bundles,
-            (double)(max_bundles * expert_bundle_bytes) / (1024.0 * 1024.0),
-            (unsigned long long)total_covered_activations,
-            coverage_pct,
+            entries.size(),
+            (unsigned long long) proj_full,
+            total_steps > 0.0 ? 100.0 * (double) proj_full / total_steps : 0.0,
+            (unsigned long long) proj_seven,
             manifest_file.c_str());
     }
 
