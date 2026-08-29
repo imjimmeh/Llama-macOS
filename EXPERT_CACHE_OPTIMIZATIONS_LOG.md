@@ -2024,3 +2024,270 @@ Raw result pairs:
 tools/results/expert-cache/fit-target-256/2026-08-29-fit-target-256-control-first-n512-{control,cache}-1..5.jsonl
 tools/results/expert-cache/fit-target-256/2026-08-29-fit-target-256-cache-first-n512-{control,cache}-1..5.jsonl
 ```
+## Automatic Fit Target 256 Capacity/Period/Max-Swaps Matrix (2026-08-29)
+
+This matrix tests each exposed `llama-bench` expert-cache control type under the Compact automatic-fit placement: cache capacity (`-exc`), rebalance period (`-excp`), static manifests (`-pe`), and max swaps (`-excm`, parsed by `llama-bench` but not shown in its help). It uses the current-source branch build from `1b6898fc3`; the `ggml-base.dll` timestamp is newer than `ggml/src/ggml-backend.cpp`.
+
+All rows use fresh processes with `-p 0 -n 512 -r 1 -t 14 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mmap -fitt 256 -o jsonl`, omit `-ngl` and `-ncmoe`, and set `GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL=0`. The control side passes `-exc 0`; cache sides pass the stated cache settings.
+
+### Calibration
+
+The runner first measured ten alternating pairs where both sides used `-exc 0`. The second process in each pair is labeled cache only because the runner preserves its pair naming. It measures process-order and system variation rather than a cache effect.
+
+| Setup | Pairs | First-process mean (tok/s) | Second-process mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs | Cache requests range |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| both sides -exc 0 | 10 | 13.689954 | 13.969253 | +2.083% | +1.045% | 6/10 | 0-0 |
+
+The cacheless calibration alone has a +2.083% mean and +1.045% median second-process delta with a -2.448% to +9.688% range. Gains of only a few percent in the two-pair screens are therefore not evidence of a cache win.
+
+### Capacity and static-profile screen
+
+Each configuration has four alternating pairs, two control-first and two cache-first. Dynamic rows use no manifest. Pinned rows use the matching tier manifest; the 2,048 MiB and 3,072 MiB rows use `active-sidecar/pinned_layer03_all_256.json` and `active-sidecar/pinned_layer03_all_256_3g.json`. All screen rows use `-excp 64 -excm -1`.
+
+| Cache setup | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs | Cache requests range |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| dynamic 64m | 4 | 14.583466 | 13.232710 | -8.928% | -8.668% | 0/4 | 0-0 |
+| dynamic 128m | 4 | 14.758602 | 14.386041 | -2.461% | -3.313% | 1/4 | 72-240 |
+| dynamic 256m | 4 | 16.311398 | 15.699925 | -3.486% | -5.602% | 1/4 | 3,264-3,768 |
+| dynamic 512m | 4 | 15.425196 | 14.768530 | -4.487% | -1.918% | 1/4 | 15,720-17,376 |
+| dynamic 1024m | 4 | 15.865259 | 15.778469 | +2.423% | -3.649% | 1/4 | 42,216-43,488 |
+| dynamic 2048m | 4 | 17.182925 | 15.474404 | -9.875% | -9.076% | 0/4 | 108,288-110,712 |
+| dynamic 3072m | 4 | 18.118939 | 10.758746 | -40.622% | -40.704% | 0/4 | 146,592-146,592 |
+| pinned 64m | 4 | 17.419086 | 17.438695 | +0.137% | -0.345% | 1/4 | 0-0 |
+| pinned 128m | 4 | 17.519922 | 17.215268 | -1.695% | -0.716% | 2/4 | 0-0 |
+| pinned 256m | 4 | 17.154250 | 17.117415 | -0.011% | +1.506% | 3/4 | 0-0 |
+| pinned 512m | 4 | 16.884987 | 16.252284 | -3.761% | -4.074% | 0/4 | 168-336 |
+| pinned 1024m | 4 | 16.073839 | 15.397703 | -4.047% | -4.578% | 1/4 | 19,008-19,776 |
+| pinned 2048m | 4 | 13.014397 | 14.285571 | +21.397% | -3.946% | 1/4 | 68,784-72,144 |
+| pinned 3072m | 4 | 13.397205 | 7.431960 | -44.549% | -40.007% | 0/4 | 119,976-119,976 |
+
+The two positive screen means are not credible wins: dynamic 1,024 MiB has a -3.649% median and 1/4 positive pairs; pinned 2,048 MiB has a -3.946% median and 1/4 positive pairs. Caches that consistently engaged become progressively worse at large capacity. The 3,072 MiB dynamic and pinned profiles regress by -40.622% and -44.549% mean paired delta respectively.
+
+### Period and max-swaps screen
+
+The two possible small-cache candidates were dynamic 128 MiB and the 2,048 MiB static profile. Each row has two alternating pairs, one in each order. `swaps=-1` is unlimited, `swaps=0` disables swaps, and all other values cap the number of swaps per rebalance.
+
+| Cache setup | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs | Cache requests range |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| dynamic-128m period=0 swaps=-1 | 2 | 14.780973 | 14.241953 | -3.632% | -3.632% | 0/2 | 0-0 |
+| dynamic-128m period=32 swaps=-1 | 2 | 15.878937 | 15.894626 | +0.562% | +0.562% | 1/2 | 72-72 |
+| dynamic-128m period=64 swaps=-1 | 2 | 15.510283 | 15.243070 | -1.543% | -1.543% | 1/2 | 0-72 |
+| dynamic-128m period=128 swaps=-1 | 2 | 16.195078 | 15.191751 | -6.184% | -6.184% | 0/2 | 24-120 |
+| dynamic-128m period=256 swaps=-1 | 2 | 16.993323 | 17.393946 | +2.389% | +2.389% | 1/2 | 48-96 |
+| dynamic-128m period=512 swaps=-1 | 2 | 18.033003 | 18.169645 | +0.763% | +0.763% | 1/2 | 0-0 |
+| dynamic-128m period=1024 swaps=-1 | 2 | 17.272861 | 17.759999 | +2.816% | +2.816% | 2/2 | 0-0 |
+| dynamic-128m period=65536 swaps=-1 | 2 | 17.564231 | 17.203028 | -2.118% | -2.118% | 1/2 | 0-0 |
+| dynamic-128m period=64 swaps=0 | 2 | 18.034775 | 17.868171 | -0.926% | -0.926% | 0/2 | 0-0 |
+| dynamic-128m period=64 swaps=1 | 2 | 17.955172 | 17.818086 | -0.763% | -0.763% | 1/2 | 0-0 |
+| dynamic-128m period=64 swaps=4 | 2 | 17.937006 | 17.754579 | -1.009% | -1.009% | 1/2 | 0-0 |
+| dynamic-128m period=64 swaps=16 | 2 | 17.897692 | 17.505937 | -2.154% | -2.154% | 1/2 | 96-120 |
+| dynamic-128m period=64 swaps=64 | 2 | 18.059236 | 18.061471 | +0.013% | +0.013% | 1/2 | 72-96 |
+| dynamic-128m period=65536 swaps=0 | 2 | 18.362220 | 18.644966 | +1.612% | +1.612% | 1/2 | 0-0 |
+| pinned-2048m period=0 swaps=-1 | 2 | 17.348083 | 16.188423 | -6.633% | -6.633% | 0/2 | 0-0 |
+| pinned-2048m period=32 swaps=-1 | 2 | 17.730588 | 15.807991 | -10.834% | -10.834% | 0/2 | 75,624-77,736 |
+| pinned-2048m period=64 swaps=-1 | 2 | 18.012118 | 15.503346 | -13.925% | -13.925% | 0/2 | 67,464-70,848 |
+| pinned-2048m period=128 swaps=-1 | 2 | 18.467374 | 16.469048 | -10.802% | -10.802% | 0/2 | 58,176-60,936 |
+| pinned-2048m period=256 swaps=-1 | 2 | 18.392668 | 16.577206 | -9.820% | -9.820% | 0/2 | 39,864-41,928 |
+| pinned-2048m period=512 swaps=-1 | 2 | 17.433695 | 16.250089 | -6.627% | -6.627% | 0/2 | 168-168 |
+| pinned-2048m period=1024 swaps=-1 | 2 | 17.928367 | 16.527209 | -7.809% | -7.809% | 0/2 | 0-0 |
+| pinned-2048m period=65536 swaps=-1 | 2 | 17.679278 | 16.458267 | -6.903% | -6.903% | 0/2 | 0-0 |
+| pinned-2048m period=64 swaps=0 | 2 | 17.688076 | 16.517110 | -6.593% | -6.593% | 0/2 | 0-0 |
+| pinned-2048m period=64 swaps=1 | 2 | 18.437048 | 17.240282 | -6.491% | -6.491% | 0/2 | 0-0 |
+| pinned-2048m period=64 swaps=4 | 2 | 18.910327 | 17.312818 | -8.431% | -8.431% | 0/2 | 0-0 |
+| pinned-2048m period=64 swaps=16 | 2 | 18.135170 | 16.906275 | -6.760% | -6.760% | 0/2 | 816-840 |
+| pinned-2048m period=64 swaps=64 | 2 | 18.698125 | 17.406990 | -6.902% | -6.902% | 0/2 | 6,576-7,128 |
+| pinned-2048m period=65536 swaps=0 | 2 | 17.261283 | 17.541497 | +2.803% | +2.803% | 1/2 | 0-0 |
+
+No period or max-swap setting produced a repeatable active-cache gain. Positive two-pair rows with zero requests are another measurement-noise control, not cache evidence. Every active pinned 2,048 MiB configuration regressed.
+
+### Confirmatory active-cache pairs
+
+The only active configurations with potentially non-negative two-pair screens, dynamic 128 MiB at periods 32 and 256, each received ten new alternating pairs: five control-first and five cache-first.
+
+| Cache setup | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs | Cache requests range |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| dynamic-128m-period256 | 10 | 17.598316 | 17.431097 | -0.967% | -1.692% | 4/10 | 0-96 |
+| dynamic-128m-period32 | 10 | 17.070390 | 16.985216 | -0.305% | -0.545% | 5/10 | 48-216 |
+
+For dynamic 128 MiB period 32, the paired-delta 95% Student-t interval is -3.999% to +3.389%. For period 256, it is -3.237% to +1.303%. Both intervals span zero and both mean and median deltas are negative.
+
+### Decision
+
+Reject every tested expert-cache configuration for the automatic-fit target-256 Compact TG512 workload on this GTX 1080. The current recommendation is `-exc 0` with no pinned manifest. This conclusion is specific to automatic placement and does not invalidate the explicit `-ngl 99 -ncmoe 40` 3 GiB static-sidecar win above.
+
+Raw result pairs (284 JSONL files):
+
+```text
+tools/results/expert-cache/fit-target-256-option-matrix/2026-08-29-fit256-option-calibration-{control-first,cache-first}-n512-{control,cache}-1..5.jsonl
+tools/results/expert-cache/fit-target-256-option-matrix/2026-08-29-fit256-option-screen-*-{control-first,cache-first}-n512-{control,cache}-1..2.jsonl
+tools/results/expert-cache/fit-target-256-option-matrix/2026-08-29-fit256-option-tune-*-{control-first,cache-first}-n512-{control,cache}-1.jsonl
+tools/results/expert-cache/fit-target-256-option-matrix/2026-08-29-fit256-option-confirm-*-{control-first,cache-first}-n512-{control,cache}-1..5.jsonl
+```
+## Cacheless Automatic-Fit Branch vs Baseline (2026-08-29)
+
+User-requested paired comparison of this expert-cache branch against `G:/code/AI/llama.cpp`, with no expert-cache parameters. The branch working tree was `1b6898fc3`; the baseline was `ca3d5a3e1`. The branch JSONL build stamp remains `b4207a3e9` because CMake records its configure-time revision, but `build/bin/Release/ggml-base.dll` is newer than the changed `ggml/src/ggml-backend.cpp`. The baseline JSONL reports `ca3d5a3e1`.
+
+Each side used a fresh `llama-bench` process with the mappable Compact preset settings: `-m C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf -p 0 -n 512 -r 1 -t 14 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mlock -fitt 256 -o jsonl`. No `-exc`, `-excp`, `-excm`, or `-pe` was passed. `llama-bench` has no equivalent for the server preset's 128K context, `no-context-shift`, unified KV, or CRAM settings.
+
+Five pairs ran branch-first, then five ran baseline-first. The JSONL confirms identical model, CUDA backend, requested fit target, requested GPU/MoE layer values, load mode, batch sizes, thread count, KV quantization, and flash-attention setting.
+
+| Matrix order | Pairs | Branch mean (tok/s) | Baseline mean (tok/s) | Mean paired delta | Median paired delta | Branch-positive pairs |
+|---|---:|---:|---:|---:|---:|---:|
+| branch-first | 5 | 18.477187 | 26.004807 | -28.937% | -29.281% | 0/5 |
+| baseline-first | 5 | 17.978402 | 25.290214 | -28.881% | -29.449% | 0/5 |
+| Combined | 10 | 18.227795 | 25.647510 | -28.909% | -29.365% | 0/10 |
+
+The current branch is consistently slower: combined mean paired delta -28.909%, median -29.365%, range -30.238% to -26.998%, and 0/10 branch-positive pairs. The paired-delta 95% Student-t interval is -29.749% to -28.069%; the two-sided paired sign-test probability is 0.001953125.
+
+The branch rows are genuinely cacheless: `expert_cache_size=0`, zero requests, and zero zero-copy hits on every row. They still record 240 route-census nodes, 61,440 route-census split inputs, and 166 CPU-host route-census nodes, so automatic fitting leaves host MoE weights on the cacheless decode graph.
+
+### Source diagnosis
+
+Two branch-only hot-path changes are active on this GTX 1080 and together explain the regression mechanism. This comparison does not isolate their individual percentages.
+
+1. Baseline `ggml_backend_sched_compute_splits()` selectively copies only routed experts when a host WEIGHTS input feeds `MUL_MAT_ID` (`G:/code/AI/llama.cpp/ggml/src/ggml-backend.cpp:1643-1727`). The tuned input loop at `ggml/src/ggml-backend.cpp:2373-2397` unconditionally performs the generic full-tensor copy before later cache processing. Its replacement path needs `cache != NULL && ggml_backend_expert_cache_can_store(...)` (`2428-2452`). With no cache flags, `llama-context.cpp:647-661` does not configure a cache, so the subset path is absent and host MoE weights use the generic full-copy route. `git log -S` identifies removal of the baseline path in `681e8e404` (`ggml : fix expert cache graph remapping and gate prompt offload`).
+
+2. The tuned CUDA forward loop adds `cudaStreamSynchronize(cuda_ctx->stream())` after every computed node (`ggml/src/ggml-cuda/ggml-cuda.cu:4168-4184`); baseline has no corresponding synchronization (`G:/code/AI/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu:4181-4189`). The GTX 1080 reports compute capability 6.1, while CUDA graphs are disabled below Volta 7.0 (`ggml/src/ggml-cuda/common.cuh:52`, `ggml/src/ggml-cuda/ggml-cuda.cu:4225-4237`). Therefore this benchmark uses the direct loop and incurs the per-node synchronization. `git log -S` identifies `c9d0d8c4a` (`wip fixes`) as the introducing commit.
+
+### Decision
+
+This branch is not a valid cacheless automatic-fit performance baseline for this model and GPU. No source patch was applied for this measurement request. The minimum repair experiment is to restore the baseline selective-copy behavior when no expert cache is configured and remove or narrowly gate the temporary per-node CUDA synchronization, then rebuild and rerun this same ten-pair comparison. Each change must be measured separately before combining them.
+
+Raw result pairs:
+
+```text
+tools/results/expert-cache/cacheless-baseline-comparison/2026-08-29-fit256-cacheless-{branch,baseline}-1..10.jsonl
+```
+
+## Cacheless Upstream Parity Repair (2026-08-29)
+
+### Changes
+
+- Removed the branch-only per-node `cudaStreamSynchronize()` from the CUDA forward loop.
+- Restored upstream routed-expert range copies for host MoE weights when no scheduler expert cache exists.
+- Skipped cache-only route discovery, census, prefetch, remapping, and dispatch work when no cache is configured.
+
+### Verification
+
+`test-backend-ops.exe test -o MUL_MAT_ID -b CUDA0` passed all 869 CUDA `MUL_MAT_ID` cases. `test-expert-cache.exe` passed, including the new cacheless scheduler regression that checks two routed range writes, numerical output against CPU, and zero cache telemetry.
+
+The exact cacheless TG512 command remained:
+
+```text
+-m C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf -p 0 -n 512 -r 1 -t 14 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mlock -fitt 256 -o jsonl
+```
+
+Five pairs ran branch-first and five baseline-first. Neither binary received expert-cache options. The environment removed inherited `GGML_EXPERT_CACHE_*` settings and set `GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL=0`.
+
+| Pairs | Repaired branch mean (tok/s) | Baseline mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs | 95% paired interval |
+|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 22.913479 | 22.825523 | +0.397% | +0.309% | 6/10 | -0.727% to +1.520% |
+
+The paired range was -2.472% to +2.852%, with sample standard deviation 1.571%. The strict +/-3% mean-delta gate passes and the paired interval contains zero.
+
+Every repaired-branch row reports zero expert-cache requests, hits, zero-copy hits, RAM-to-GPU bytes, route-plan counters, route-census counters, route-ready counters, and cache actions. This restores a valid cacheless control on the GTX 1080 automatic-fit TG512 workload.
+
+Raw result pairs:
+
+```text
+tools/results/expert-cache/cacheless-parity-final/2026-08-29-cacheless-parity-final-{branch,baseline}-1..10.jsonl
+```
+
+## Post-Parity Expert Cache Matrix (2026-08-29)
+
+### Method
+
+All rows used fresh `llama-bench` processes, `-p 0 -n 512 -r 1 -t 14 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mmap`, and `GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL=0`. Each configuration alternated control and cache rows in two orders. Cache-off rows used `-exc 0`.
+
+### Explicit static route-ready placement
+
+The retained sidecar profile used `-ngl 99 -ncmoe 40 -fitt 0 -exc 3072 -excp 65536 -excm 0 -pe tools/results/expert-cache/active-sidecar/pinned_layer03_all_256_3g.json`.
+
+| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|:---|---:|---:|---:|---:|---:|---:|
+| Control first | 10 | 18.740826 | 20.427487 | +9.004% | +8.920% | 10/10 |
+| Cache first | 10 | 18.869043 | 20.253412 | +7.347% | +7.972% | 10/10 |
+| Combined | 20 | 18.804934 | 20.340449 | +8.176% | +8.330% | 20/20 |
+
+The combined paired-delta range is +5.482% to +11.102%; sample standard deviation is 1.519%; and the 95% Student-t interval is +7.467% to +8.885%. Cache rows averaged 20,340 requests and zero-copy hits, 894 route-ready actions, 80 dispatches, 20,480 classifications, and zero RAM-to-GPU bytes. The prior active-sidecar absolute cache throughput was 15.741 tok/s, so removing CUDA serialization and restoring the cacheless scheduler path increases the retained cache-on absolute throughput to 20.340 tok/s. This combined repair does not attribute that increase between its two changes.
+
+### Automatic-fit dynamic cache
+
+Both candidates used `-fitt 256 -exc 128 -excm -1` without a pinned manifest.
+
+| Period | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs | 95% paired interval |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 10 | 22.040287 | 22.764980 | +3.305% | +3.637% | 9/10 | +2.049% to +4.561% |
+| 256 | 10 | 22.108924 | 22.349791 | +1.105% | +1.345% | 8/10 | -0.842% to +3.051% |
+
+Period 32 paired deltas range from -1.252% to +5.020%; sample standard deviation is 1.689%. Cache rows averaged 249 requests and zero-copy hits, 66 route-ready actions, 56 dispatches, 14,336 classifications, and zero RAM-to-GPU bytes. Period 256 paired deltas range from -5.652% to +5.744%; sample standard deviation is 2.616%. Its cache rows averaged 174 requests and zero-copy hits, 45 route-ready actions, 56 dispatches, 14,336 classifications, and zero RAM-to-GPU bytes.
+
+### Decision
+
+The explicit 3 GiB static sidecar remains a retained gain under its explicit placement. The automatic-fit 128 MiB dynamic cache with `-excp 32` now also beats repaired cache-off with a positive paired interval, so retain it for this model, GPU, and TG512 workload. Do not retain period 256 because its paired interval includes zero. The old cacheless full-weight copy was not moved into a cache-owned-copy design: cacheless execution now uses upstream selective copies, while cache-enabled execution keeps its route-ready cache path.
+
+Raw result pairs:
+
+```text
+tools/results/expert-cache/post-parity-cache-matrix/2026-08-29-post-parity-explicit-{control-first,cache-first}-n512-{control,cache}-1..10.jsonl
+tools/results/expert-cache/post-parity-cache-matrix/2026-08-29-post-parity-fit256-period{32,256}-{control-first,cache-first}-n512-{control,cache}-1..5.jsonl
+```
+
+### Automatic-Fit 1,024 Static Expert Recheck
+
+The 3 GiB `pinned_layer03_all_256_3g.json` manifest was rerun after cacheless parity repair under automatic fit with `-fitt 256 -exc 3072 -excp 65536 -excm 0`. Ten fresh TG512 pairs ran in two orders.
+
+| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|:---|---:|---:|---:|---:|---:|---:|
+| Control first | 5 | 22.663952 | 10.611257 | -53.172% | -53.000% | 0/5 |
+| Cache first | 5 | 23.852222 | 11.059394 | -53.562% | -52.317% | 0/5 |
+| Combined | 10 | 23.258087 | 10.835326 | -53.367% | -52.658% | 0/10 |
+
+The paired-delta range is -59.942% to -50.803%; sample standard deviation is 2.290%; and the 95% Student-t interval is -55.071% to -51.662%. Every cache row engaged: 24,720 requests and zero-copy hits, 1,091 route-ready actions, 80 dispatches, 20,480 classifications, and zero expert RAM-to-GPU bytes. This is a real automatic-fit regression, not a cache-engagement failure. Do not retain the 1,024-static-expert profile for automatic fit.
+
+Raw result pairs:
+
+```text
+tools/results/expert-cache/post-parity-cache-matrix/2026-08-29-post-parity-fit256-static1024-{control-first,cache-first}-n512-{control,cache}-1..5.jsonl
+```
+
+### Automatic-Fit 1,024 MiB Static Profile Recheck
+
+The intended 1,024 MiB configuration used `-fitt 256 -exc 1024 -excp 65536 -excm 0 -pe pinned_experts_1024mb.json`. Ten fresh TG512 pairs ran in two orders.
+
+| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|:---|---:|---:|---:|---:|---:|---:|
+| Control first | 5 | 19.560809 | 19.800332 | +0.868% | +0.734% | 3/5 |
+| Cache first | 5 | 22.416061 | 22.460981 | +1.316% | -5.243% | 2/5 |
+| Combined | 10 | 20.988435 | 21.130657 | +1.092% | -1.142% | 5/10 |
+
+The paired-delta range is -9.724% to +26.847%; the 95% Student-t interval is -6.003% to +8.188%. Every cache row recorded zero requests, zero zero-copy hits, zero route-ready actions, and zero RAM-to-GPU bytes. It still planned 68 route-ready dispatches and 17,408 classifications, but no host expert weight became eligible for cache execution. This is not evidence of a 1,024 MiB cache gain and the profile is not retained.
+
+Raw result pairs:
+
+```text
+tools/results/expert-cache/post-parity-cache-matrix/2026-08-29-post-parity-fit256-static1024m-{control-first,cache-first}-n512-{control,cache}-1..5.jsonl
+```
+
+### 1,024 MiB Zero-Action Root-Cause Analysis
+
+The zero request/hit/action counters do not mean the manifest was absent:
+
+- Startup reports 537 parsed static entries.
+- Cache teardown reports 666.77 MiB resident, 1,370 slots used across four pools.
+- Scheduler telemetry reports 17,408 route-ready classifications and 68 planned dispatches per TG512 row.
+
+`n_requests` increments only when an expert tensor records an executed zero-copy hit, D2D hit, or miss. It does not count route partition attempts. `n_route_ready_actions` increments only for the production admission cases in `ggml_backend_sched_compute_splits`: all 8 routes resident, or exactly 7 resident plus one CPU miss. Therefore zero requests plus nonzero classifications means every classified bundle was rejected below 7/8 residency.
+
+The manifest shape explains the rejection. Its 537 entries span all 40 layers, with only 8-18 expert IDs per layer (mean 13.425 out of 256). The documented 71.7% coverage was measured as aggregate individual-route coverage for the older executor that ran arbitrary GPU hits alongside CPU misses. Current production deliberately rejects 1/8 through 6/8 hit masks because the partial-hit oracle found them slower than CPU-base execution. The old profile metric and current admission objective are not equivalent.
+
+Automatic placement adds two losses:
+
+1. Some profiled layers already have non-host MoE weights and cannot benefit from a host-weight sidecar. The TG512 row records 9,216 non-host weight bypasses and 52,224 CPU-backend bypasses.
+2. The static loader reports parsed entries, not successful residency. It silently ignores failed `ggml_backend_expert_cache_seed()` calls. Equal allocation by unique slot-pool shape and placement-ineligible entries leave 357.23 MiB of the nominal 1,024 MiB capacity unused in this run.
+
+A diagnostic 1,024 MiB run with the full layer-0-through-3 manifest also produced zero actions. It reported only 511.88 MiB resident (767 slots across two pools) after claiming to load 1,024 entries. This confirms that manifest parsing is not evidence that the intended bundles became usable under automatic placement.
+
+The dynamic 128 MiB period-32 configuration is the counterexample: under the same automatic-fit workload it records route-ready actions and zero-copy hits and has a positive paired interval. The dispatcher and telemetry work; the legacy static profile, loader reporting, and automatic placement are not aligned.
+
+Decision: treat `pinned_experts_1024mb.json` as obsolete for the current selective dispatcher. A replacement must rank complete 7/8 or 8/8 co-occurring route bundles after automatic placement, exclude non-host-ineligible layers, budget the actual four slot-pool shapes, and report parsed, seeded, resident, rejected-capacity, and rejected-placement counts separately.

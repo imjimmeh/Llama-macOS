@@ -65,9 +65,9 @@ The partial-hit oracle covers every 0-8 hit mask. Runtime profiling found the 1-
 In earlier naive forced-routing experiments, un-cached experts were synchronously transferred across the PCIe bus during the critical decode path (causing up to 169.7 GiB of miss uploads and dropping decode speed to 9.19 tok/s).
 
 Under the **Zero-Miss-Upload Discipline**:
-1. **Never upload weights in-band during decode**: When a requested expert is not resident in GPU slots, its slice is computed on host CPU memory.
-2. **Transfer activations instead of weights**: A missing expert bundle requires uploading 1.95 MiB across PCIe. In contrast, partial hidden states require transferring only 8 KiB (2000x less PCIe traffic).
-3. **Zero GPU compute stall**: Tokens with GPU hits compute on GPU slots; tokens with CPU misses compute on CPU threads; hidden states are combined with zero PCIe weight stalls.
+1. **Never upload weights in-band during decode**: When a route-ready bundle does not meet the GPU admission threshold, production keeps the bundle on the CPU-base path.
+2. **Transfer activations instead of weights**: The admitted one-miss path transfers partial hidden state instead of expert weights.
+3. **Zero timed expert-weight upload**: The admitted full-hit and one-miss paths record zero expert RAM-to-GPU bytes.
 
 ### 2.2 Understanding Layer-Fit vs. Expert-Cache Trade-Offs
 - **Full GPU Layer**: Holds all 256 experts in VRAM. 100% of routes compute on GPU at ~300 GB/s with 0 CPU fallbacks.
@@ -86,6 +86,8 @@ The built-in profiler ranks all candidate expert bundles and produces pinned man
 - `pinned_experts_256mb.json`: 134 bundles (~255.4 MiB) -> **32.6% route coverage**
 - `pinned_experts_128mb.json`: 67 bundles (~127.7 MiB) -> **18.7% route coverage**
 - `pinned_experts_64mb.json`: 33 bundles (~62.9 MiB) -> **9.8% route coverage**
+
+These coverage values are historical aggregate individual-route coverage from the older arbitrary-partial-hit executor. They do not predict the current production dispatcher, which admits only 7/8-hit and 8/8-hit bundles. Regenerate manifests against complete route co-occurrence before using them with the current path.
 
 ### 2.4 Non-Blocking Background Promotion Pipeline
 - Candidate expert promotions are dispatched asynchronously on dedicated background CUDA streams.
@@ -139,46 +141,44 @@ Hardware: NVIDIA GeForce GTX 1080 (SM61, 8 GB VRAM) | CPU: 14 Threads | Model: `
 | **Dynamic Cache 128 MiB** | none | 128 MiB | 324.55 tok/s | **16.39 tok/s** | 8 full layers + 128M dynamic LRU cache. |
 | **Hybrid Preset** | `pinned_experts_1024mb.json` | 128 MiB | 326.85 tok/s | **16.18 tok/s** | 8 full layers + hybrid dynamic/pinned cache. |
 
-### Regime C: Active Route-Ready Sidecar (2026-08-29)
+### Regime C: Active Route-Ready Sidecar (Post-Parity, 2026-08-29)
 
-This is the current measured deployment result, not an isolation benchmark.
+This is the retained explicit-placement deployment result after restoring cacheless upstream scheduler parity.
 
 - Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf`; GTX 1080; 14 CPU threads.
 - Workload: fresh `llama-bench` process per row with `-p 0 -n 512 -r 1 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mmap -ngl 99 -ncmoe 40 -fitt 0`.
 - Control: `-exc 0`.
 - Cache: `-exc 3072 -excp 65536 -excm 0 -pe tools/results/expert-cache/active-sidecar/pinned_layer03_all_256_3g.json`.
 - Manifest: 1024 static entries for expert IDs 0-255 in layers 0-3. It is a 3072 MiB tier with dynamic swaps disabled.
-- Method: twenty alternating pairs, with ten control-first and ten cache-first pairs across two independent five-pair matrices in each order.
+- Method: twenty alternating pairs, ten control-first and ten cache-first.
 
-| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
-|:---|---:|---:|---:|---:|---:|---:|
-| Control first | 10 | 14.806427 | 15.530123 | +5.074% | +4.817% | 9/10 |
-| Cache first | 10 | 15.163974 | 15.951169 | +5.333% | +4.513% | 9/10 |
-| Combined | 20 | 14.985200 | 15.740646 | **+5.203%** | **+4.817%** | **18/20** |
+| Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|:---|---:|---:|---:|---:|---:|
+| 20 | 18.804934 | 20.340449 | **+8.176%** | **+8.330%** | **20/20** |
 
-The combined paired-delta 95% Student-t interval is +2.175% to +8.231%; the one-sided paired sign-test probability under equal cache/control performance is 0.00020123. Cache-enabled rows recorded 1,070-1,091 route-ready actions, 20,480 classifications, 24,285-24,720 zero-copy hits, and zero expert RAM-to-GPU bytes. Every control row recorded zero for those counters.
+The combined paired-delta 95% Student-t interval is +7.467% to +8.885%. Cache-enabled rows averaged 20,340 requests and zero-copy hits, 894 route-ready actions, 80 dispatches, 20,480 classifications, and zero expert RAM-to-GPU bytes. Every control row recorded zero for those counters.
 
-Raw result pairs are under `tools/results/expert-cache/active-sidecar/` with prefixes `2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-control-first-n512`, `2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-cache-first-n512`, `2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-repeat-control-first-n512`, and `2026-08-29-active-sidecar-3072m-pinned-layer03-prefix-fix-repeat-cache-first-n512`.
+Raw result pairs are under `tools/results/expert-cache/post-parity-cache-matrix/` with prefixes `2026-08-29-post-parity-explicit-control-first-n512` and `2026-08-29-post-parity-explicit-cache-first-n512`.
 
-### Regime D: Automatic Fit With 3 GiB Static Route-Ready Cache (2026-08-29)
+### Regime D: Static Expert Profiles With Automatic Fit (Post-Parity, 2026-08-29)
 
-This measures the same TG512 cache profile as Regime C with automatic placement instead of explicit `-ngl 99 -ncmoe 40`.
+The 3 GiB manifest holding all 256 experts for layers 0-3 was rerun under automatic fit: `-fitt 256 -exc 3072 -excp 65536 -excm 0 -pe tools/results/expert-cache/active-sidecar/pinned_layer03_all_256_3g.json`. Ten alternating fresh-process TG512 pairs measured 23.258087 tok/s cache-off and 10.835326 tok/s cache-on: **-53.367%** mean paired delta, **-52.658%** median, 0/10 positive pairs, 95% interval -55.071% to -51.662%. It engaged correctly, averaging 24,720 zero-copy hits, 1,091 route-ready actions, 80 dispatches, 20,480 classifications, and zero RAM-to-GPU bytes. Do not use this static profile with automatic fit. Raw rows use `2026-08-29-post-parity-fit256-static1024-*` in `tools/results/expert-cache/post-parity-cache-matrix/`.
 
-- Model and workload: the Regime C model, GPU, thread count, and `-p 0 -n 512 -r 1 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mmap` workload.
-- Placement: `-fitt 256` with no `-ngl` or `-ncmoe`. In `llama-bench`, a non-default fit target enables `common_fit_params()` and resets `n_gpu_layers` to its default before automatic placement.
-- Control: `-exc 0`.
-- Cache: the Regime C `-exc 3072 -excp 65536 -excm 0` static layers 0-3 manifest.
-- Method: ten alternating fresh-process pairs, five control-first and five cache-first.
+The intended 1,024 MiB profile was also measured with `-fitt 256 -exc 1024 -excp 65536 -excm 0 -pe pinned_experts_1024mb.json`. Ten pairs measured 20.988435 tok/s cache-off and 21.130657 tok/s cache-on: +1.092% mean paired delta, -1.142% median, 5/10 positive pairs, and a -6.003% to +8.188% interval. The manifest loaded and seeded 666.77 MiB into 1,370 slots across four pools, but none of 17,408 classified route bundles reached the current 7/8-hit or 8/8-hit admission threshold. The legacy manifest spreads 537 entries across all 40 layers, only 8-18 expert IDs per layer. Its historical 71.7% figure is individual-route coverage from the older heterogeneous executor, not complete-bundle coverage for the current selective dispatcher. The zero request counter records zero executed cache tensors, not zero route lookups. Do not retain this profile without regenerating it for current automatic placement and bundle-level admission. Raw rows use `2026-08-29-post-parity-fit256-static1024m-*` in `tools/results/expert-cache/post-parity-cache-matrix/`.
 
-| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
-|:---|---:|---:|---:|---:|---:|---:|
-| Control first | 5 | 16.704502 | 9.966571 | -39.901% | -43.366% | 0/5 |
-| Cache first | 5 | 16.463109 | 10.769035 | -34.076% | -36.477% | 0/5 |
-| Combined | 10 | 16.583806 | 10.367803 | **-36.988%** | **-36.954%** | **0/10** |
+### Regime E: Automatic-Fit Dynamic Expert Cache (Post-Parity, 2026-08-29)
 
-The paired-delta 95% Student-t interval is -42.025% to -31.952%; the two-sided paired sign-test probability under equal cache/control performance is 0.001953125. Cache-enabled rows all recorded 24,720 requests and zero-copy hits, 1,091 route-ready actions, 80 dispatches, 20,480 classifications, and zero expert RAM-to-GPU bytes. Every control row recorded zero for those counters.
+The post-parity automatic-fit target-256 Compact TG512 matrix used `-p 0 -n 512 -r 1 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mmap -fitt 256` with fresh processes. Each period has five control-first and five cache-first pairs. The cache rows use `-exc 128 -excm -1`; no pinned manifest.
 
-This is a real active-cache regression, not an engagement failure. Do not combine the 3 GiB static route-ready profile with this automatic-fit placement for this model and GPU. Raw pairs are under `tools/results/expert-cache/fit-target-256/` with prefixes `2026-08-29-fit-target-256-control-first-n512` and `2026-08-29-fit-target-256-cache-first-n512`.
+| Rebalance period | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs | 95% paired interval |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 10 | 22.040287 | 22.764980 | **+3.305%** | **+3.637%** | 9/10 | +2.049% to +4.561% |
+| 256 | 10 | 22.108924 | 22.349791 | +1.105% | +1.345% | 8/10 | -0.842% to +3.051% |
+
+Retain the 128 MiB dynamic cache with `-excp 32` for this model, GPU, and automatic-fit workload. It averaged 249 requests, 249 zero-copy hits, 66 route-ready actions, 56 dispatches, 14,336 classifications, and zero RAM-to-GPU bytes. Period 256 is not retained because its paired interval includes zero.
+
+Raw result pairs are under `tools/results/expert-cache/post-parity-cache-matrix/` with prefixes `2026-08-29-post-parity-fit256-period32-*` and `2026-08-29-post-parity-fit256-period256-*`.
+
 
 ---
 
