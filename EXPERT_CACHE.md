@@ -14,6 +14,8 @@ CURRENT IMPLEMENTATION STATUS:
 - Multi-token prompt processing CPU backend decoupling: Implemented and tested.
 - Windows WDDM and pre-Hopper GPU stability safeguards: Implemented.
 - Timed decode expert-weight upload: 0 bytes in the active route-ready paths.
+- Route-ready admission telemetry: full-hit, fallback, and 0/8-8/8 mask counters exposed to llama-bench.
+- Fallback bundle ordering: the down node runs on the host after its activation input exists, never before.
 - Event-driven dual-device concurrency: Staged.
 ```
 

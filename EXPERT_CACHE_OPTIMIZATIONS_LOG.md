@@ -2291,3 +2291,55 @@ A diagnostic 1,024 MiB run with the full layer-0-through-3 manifest also produce
 The dynamic 128 MiB period-32 configuration is the counterexample: under the same automatic-fit workload it records route-ready actions and zero-copy hits and has a positive paired interval. The dispatcher and telemetry work; the legacy static profile, loader reporting, and automatic placement are not aligned.
 
 Decision: treat `pinned_experts_1024mb.json` as obsolete for the current selective dispatcher. A replacement must rank complete 7/8 or 8/8 co-occurring route bundles after automatic placement, exclude non-host-ineligible layers, budget the actual four slot-pool shapes, and report parsed, seeded, resident, rejected-capacity, and rejected-placement counts separately.
+
+## Route-Ready Fallback Stale-Activation Fix and Admission Telemetry (2026-08-29)
+
+### Symptom
+
+Qwen3.6-35B-A3B-APEX-Compact TG decode with the retained automatic-fit dynamic cache (`-fitt 256 -exc 128 -excp 32 -excm -1`, seed 42) produced corrupt output that degraded into mixed-language token sequences, while the cache-off control stayed coherent. The explicit 3 GiB static sidecar was unaffected because it always admits full-hit and never takes the fallback path.
+
+### Root cause
+
+The production fallback in `ggml_backend_sched_compute_splits` computed a not-admitted bundle's down node immediately during the input-processing loop, reading the activation tensor before the same split had computed it. The result baked stale activation data into the output, the node was hidden with `GGML_OP_NONE`, and every fallback bundle contaminated the residual stream with one-token-old routing results. A second defect surfaced under instrumentation: the dispatch read route IDs through the split's copy node, which may not have executed yet on the first compute, yielding garbage IDs.
+
+### Changes
+
+- Deferred the fallback down node into the route-ready dispatch phase: the prefix computes gate, up, and activation, then the down node runs on the host with valid inputs and is uploaded row-wise, skipping negative route IDs so untouched rows keep their prior contents.
+- The dispatch now reads route IDs synchronously from the producing tensor instead of the not-yet-executed split copy.
+- Added route-ready admission telemetry: `n_route_ready_full_hits`, `n_route_ready_fallbacks`, and `n_route_ready_mask_counts[0..8]` in `ggml_backend_expert_cache_stats`, an admission print in `ggml_backend_sched_print_expert_cache_stats`, and `expert_cache_route_ready_full_hits` / `expert_cache_route_ready_fallbacks` columns in llama-bench.
+- Extended `test_route_ready_cross_split_sidecar` with admission counter assertions.
+
+### Verification
+
+- Cache-on coherence restored: the same seed and prompt that previously produced corrupt output now generates coherent English; cache-off control unchanged.
+- `test-backend-ops.exe test -b CUDA0 -o MUL_MAT_ID`: all 869 cases pass.
+- `tools/results/expert-cache/test_run_tg_matrix.py` (bench column alignment): pass.
+- `test_route_ready_sidecar_full_hit` including the negative-route sentinel checks: pass.
+- The dynamic 128 MiB period-32 paired matrix recorded before this fix (+3.305%) measured speed with corrupt fallback outputs; re-measure quality before relying on that operating point. The explicit sidecar operating point is unaffected.
+
+### Open item
+
+`test_route_ready_cross_split_sidecar` still fails its numerical comparison intermittently (roughly four of five runs): compute two's admitted GPU path and compute one's host path disagree for the synthetic two-expert graph. This matches the previously documented synthetic-graph GPU-path numeric fault class. Production coherence passes; debug this test with a debugger against the sidecar and hetero slot reads before trusting synthetic GPU-path numerics in this suite.
+
+## Bundle-Admission Generator v2 and Route-Capture Blocker (2026-08-29)
+
+### Change
+
+Reworked `tests/test-moe-tg-profiler.cpp` into the placement-aware bundle-admission generator from `docs/superpowers/plans/2026-08-29-bundle-admission-manifest-v2.md`:
+
+- New CLI: `--cache-mib` (mirrored into `params.expert_cache_size` so `common/fit.cpp` reproduces deployment placement), `--w-full`, `--w-hetero`, `--dump-routes`.
+- Placement eligibility census: a layer is eligible only when its `blk.N.ffn_gate_exps.weight` buffer is host-resident. For the Compact preset at 1024 MiB this is 33 of 40 layers; at 0 MiB it is 27 of 40.
+- Greedy selection now maximises a per-decode-step potential `phi(c)` over the number `c` of already-pinned routes (linear progress credit below the admission thresholds, then the `w_hetero` 7/8 and `w_full` 8/8 payouts). The plan's literal threshold-only gain (`w_full*d_full + w_hetero*d_seven`) cannot start: from an empty selection no token is ever at `c == top_k-1`, so every candidate scores zero and the loop emits zero bundles. The potential form is monotone and reproduces the intended 7/8-and-8/8 objective once a layer fills up.
+- Manifest format v2 keys (`format`, `admission`, `top_k`, `w_full`, `w_hetero`, `placement_cache_mib`, `eligible_layers`, per-entry `bundle_full_hits`/`bundle_seven_hits`); the Task 2 loader still parses `layer`/`expert_id` by string scan.
+
+### Blocker: the captured routes are degenerate
+
+The generator is correct against its input, but the input is wrong. `profiler_cb_eval` records `MUL_MAT_ID` `src[2]` (the `ffn_moe_topk-N` ids) and the value is read either mid-graph or after `llama_decode` returns; both yield all-zero ids.
+
+- Diagnostic (`MOE_PROF_DIAG=1`, layers 0-2): `ffn_moe_topk-N` is a `GGML_OP_VIEW` over `ffn_moe_argsort-N` (`GGML_OP_ARGSORT`, device-resident, 256 i32 elements), offset 0. Reading the full 256-element argsort after the decode returns is still `0 0 0 ... 0`. So it is not a view-offset problem and not a mid-graph-only problem.
+- The same degeneracy appears at `--cache-mib 0`, so the cache path is not the cause.
+- Consequence: every token's route vector is eight identical ids, so the greedy saturates at one expert per eligible layer (33 bundles) and reports impossible 82.5% projected 8/8 admissions. The generated v2 manifests are not trustworthy until routes are captured correctly.
+
+### Next diagnostic
+
+The scheduler reads decode routes synchronously right after submitting the producing split (`ggml_backend_synchronize(ids_backend)` following `ggml_backend_tensor_get_async`, `ggml-backend.cpp:2657`). The profiler's `llama_model_get_tensor`-based census and `ggml_backend_tensor_get` go through no such sync. Before trusting any generated manifest, capture routes the way the scheduler does: either (a) add a `ggml_backend_synchronize` on the CUDA device backend immediately before the argsort/topk read and confirm non-zero ids, or (b) instrument `GGML_OP_ARGSORT`/topk production directly. Do not ship a manifest generated from the current degenerate capture.
