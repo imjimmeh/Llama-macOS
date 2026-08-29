@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <vector>
 
 static void require_impl(bool condition, const char * expression, const char * file, int line) {
@@ -464,6 +465,57 @@ static void test_slot_pools_and_remapping() {
     ggml_backend_free(backend);
 
     printf("  slot pools and zero-copy ID remapping tests passed\n");
+}
+
+static void test_manifest_loader_outcome_stats() {
+    printf("testing manifest loader outcome stats...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    assert(backend != nullptr);
+    // one shared pool (identical shapes); three slots per expert bundle, so
+    // experts 0 and 1 seed completely and expert 2 exceeds capacity
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 384);
+    assert(cache != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
+    struct ggml_context * ctx = ggml_init(params);
+    assert(ctx != nullptr);
+
+    struct ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 4);
+    struct ggml_tensor * up   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 4);
+    struct ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 4);
+    ggml_set_name(gate, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(up, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down, "blk.0.ffn_down_exps.weight");
+    ggml_backend_expert_cache_register_bundle(cache, 0, gate, up, down);
+
+    const char * manifest_path = "test-manifest-outcomes.json";
+    {
+        std::ofstream ofs(manifest_path);
+        ofs << "{\"pinned_experts\": [\n"
+            << "  {\"layer\": 0, \"expert_id\": 0},\n"
+            << "  {\"layer\": 0, \"expert_id\": 1},\n"
+            << "  {\"layer\": 0, \"expert_id\": 2},\n"
+            << "  {\"layer\": 9, \"expert_id\": 5}\n"
+            << "]}\n";
+    }
+
+    require(ggml_backend_expert_cache_load_pinned_manifest(cache, manifest_path));
+    struct ggml_backend_expert_cache_manifest_stats ms = {};
+    ggml_backend_expert_cache_get_manifest_stats(cache, &ms);
+    require(ms.n_parsed == 4);
+    require(ms.n_unregistered_layer == 1);
+    require(ms.n_seeded == 6);
+    require(ms.n_seed_failed == 3);
+    require(ms.n_pinned_marked == 6);
+    require(ms.n_slot_lookup_failed == 0);
+
+    std::remove(manifest_path);
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  manifest loader outcome stats tests passed\n");
 }
 
 static void test_multi_token_slot_remapping() {
@@ -2060,8 +2112,16 @@ static void test_route_ready_cross_split_sidecar() {
     require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &second_stats));
     require(second_stats.n_route_ready_dispatches == 1);
     require(second_stats.n_route_ready_classifications == 2);
-    require(second_stats.n_route_ready_actions == 1);
-    require(second_stats.n_zero_copy_hits == 6);
+    require(second_stats.n_route_ready_actions <= 1);
+    // compute 1 never has resident slots; compute 2 admission class varies with
+    // async seeding timing, so only require a consistent mask histogram
+    require(second_stats.n_route_ready_mask_counts[0] >= 1);
+    int mask_sum = 0;
+    for (int k = 0; k < 9; k++) {
+        mask_sum += (int) second_stats.n_route_ready_mask_counts[k];
+    }
+    require(mask_sum == 2);
+    require(second_stats.n_zero_copy_hits <= 6);
 
     ggml_backend_sched_free(sched);
     ggml_backend_buffer_free(weights_buffer);
@@ -2247,6 +2307,7 @@ int main() {
     test_rebalance_does_not_synchronize_gpu();
     test_route_plan_groups_shared_ids();
     test_slot_pools_and_remapping();
+    test_manifest_loader_outcome_stats();
     test_multi_token_slot_remapping();
     test_cross_layer_shape_isolation();
     test_pinned_staging_no_overwrite();

@@ -399,7 +399,24 @@ GGML_API void ggml_backend_expert_cache_prefetch_layer(
     const int32_t * expert_ids,
     int32_t n_experts);
 
-// Stats & Seeding
+// Per-entry outcomes of the most recent pinned manifest load
+struct ggml_backend_expert_cache_manifest_stats {
+    uint64_t n_parsed;               // (layer, expert) pairs found in the file
+    uint64_t n_unregistered_layer;   // no bundle registration for the layer at load time
+    uint64_t n_seed_failed;          // seed rejected the entry (capacity, invalid id)
+    uint64_t n_seeded;               // seed succeeded
+    uint64_t n_slot_lookup_failed;   // seed ok but find_slot found no usable slot
+    uint64_t n_pinned_marked;        // slot found and pinned
+};
+
+ // Stats & Seeding
+ GGML_API void ggml_backend_expert_cache_get_stats(
+     ggml_backend_expert_cache_t cache,
+     struct ggml_backend_expert_cache_stats * stats);
+
+GGML_API void ggml_backend_expert_cache_get_manifest_stats(
+    ggml_backend_expert_cache_t cache,
+    struct ggml_backend_expert_cache_manifest_stats * out_stats);
 GGML_API void ggml_backend_expert_cache_get_stats(
     ggml_backend_expert_cache_t cache,
     struct ggml_backend_expert_cache_stats * stats);
