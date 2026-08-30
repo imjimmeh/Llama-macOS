@@ -16,7 +16,8 @@ CURRENT IMPLEMENTATION STATUS:
 - Timed decode expert-weight upload: 0 bytes in the active route-ready paths.
 - Route-ready admission telemetry: full-hit, fallback, and 0/8-8/8 mask counters exposed to llama-bench.
 - Fallback bundle ordering: the down node runs on the host after its activation input exists, never before.
-- Event-driven dual-device concurrency: Staged.
+- Event-driven dual-device concurrency: Implemented for the direct partial executor (event joins, pinned exchange, GPU canonical scatter, zero backend-wide synchronization). Scheduler dispatch is development-gated behind GGML_EXPERT_CACHE_HETERO_CONCURRENT=1 and admits only 7/8 bundles; the 2026-08-30 mask matrix measured no concurrent win over CPU-base at any mask, so serial remains the production 7/8 path and 0-6 stays CPU-base.
+- Fixed TG1 partial executor: seven persistent exact-K GPU graphs, seven exact-M CPU graphs, GPU-host-pinned exchange storage, and the required event set are constructed during scheduler graph allocation. Direct execution covers every 1/8 through 7/8 mask with overlapped GPU/CPU routes and a canonical host result.
 ```
 
 For the Compact model's `top_k = 8` single-token route-ready workload, production dispatch is intentionally selective:

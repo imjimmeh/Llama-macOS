@@ -2517,3 +2517,151 @@ Sample-by-Sample Head-to-Head (Pass 2):
 Prompt processing speed also improved from 142.18 tok/s to 453.84 tok/s (3.19x faster prompt evaluation) due to optimized graph compute allocations.
 
 Raw results and logs stored in `tools/results/expert-cache/server-speed-bench/`.
+
+## Cross-Split CPU Fallback Route-ID Race (2026-08-30)
+
+`test_route_ready_cross_split_sidecar` intermittently returned the CPU-base result for route 0 in both gate/up rows, then applied the correct route 1 down projection. The prior test compared that incorrect fallback output with the full-hit sidecar output, so it failed only when async promotion made compute 2 use the sidecar.
+
+- Root cause: route-ready dispatch synchronously read canonical producer IDs for classification, but its CPU fallback prefix consumed the scheduler's cross-split CPU route-ID copy before it reliably contained those values.
+- Fix: before the CPU fallback evaluates gate/up/activation, refresh each bundle node's rewired route-ID input from the canonical IDs already read for dispatch. This adds no allocation or cache synchronization.
+- Test: the test now checks the explicit F32 reference output for both fallback and full-hit executions, synchronizes promotions before compute 2, and asserts the exact `0-hit -> 2-hit` mask sequence plus six zero-copy hits.
+- Validation: the new test failed at `test-expert-cache.cpp:2102` before the production fix. `ctest --test-dir build -C Release -R "^test-expert-cache$" --output-on-failure --repeat until-fail:50` then passed all 50 runs in 16.57 seconds.
+
+## Fixed TG1 Partial Executor Contract (2026-08-30)
+
+Defined the fixed eight-route partial-execution boundary in `ggml-backend-moe-hetero`:
+
+- A route snapshot requires a nonzero mixed hit/miss split, exact coverage of every route in `[0, top_k)`, and a resident complete bundle for every hit.
+- The opaque executor stores immutable backend, shape, fusion, and projection-type compatibility inputs. Its execute entry rejects invalid snapshots, incompatible dimensions or types, missing slot descriptors, non-host Down output, or backends without async copy/event support before queueing work.
+- Persistent graph and exchange-buffer state is not allocated yet, so otherwise valid calls conservatively return `NOT_ADMITTED`. The old concurrent forwarding stub was removed; serial execution remains unchanged.
+- Added the partial-executor telemetry fields to the public expert-cache stats structure. Aggregation and runtime ownership follow with the execution path.
+
+Validation:
+
+- Red: `test_partial_route_snapshot_validation` did not compile before the snapshot type and validator existed.
+- Green: `cmake --build build --config Release --target test-expert-cache` completed, then `build/bin/Release/test-expert-cache.exe` passed the new validation test and all existing expert-cache tests.
+
+## Fixed TG1 Partial Executor Persistent State (2026-08-30)
+
+The partial executor now allocates all decode state before graph execution:
+
+- Seven fixed GPU variants for one through seven resident routes, seven fixed CPU variants for one through seven host-miss routes, a GPU merge buffer, and a GPU CPU-result upload buffer.
+- One buffer allocated from the GPU device host-buffer type holds the activation, all CPU miss-ID slices, and all CPU miss-output slices.
+- Nine GPU events cover activation copy, GPU graph, CPU-result upload, scatter, and final-output completion.
+- Each graph owns stable projection descriptors. Construction copies source descriptors and clears graph links; runtime rebinding is deferred to the exact execution path.
+- The scheduler catalog is keyed by GPU backend, CPU backend, `d_model`, `d_ff`, `top_k`, fusion, and projection types. Two compatible route-ready bundles reuse one executor. Executors are released with the scheduler.
+
+The runtime dispatcher remains unchanged: partial execution is still not admitted while the exact route graphs, dependency chain, and scatter are incomplete.
+
+- Red: the focused persistence test could not compile before the test-only state accessor and scheduler catalog accessor existed.
+- Green: `cmake --build build --config Release --target test-expert-cache test-backend-ops` completed. Direct `test-expert-cache.exe` and `test-backend-ops.exe` completed successfully; the backend suite reported `13253/13253 tests passed`.
+
+## Fixed TG1 Exact-K/M Route Graphs (2026-08-30)
+
+The direct partial executor now runs its existing persistent GPU and CPU graph variants for every mixed eight-route snapshot:
+
+- Snapshot entries are the only source of per-route slot IDs and CPU expert IDs. The executor performs no route repartitioning and no per-route cache lookup.
+- Pre-launch validation requires F32 TG1 contiguous input and canonical output layouts, exact Gate/Up/Down dimensions, host-resident CPU weights, valid pinned exchange storage, and nonnegative in-range slot IDs.
+- The GPU exact-K graph runs asynchronously, the exact-M CPU graph runs while it is queued, then the temporary synchronous join protects descriptor unbinding and slot release. Event-driven joins and GPU scatter are deferred to the next task.
+- Outputs remain packed by hit and miss order at this stage. The direct test reconstructs canonical route order from the immutable snapshot and compares it elementwise with the ordinary CPU bundle graph.
+
+Red: the new direct execution test returned `GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED` at `tests/test-expert-cache.cpp:1627` before the exact graph path existed.
+
+Green: `cmake --build build --config Release --target test-expert-cache` completed, then `build/bin/Release/test-expert-cache.exe` passed. Coverage includes all hit counts one through seven and the required masks `CGGGGGGG`, `GGGGGGGC`, `CCGGGGGG`, `GGGCGGGC`, `GGGGCCCC`, `GCGCGCGC`, and `CCGGGGCC`; each asserts packed-output parity, canonical ordering, separate route counts, and zero weight H2D bytes.
+
+## Fixed TG1 Event-Driven Overlap and Canonical Scatter (2026-08-30)
+
+The direct partial executor now overlaps GPU-resident and CPU-miss route execution without any backend-wide synchronization:
+
+- Timeline: pinned activation/ID copies, async GPU input uploads, `cudaEvent`-bracketed exact-K GPU graph, synchronous exact-M CPU graph running concurrently, contiguous pinned H2D of miss rows, individually measured event joins, same-layout single-row `ggml_backend_tensor_copy_async` scatter into the canonical `[d_model, 8]` GPU buffer, and one async D2H into the host down node.
+- The `ggml_backend_event_elapsed_us` proc is registered by the CUDA backend (`cudaEventElapsedTime`, events created with `cudaEventDefault` for timing) and required at executor construction; other GPU backends without the proc fall back to CPU-base by construction failure.
+- Exchange memory is allocated through the GPU device host buffer type with exact type verification (`CUDA_Host pinned=1` observed) and one debug line at creation.
+- Post-launch failure policy: GPU graph submission failure cleans up without poisoning; CPU graph failure after a queued GPU graph drains only `GPU_GRAPH_END`, releases slots, and poisons the executor.
+- New telemetry accumulates submit/elapsed/compute/join-wait/total timings plus CPU-result H2D bytes alongside the existing per-mask execution counters.
+
+Two ordering defects were caught by the new regressions and fixed:
+
+1. Scatter row views reused parent `nb[2]/nb[3]`, failing `ggml_are_same_layout`; single-row views now normalize all strides.
+2. The final-output event was recorded before queueing the D2H copy, so hosts could read stale rows; the event now brackets the queued copy.
+
+Green: `build/bin/Release/test-expert-cache.exe` passes. The 7/8 concurrent case makes zero backend-wide synchronize calls, reconstructs canonical route order on alternating activation inputs, and every mask `GCCCCCCC` through `CCGGGGCC` (all hit counts 1-7) matches the ordinary CPU bundle output elementwise with zero weight H2D bytes.
+
+## Fixed TG1 Feature-Gated Scheduler Dispatch (2026-08-30)
+
+The route-ready TG1 dispatcher now offers opt-in concurrent 7/8 execution behind `GGML_EXPERT_CACHE_HETERO_CONCURRENT=1` (default off, read per dispatch so tests can toggle it):
+
+- Admission constant `GGML_MOE_PARTIAL_MIN_GPU_HITS = 7`; eligibility additionally requires `top_k == 8`, fewer hits than `top_k`, and a scheduler-owned partial executor.
+- One route partition per dispatch builds a stack snapshot; the executor never repartitions.
+- Concurrent success skips the original Gate/Up/activation/Down range; `NOT_ADMITTED` falls straight to the CPU-base branch in the same invocation. The serial reference path is skipped in concurrent mode by design - no hidden serial fallback.
+- 8/8 sidecar, 1-6 CPU-base, and PP behavior are unchanged.
+
+One regression caught and fixed during bring-up: the restructured serial branch initially omitted its handled flag, letting the CPU-base branch rerun the down node after serial execution; the sidecar stale-IDs test caught it immediately.
+
+Green: `build/bin/Release/test-expert-cache.exe` passes including the new `test_partial_executor_scheduler_feature_gate` (gate off: serial histogram +1, no partial execution; gate on: `exec_by_hits[7] +1`, 7 GPU + 1 CPU routes, zero weight H2D, output equal to the CPU reference in both modes).
+
+## Fixed TG1 Partial-Executor Telemetry Export (2026-08-30)
+
+- The executor now accumulates scatter submit time in addition to submit/elapsed/compute/join/total timings.
+- `ggml_backend_sched_print_expert_cache_stats()` prints the seven per-mask execution buckets, GPU/CPU route totals, activation/CPU-result/weight byte counters (weight H2D marked MUST BE 0), and all concurrent timings whenever the 7/8 bucket is nonzero.
+- `llama-bench` exports `expert_cache_partial_exec_1_hit` through `_7_hit` plus 15 scalar partial-executor fields appended to get_fields, the INT type list, get_values, and `subtract_expert_cache_stats` (including the full 9-entry `hetero_partial_exec_by_hits` delta loop). `get_map()` now asserts field/value count equality before zipping.
+
+Green: `cmake --build build --config Release --target test-expert-cache llama-bench` completed; `build/bin/Release/test-expert-cache.exe` passes (feature-gate fixture additionally asserts `hetero_partial_total_us > 0` and `hetero_partial_activation_d2h_bytes == 0`); `build/bin/Release/llama-bench.exe --help` runs.
+
+## Partial-Mask Latency Matrix and First Decision Gate (2026-08-30)
+
+The real-executor harness ran the mandatory mask matrix on GTX 1080 + Ryzen 7 5700X, 14 CPU threads, warmup 100 / 1000 timed reps per mode per mask, Gate A dimensions (d_model 2048, d_ff 512, 256 experts, top_k 8, TG1), Q4_K gate/up + Q6_K down, one resident cache per mask:
+
+| GPU hits | CPU-base median us | CPU-base P95 us | Serial median us | Serial P95 us | Concurrent median us | Concurrent P95 us |
+| -------: | -----------------: | --------------: | ---------------: | ------------: | -------------------: | ----------------: |
+| 1/8 | 146.0 | 193.0 | 555.0 | 670.0 | 560.0 | 920.0 |
+| 2/8 | 154.5 | 254.0 | 549.5 | 797.0 | 594.0 | 927.0 |
+| 3/8 | 150.0 | 232.0 | 535.0 | 761.0 | 646.5 | 1049.0 |
+| 4/8 | 146.0 | 171.0 | 533.0 | 910.0 | 526.0 | 804.0 |
+| 5/8 | 181.0 | 278.0 | 525.0 | 849.0 | 470.5 | 798.0 |
+| 6/8 | 145.0 | 187.0 | 466.0 | 592.0 | 438.5 | 565.0 |
+| 7/8 | 247.0 | 446.0 | 435.0 | 679.0 | 437.0 | 563.0 |
+
+Raw samples: `tools/results/expert-cache/2026-08-30-partial-mask-latency.csv` (21000 rows: 7 masks x 3 modes x 1000 reps). Every mask/mode matched the canonical CPU-base output within the quantized-kernel tolerance.
+
+First decision gate result: **no mask qualifies for concurrent production admission.**
+
+- Concurrent 7/8 median (437.0 us) is statistically tied with serial (435.0 us), not faster.
+- CPU-base is the fastest mode at every mask in this isolated single-layer fixture; one-miss GPU work never repays its launch/timeline overhead at these dimensions.
+- Concurrent P95 (563.0 us at 7/8) regresses versus CPU-base P95 (446.0 us).
+
+Per the gate rule, `GGML_MOE_PARTIAL_MIN_GPU_HITS` stays at 7 and concurrent execution stays behind `GGML_EXPERT_CACHE_HETERO_CONCURRENT=1` (default off). Production policy is unchanged: 0-6 CPU-base, 7/8 serial, 8/8 sidecar.
+
+Profiler evidence: `nsys` is not installed on this machine, so the CUDA-timeline capture was not run. Overlap is evidenced instead by (a) the direct-executor regression requiring zero backend-wide synchronize calls during 7/8 concurrent execution, (b) device-time `gpu_hit_elapsed_us` recorded while the CPU miss graph runs, and (c) event-ordered CPU-result upload before scatter. A wall-clock win over serial was not observed, consistent with the tied medians.
+
+## Matrix Runner Concurrent Switch (2026-08-30)
+
+`tools/results/expert-cache/run-tg-matrix.py` now accepts `--hetero-concurrent {0,1}` (default 0) and builds every child environment through a named `bench_environment()` helper that pins `GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL=0` and sets `GGML_EXPERT_CACHE_HETERO_CONCURRENT` explicitly, so a parent shell can no longer select the wrong policy. Unit coverage added in `test_run_tg_matrix.py` (both switch values plus parent-env inheritance); all 5 tests pass.
+
+Threshold selection: the mask matrix produced no K in [1,7] whose concurrent median is at least 5 percent faster than CPU-base, so `GGML_MOE_PARTIAL_MIN_GPU_HITS` stays 7 and concurrent execution stays development-gated. No production code change was required for the threshold.
+
+## Whole-Model Concurrent-Gate Validation (2026-08-30)
+
+The Compact preset (Qwen3.6-35B-A3B-APEX-Compact, GTX 1080) was validated with the matrix runner, 5 alternating control/cache pairs per gate state, `-exc 128M -excp 32 -fitt 256`:
+
+| Gate state | cache median t/s | control median t/s | partial_exec_7_hit |
+| --- | ---: | ---: | ---: |
+| HETERO_CONCURRENT=0 | 26.46 | 24.88 | 0 |
+| HETERO_CONCURRENT=1 | 26.30 | 24.31 | 0 |
+
+- The cache reservation effect (+5.7 percent median) reproduces and is unchanged by the gate. Concurrent-cache versus serial-cache differs by -0.62 percent, inside run noise.
+- Under the retained fit placement the expert-cache route-ready path is idle: every run logged zero expert-cache requests (the 128 MiB reservation only shifts GPU layer fit), so `partial_exec_7_hit` never incremented. The concurrent gate is provably inert on the production surface.
+- Raw results: `tools/results/expert-cache/2026-08-30-concurrent-gate/`.
+
+### Deterministic generation and forced-engagement findings
+
+The plan's bitwise determinism gate (cache-off versus cache-on token hashes) is not achievable under dynamic fit placement: identical requests on identically configured fresh servers produce different token streams in both gate states, because per-launch free-VRAM measurement changes the fitted layer split and hence numerics. Three fit-placement servers with the gate on produced three different outputs while the executor was provably idle (zero cache requests) - the variance is pre-existing and independent of this work.
+
+Forcing engagement with `-ngl 99 -ncmoe 12 -exc 128M` exposed two pre-existing problems, both reproduced with the gate OFF:
+
+1. Degenerate generation (24 tokens, repeated fragments) under serial policy.
+2. With the gate ON, one generation crashed the server (exit 0x7FFFFFFF) inside the engaged route-ready path.
+
+Consequences:
+
+- The decision gate stands reinforced: concurrent execution stays development-gated behind `GGML_EXPERT_CACHE_HETERO_CONCURRENT=1`, serial remains the 7/8 production policy, and the threshold stays 7.
+- A `GGML_MOE_PARTIAL_VERIFY=1` diagnostic was added to the dispatcher's concurrent branch: after each successful concurrent execution it recomputes the bundle on the host and logs the worst route-row delta. This is the entry tool for the follow-up session that must debug the engaged-mode crash before forced-engagement configs are retried.
