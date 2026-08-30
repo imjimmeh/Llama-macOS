@@ -1,0 +1,92 @@
+[
+  {
+    "pass": 1,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 23.33669530930141,
+    "prompt_per_second": 199.30951077960424,
+    "completion_tokens": 512,
+    "latency_s": 24.247152899988578
+  },
+  {
+    "pass": 2,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 23.38432290281178,
+    "prompt_per_second": 37.455638478177406,
+    "completion_tokens": 512,
+    "latency_s": 24.037525099993218
+  },
+  {
+    "pass": 3,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 22.135250277773565,
+    "prompt_per_second": 22.91646376047712,
+    "completion_tokens": 512,
+    "latency_s": 25.344461100001354
+  },
+  {
+    "pass": 4,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 22.013444398842772,
+    "prompt_per_second": 37.96651353506208,
+    "completion_tokens": 512,
+    "latency_s": 25.406041399997775
+  },
+  {
+    "pass": 5,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 23.28403603202298,
+    "prompt_per_second": 21.007300036762775,
+    "completion_tokens": 512,
+    "latency_s": 24.240314199996646
+  },
+  {
+    "pass": 6,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 22.96814610293936,
+    "prompt_per_second": 40.7468905029185,
+    "completion_tokens": 512,
+    "latency_s": 24.433457100007217
+  },
+  {
+    "pass": 7,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 22.536202137472774,
+    "prompt_per_second": 19.395726151742466,
+    "completion_tokens": 512,
+    "latency_s": 24.98742299999867
+  },
+  {
+    "pass": 8,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 24.282213492452318,
+    "prompt_per_second": 44.43950672147539,
+    "completion_tokens": 512,
+    "latency_s": 23.186417500008247
+  },
+  {
+    "pass": 9,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 22.419901501606905,
+    "prompt_per_second": 24.800818427008092,
+    "completion_tokens": 512,
+    "latency_s": 25.049502499998198
+  },
+  {
+    "pass": 10,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 22.877632824917118,
+    "prompt_per_second": 40.43140307076506,
+    "completion_tokens": 512,
+    "latency_s": 24.51685319999524
+  }
+]

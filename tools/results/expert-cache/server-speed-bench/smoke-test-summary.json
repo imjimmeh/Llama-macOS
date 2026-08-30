@@ -1,0 +1,11 @@
+[
+  {
+    "pass": 1,
+    "id": "0daf539b787c4dccbb547330a8b4c3d7",
+    "category": "coding",
+    "predicted_per_second": 15.960935736459108,
+    "prompt_per_second": 17.93080350969646,
+    "completion_tokens": 64,
+    "latency_s": 9.301301200001035
+  }
+]

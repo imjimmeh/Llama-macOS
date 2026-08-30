@@ -1,0 +1,62 @@
+{
+  "completed_samples": 1,
+  "config": {
+    "bench": "qualitative",
+    "category": "coding",
+    "concurrency": 1,
+    "extra_inputs": {
+      "temperature": 0
+    },
+    "model": null,
+    "osl": 512,
+    "url": "localhost:9999"
+  },
+  "failed_samples": 0,
+  "results": [
+    {
+      "category": "coding",
+      "completion_tokens": 512,
+      "draft_n": 0,
+      "draft_n_accepted": 0,
+      "error": null,
+      "finish_reason": "length",
+      "id": "0daf539b787c4dccbb547330a8b4c3d7",
+      "latency_s": 24.857753799995407,
+      "ok": true,
+      "predicted_ms": 22683.878,
+      "predicted_per_second": 22.52701235652916,
+      "prompt_ms": 101.309,
+      "prompt_per_second": 39.48316536536734,
+      "prompt_tokens": 59,
+      "total_tokens": 571,
+      "turns": 1
+    }
+  ],
+  "selected_samples": 1,
+  "summary": [
+    {
+      "accept_rate": null,
+      "accepted": 0,
+      "avg_latency": 24.857753799995407,
+      "avg_pred_t_s": 22.52701235652916,
+      "avg_prompt_t_s": 39.48316536536734,
+      "category": "coding",
+      "draft_n": 0,
+      "failed": 0,
+      "requests": 1,
+      "turns": 1
+    },
+    {
+      "accept_rate": null,
+      "accepted": 0,
+      "avg_latency": 24.857753799995407,
+      "avg_pred_t_s": 22.52701235652916,
+      "avg_prompt_t_s": 39.48316536536734,
+      "category": "overall",
+      "draft_n": 0,
+      "failed": 0,
+      "requests": 1,
+      "turns": 1
+    }
+  ]
+}
