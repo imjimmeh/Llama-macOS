@@ -2544,12 +2544,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     return ec;
                 }
             } else {
-                int j0 = 0;
-                for (int j1 = 0; j1 < split->graph.n_nodes; j1++) {
-                    struct ggml_tensor * t = split->graph.nodes[j1];
-                    const bool need = sched->callback_eval(
+                for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+                    struct ggml_tensor * t = split->graph.nodes[j0];
+                    bool need = sched->callback_eval(
                         t, true, sched->callback_eval_user_data);
-                    struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 - j0 + 1);
+                    int j1 = j0;
+                    while (!need && j1 < split->graph.n_nodes - 1) {
+                        t = split->graph.nodes[++j1];
+                        need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                    }
+                    struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
                     enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                     if (ec != GGML_STATUS_SUCCESS) {
                         return ec;
@@ -3183,16 +3187,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
-            int j0 = 0;
-            for (int j1 = 0; j1 < split->graph.n_nodes; j1++) {
-                struct ggml_tensor * t = split->graph.nodes[j1];
+            for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+                struct ggml_tensor * t = split->graph.nodes[j0];
 
                 // check if the user needs data from this node
                 bool need = sched->callback_eval(t, true, sched->callback_eval_user_data);
 
-                int n_nodes = j1 - j0 + 1;
+                int j1 = j0;
 
-                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, n_nodes);
+                // determine the range [j0, j1] of nodes that can be computed together
+                while (!need && j1 < split->graph.n_nodes - 1) {
+                    t = split->graph.nodes[++j1];
+                    need = sched->callback_eval(t, true, sched->callback_eval_user_data);
+                }
+
+                struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {

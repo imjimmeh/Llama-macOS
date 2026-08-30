@@ -73,9 +73,6 @@ struct profiler_context {
 
     // layer -> token -> list of routed expert IDs
     std::vector<std::vector<std::vector<int32_t>>> layer_routes; // [layer][token][expert]
-    // device route ids are produced asynchronously; the callback only records
-    // the ids tensor and the value is copied after the decode call returns
-    std::vector<const ggml_tensor *> pending_ids; // [layer]
     std::vector<uint64_t> token_wall_times_us;
     std::vector<uint64_t> token_cpu_times_us;
     std::vector<uint64_t> token_gpu_times_us;
@@ -144,20 +141,20 @@ static bool profiler_cb_eval(struct ggml_tensor * t, bool ask, void * user_data)
             l_stat.combine_us += dt_us;
         }
 
-        // Record the route ids tensor; values are copied after the decode
-        // call returns, when the producing kernels have landed.
+        // Record route ids directly while device buffer is live and synchronized
         if (t->op == GGML_OP_MUL_MAT_ID && t->src[2] != nullptr) {
-            if (ctx->pending_ids.size() <= (size_t) layer_idx) {
-                ctx->pending_ids.resize(ctx->n_layers, nullptr);
-            }
-            if (ctx->pending_ids[layer_idx] == nullptr) {
-                ctx->pending_ids[layer_idx] = t->src[2];
-            }
             if (ctx->layer_routes.size() <= (size_t) layer_idx) {
                 ctx->layer_routes.resize(ctx->n_layers);
             }
             if (ctx->layer_routes[layer_idx].size() <= (size_t) ctx->current_token) {
                 ctx->layer_routes[layer_idx].resize(ctx->current_token + 1);
+            }
+            if (ctx->layer_routes[layer_idx][ctx->current_token].empty()) {
+                const ggml_tensor * ids_tensor = t->src[2];
+                const int n_ids = (int) ggml_nelements(ids_tensor);
+                std::vector<int32_t> ids_vec(n_ids);
+                ggml_backend_tensor_get(ids_tensor, ids_vec.data(), 0, n_ids * sizeof(int32_t));
+                ctx->layer_routes[layer_idx][ctx->current_token] = std::move(ids_vec);
             }
         }
     }
@@ -291,46 +288,19 @@ int main(int argc, char ** argv) {
         const int64_t t_tok1 = get_time_us();
         pctx.token_wall_times_us.push_back(t_tok1 - t_tok0);
 
-        // route ids are only valid once the submitted device work has landed
-        for (int l = 0; l < pctx.n_layers; l++) {
-            if (l >= (int) pctx.pending_ids.size() || pctx.pending_ids[l] == nullptr) {
-                continue;
-            }
-            const ggml_tensor * ids_tensor = pctx.pending_ids[l];
-            std::vector<int32_t> ids_vec(ggml_nelements(ids_tensor));
-            if (ggml_backend_buffer_is_host(ids_tensor->buffer)) {
-                memcpy(ids_vec.data(), ids_tensor->data, ids_vec.size() * sizeof(int32_t));
-            } else {
-                ggml_backend_tensor_get(ids_tensor, ids_vec.data(), 0, ids_vec.size() * sizeof(int32_t));
-            }
-            if (pctx.layer_routes[l].size() > (size_t) t && pctx.layer_routes[l][t].empty()) {
-                pctx.layer_routes[l][t] = std::move(ids_vec);
-            }
-        }
-
         if (getenv("MOE_PROF_DIAG") && t < 2) {
             for (int l = 0; l < 3; l++) {
-                const ggml_tensor * it = l < (int) pctx.pending_ids.size() ? pctx.pending_ids[l] : nullptr;
-                if (!it || !it->src[0]) {
+                if (pctx.layer_routes.size() <= (size_t) l || pctx.layer_routes[l].size() <= (size_t) t) {
                     continue;
                 }
-                const ggml_tensor * prod = it->src[0];
-                std::vector<int32_t> v(ggml_nelements(prod));
-                if (ggml_backend_buffer_is_host(prod->buffer)) {
-                    memcpy(v.data(), prod->data, v.size() * sizeof(int32_t));
-                } else {
-                    ggml_backend_tensor_get(prod, v.data(), 0, v.size() * sizeof(int32_t));
-                }
-                fprintf(stderr, "[diag] t=%d L%d view ne=%lld offset=%zu prod='%s' type=%s ne=%lld vals[0..15]:",
-                    t, l, (long long) ggml_nelements(it), (size_t) ((char *) it->data - (char *) prod->data),
-                    prod->name, ggml_type_name(prod->type), (long long) ggml_nelements(prod));
-                for (size_t i = 0; i < v.size() && i < 16; i++) {
+                const auto & v = pctx.layer_routes[l][t];
+                fprintf(stderr, "[diag] t=%d L%d routes (%zu):", t, l, v.size());
+                for (size_t i = 0; i < v.size(); i++) {
                     fprintf(stderr, " %d", v[i]);
                 }
                 fprintf(stderr, "\n");
             }
         }
-        std::fill(pctx.pending_ids.begin(), pctx.pending_ids.end(), nullptr);
 
         // Simple argmax sample for deterministic stepping
         const float * logits = llama_get_logits_ith(ctx, 0);
