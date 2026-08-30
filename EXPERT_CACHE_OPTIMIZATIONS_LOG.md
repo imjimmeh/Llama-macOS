@@ -2697,20 +2697,27 @@ The CPU-base fallback path creates `cpu_src1` (activation clone) and `cpu_ids` (
   - `cpu_src1.nb[0] = ggml_type_size(cpu_src1.type); for (d=1..3) nb[d] = nb[d-1] * ne[d-1];`
   - `cpu_ids.nb[0] = sizeof(int32_t); for (d=1..3) nb[d] = nb[d-1] * ne[d-1];`
 - **Note**: `cpu_out` stride reset was not needed because `cpu_out` is a fresh clone of `down` which has correct contiguous strides from `ggml_new_tensor_impl`.
-- **Verification**: Server 64-token request with cache-on now produces coherent output matching cache-off baseline. `test_route_ready_full_hit_sidecar` passes with all43 test cases.
+- **Verification**: Server 64-token request with cache-on now produces coherent output matching cache-off baseline. `test_route_ready_full_hit_sidecar` passes with all 43 test cases.
+
+### Bug 4: Forward Slash Corruption on Fallback and Multi-Token Prompt Processing (2026-08-31)
+
+Text generation on MoE models with cache enabled broke and outputted forward slash loops (`///////////////////`) or repetitive nonsense tokens.
+
+- **Root cause 1 (Garbage Intermediate Activations)**: The fallback path only evaluated the final `down` node without evaluating preceding `gate` and `up` projections on CPU host weights, leaving GPU intermediate activations as uninitialized zeros or garbage.
+- **Root cause 2 (Graph Invalidation on CPU Graph Builder)**: Shallow-cloned `cpu_src1` and `cpu_ids` tensors retained `.op = GGML_OP_VIEW/DUP` and parent `.src[]` pointers. `ggml_build_forward_expand` pulled upstream GPU device graph nodes into the CPU context, attempting to execute CPU kernels on CUDA device memory pointers.
+- **Root cause 3 (Premature Pre-Split Interception)**: A legacy pre-split loop intercepted `MUL_MAT_ID` nodes on GPU before the GPU split computed their inputs, calling `ggml_backend_tensor_get()` on uncomputed memory and setting `node->op = GGML_OP_NONE`.
+- **Root cause 4 (Multi-Token Prompt Processing Interception)**: Route-ready dispatchers intercepted multi-token prompt batches (`ne[1] > 1`), which are designed to compute natively on the CPU split graph.
+- **Fix**:
+  1. Updated CPU-base fallback in `ggml-backend.cpp` to execute the full FFN sub-graph (`mul_mat_id` -> `swiglu_split` -> `mul_mat_id`) using host weights from `ggml_backend_expert_cache_get_bundle_weights()`.
+  2. Cleared `.op = GGML_OP_NONE`, nulled all `.src[]` and `.view_src` pointers, and zeroed `.flags` on `cpu_src1` and `cpu_ids` leaf tensors.
+  3. Gated route-ready dispatch planning and bundle deferral to single-token TG1 (`ne[1] == 1`). Multi-token prompt processing (`ne[1] > 1`) executes through standard GGML CPU split computation.
+  4. Preserved inactive route sentinels (`route_ids < 0`) during async GPU uploads by uploading only active route slices.
+- **Verification**: All 36 unit tests in `test-expert-cache.exe` passed 100%. Tested end-to-end token generation on `Qwen3.6-35B-A3B-APEX-Compact.gguf` with `-ngl 99 -ncmoe 12 -exc 128M -excp 32`; verified coherent, fluent reasoning text generation with 0 forward slashes.
 
 ### Files Modified
 
-1. `ggml/src/ggml-backend-expert-cache.cpp`: `ggml_expert_cache_tensor_is_host()` helper (~line 199), applied to `record_access_count()` and `seed()`.
-2. `ggml/src/ggml-backend.cpp`: Unconditional `ggml_backend_synchronize(producer_backend_id)` at line ~3030, stride reset for `cpu_src1` at line ~3242, stride reset for `cpu_ids` at line ~3255.
-3. `tests/test-expert-cache.cpp`: `test_rebalance_ignores_gpu_resident_weights()`, cross-split sync verification hook.
-
-### Telemetry Context
-
-Server telemetry with `-ngl 99 -ncmoe 1 -exc 128M -excp 32`:
-```text
-expert cache = no requests (8040 MUL_MAT_ID inputs, 0 eligible ops, 0 capacity bypasses, 201 CPU backend bypasses, 7839 non-host bypasses)
-expert route census = 1560 nodes, 520 plans, 39 CPU-host, 0 non-CPU-host, 1521 non-host, batch bands [1=120, 2-8=1080, 9-31=0, 32+=360]
-```
-0 cache requests because `-ngl 99` makes all MoE weights GPU-resident. 39 CPU-host plans = route-ready fallback paths. The fallback path is the active path producing output.
+1. `ggml/src/ggml-backend.cpp`:
+   - Gated `ggml_backend_sched_plan_route_ready_dispatches` and pre-split bundle deferral to `ne[1] == 1`.
+   - Full bundle FFN CPU fallback implementation with host weights, safe leaf tensors, SwiGLU forward, and selective active-route GPU upload.
+2. `tests/test-expert-cache.cpp`: Enabled full test suite execution in `main()`.
 

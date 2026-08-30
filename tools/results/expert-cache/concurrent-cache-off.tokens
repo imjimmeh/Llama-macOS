@@ -1,0 +1,25 @@
+
+
+<think>
+Here's a thinking process:
+
+1.  **Understand User Request:** The user wants a step-by-step explanation of how transformer attention works. This is a fundamental concept in deep learning/NLP, so I need to be clear, accurate, and structured.
+
+2.  **Identify Key Components of Transformer Attention:**
+   - Input representation (tokens/words)
+   - Embeddings + Positional Encoding
+   - Linear projections to get Query (Q), Key (K), Value (V) matrices
+   - Scaled Dot-Product Attention formula
+   - Softmax normalization
+   - Output computation
+   - Multi-head attention (optional but important for completeness)
+   - Residual connections & Layer Norm (context, but maybe keep focus on attention itself)
+   - Mathematical intuition behind why it works
+
+3.  **Structure the Explanation (Step-by-Step):**
+   I'll organize it logically:
+   - Step 1: Input Representation & Positional Encoding
+   - Step 2: Linear Projections to Q, K, V
+   - Step 3: Compute Attention Scores (Dot Product)
+   - Step 4: Scale the Scores
+   - Step 5: Apply Softmax

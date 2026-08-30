@@ -15,6 +15,9 @@
 static void require_impl(bool condition, const char * expression, const char * file, int line) {
     if (!condition) {
         fprintf(stderr, "test requirement failed: %s:%d: %s\n", file, line, expression);
+        printf("test requirement failed: %s:%d: %s\n", file, line, expression);
+        fflush(stderr);
+        fflush(stdout);
         abort();
     }
 }
@@ -2676,7 +2679,6 @@ static void test_route_ready_cross_split_sidecar() {
     require(first_stats.n_route_ready_dispatches == 1);
     require(first_stats.n_route_ready_classifications == 1);
     ggml_backend_sched_expert_cache_sync(sched);
-
 
     ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
     ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
