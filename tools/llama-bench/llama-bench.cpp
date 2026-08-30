@@ -1602,6 +1602,25 @@ static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_ba
     EXPERT_CACHE_SUBTRACT(n_route_ready_classifications);
     EXPERT_CACHE_SUBTRACT(n_route_ready_full_hits);
     EXPERT_CACHE_SUBTRACT(n_route_ready_fallbacks);
+    for (int k = 0; k < 9; ++k) {
+        GGML_ASSERT(after.hetero_partial_exec_by_hits[k] >= before.hetero_partial_exec_by_hits[k]);
+        delta.hetero_partial_exec_by_hits[k] = after.hetero_partial_exec_by_hits[k] - before.hetero_partial_exec_by_hits[k];
+    }
+    EXPERT_CACHE_SUBTRACT(hetero_partial_gpu_routes_executed);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_cpu_routes_executed);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_activation_d2h_bytes);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_cpu_result_h2d_bytes);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_weight_h2d_bytes);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_partition_us);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_activation_d2h_us);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_gpu_hit_submit_us);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_gpu_hit_elapsed_us);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_cpu_miss_compute_us);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_cpu_result_h2d_us);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_join_wait_gpu_us);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_join_wait_cpu_us);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_scatter_us);
+    EXPERT_CACHE_SUBTRACT(hetero_partial_total_us);
 #undef EXPERT_CACHE_SUBTRACT
     return delta;
 }
@@ -1796,8 +1815,29 @@ struct test {
             "expert_cache_route_ready_dispatches",
             "expert_cache_route_ready_classifications",
             "expert_cache_route_ready_full_hits",
-            "expert_cache_route_ready_fallbacks"
-
+            "expert_cache_route_ready_fallbacks",
+            "expert_cache_partial_exec_1_hit",
+            "expert_cache_partial_exec_2_hit",
+            "expert_cache_partial_exec_3_hit",
+            "expert_cache_partial_exec_4_hit",
+            "expert_cache_partial_exec_5_hit",
+            "expert_cache_partial_exec_6_hit",
+            "expert_cache_partial_exec_7_hit",
+            "expert_cache_partial_gpu_routes",
+            "expert_cache_partial_cpu_routes",
+            "expert_cache_partial_activation_d2h_bytes",
+            "expert_cache_partial_cpu_result_h2d_bytes",
+            "expert_cache_partial_weight_h2d_bytes",
+            "expert_cache_partial_partition_us",
+            "expert_cache_partial_activation_d2h_us",
+            "expert_cache_partial_gpu_hit_submit_us",
+            "expert_cache_partial_gpu_hit_elapsed_us",
+            "expert_cache_partial_cpu_miss_compute_us",
+            "expert_cache_partial_cpu_result_h2d_us",
+            "expert_cache_partial_join_wait_gpu_us",
+            "expert_cache_partial_join_wait_cpu_us",
+            "expert_cache_partial_scatter_us",
+            "expert_cache_partial_total_us"
         };
         return fields;
     }
@@ -1868,7 +1908,29 @@ struct test {
             field == "expert_cache_route_ready_dispatches" ||
             field == "expert_cache_route_ready_classifications" ||
             field == "expert_cache_route_ready_full_hits" ||
-            field == "expert_cache_route_ready_fallbacks") {
+            field == "expert_cache_route_ready_fallbacks" ||
+            field == "expert_cache_partial_exec_1_hit" ||
+            field == "expert_cache_partial_exec_2_hit" ||
+            field == "expert_cache_partial_exec_3_hit" ||
+            field == "expert_cache_partial_exec_4_hit" ||
+            field == "expert_cache_partial_exec_5_hit" ||
+            field == "expert_cache_partial_exec_6_hit" ||
+            field == "expert_cache_partial_exec_7_hit" ||
+            field == "expert_cache_partial_gpu_routes" ||
+            field == "expert_cache_partial_cpu_routes" ||
+            field == "expert_cache_partial_activation_d2h_bytes" ||
+            field == "expert_cache_partial_cpu_result_h2d_bytes" ||
+            field == "expert_cache_partial_weight_h2d_bytes" ||
+            field == "expert_cache_partial_partition_us" ||
+            field == "expert_cache_partial_activation_d2h_us" ||
+            field == "expert_cache_partial_gpu_hit_submit_us" ||
+            field == "expert_cache_partial_gpu_hit_elapsed_us" ||
+            field == "expert_cache_partial_cpu_miss_compute_us" ||
+            field == "expert_cache_partial_cpu_result_h2d_us" ||
+            field == "expert_cache_partial_join_wait_gpu_us" ||
+            field == "expert_cache_partial_join_wait_cpu_us" ||
+            field == "expert_cache_partial_scatter_us" ||
+            field == "expert_cache_partial_total_us") {
             return INT;
         }
         return STRING;
@@ -2001,7 +2063,29 @@ struct test {
                                             std::to_string(expert_cache_stats.n_route_ready_dispatches),
                                             std::to_string(expert_cache_stats.n_route_ready_classifications),
                                             std::to_string(expert_cache_stats.n_route_ready_full_hits),
-                                            std::to_string(expert_cache_stats.n_route_ready_fallbacks) };
+                                            std::to_string(expert_cache_stats.n_route_ready_fallbacks),
+                                            std::to_string(expert_cache_stats.hetero_partial_exec_by_hits[1]),
+                                            std::to_string(expert_cache_stats.hetero_partial_exec_by_hits[2]),
+                                            std::to_string(expert_cache_stats.hetero_partial_exec_by_hits[3]),
+                                            std::to_string(expert_cache_stats.hetero_partial_exec_by_hits[4]),
+                                            std::to_string(expert_cache_stats.hetero_partial_exec_by_hits[5]),
+                                            std::to_string(expert_cache_stats.hetero_partial_exec_by_hits[6]),
+                                            std::to_string(expert_cache_stats.hetero_partial_exec_by_hits[7]),
+                                            std::to_string(expert_cache_stats.hetero_partial_gpu_routes_executed),
+                                            std::to_string(expert_cache_stats.hetero_partial_cpu_routes_executed),
+                                            std::to_string(expert_cache_stats.hetero_partial_activation_d2h_bytes),
+                                            std::to_string(expert_cache_stats.hetero_partial_cpu_result_h2d_bytes),
+                                            std::to_string(expert_cache_stats.hetero_partial_weight_h2d_bytes),
+                                            std::to_string(expert_cache_stats.hetero_partial_partition_us),
+                                            std::to_string(expert_cache_stats.hetero_partial_activation_d2h_us),
+                                            std::to_string(expert_cache_stats.hetero_partial_gpu_hit_submit_us),
+                                            std::to_string(expert_cache_stats.hetero_partial_gpu_hit_elapsed_us),
+                                            std::to_string(expert_cache_stats.hetero_partial_cpu_miss_compute_us),
+                                            std::to_string(expert_cache_stats.hetero_partial_cpu_result_h2d_us),
+                                            std::to_string(expert_cache_stats.hetero_partial_join_wait_gpu_us),
+                                            std::to_string(expert_cache_stats.hetero_partial_join_wait_cpu_us),
+                                            std::to_string(expert_cache_stats.hetero_partial_scatter_us),
+                                            std::to_string(expert_cache_stats.hetero_partial_total_us) };
         return values;
     }
 
@@ -2009,6 +2093,7 @@ struct test {
         std::map<std::string, std::string> map;
         auto                               fields = get_fields();
         auto                               values = get_values();
+        GGML_ASSERT(fields.size() == values.size());
         std::transform(fields.begin(), fields.end(), values.begin(), std::inserter(map, map.end()),
                        std::make_pair<const std::string &, const std::string &>);
         return map;
