@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="run the fixed Compact route-ready sidecar measurement matrix",
     )
+    parser.add_argument("--hetero-concurrent", choices=(0, 1), type=int, default=0)
     return parser.parse_args()
 
 
@@ -73,6 +74,13 @@ def run_order(cache_first: bool) -> tuple[bool, bool]:
     return (True, False) if cache_first else (False, True)
 
 
+def bench_environment(args: argparse.Namespace) -> dict[str, str]:
+    return os.environ | {
+        "GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL": "0",
+        "GGML_EXPERT_CACHE_HETERO_CONCURRENT": str(args.hetero_concurrent),
+    }
+
+
 def main() -> int:
     args = parse_args()
     if args.route_ready_sidecar:
@@ -102,7 +110,10 @@ def main() -> int:
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = args.prefix or datetime.now(UTC).strftime("%Y-%m-%d-tg-matrix")
-    environment = os.environ | {"GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL": "0"}
+    environment = bench_environment(args)
+
+
+    environment = bench_environment(args)
 
     for run in range(1, args.runs + 1):
         for cache_enabled in run_order(args.cache_first):

@@ -50,5 +50,26 @@ class BenchCommandTest(unittest.TestCase):
         self.assertEqual(run_tg_matrix.run_order(cache_first=False), (False, True))
 
 
+class BenchEnvironmentTest(unittest.TestCase):
+    def test_environment_forces_experimental_off_and_selects_concurrent(self):
+        args = Namespace(hetero_concurrent=1)
+        environment = run_tg_matrix.bench_environment(args)
+
+        self.assertEqual(environment["GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL"], "0")
+        self.assertEqual(environment["GGML_EXPERT_CACHE_HETERO_CONCURRENT"], "1")
+
+    def test_environment_defaults_concurrent_off(self):
+        args = Namespace(hetero_concurrent=0)
+        environment = run_tg_matrix.bench_environment(args)
+
+        self.assertEqual(environment["GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL"], "0")
+        self.assertEqual(environment["GGML_EXPERT_CACHE_HETERO_CONCURRENT"], "0")
+
+    def test_environment_inherits_parent_variables(self):
+        args = Namespace(hetero_concurrent=1)
+        environment = run_tg_matrix.bench_environment(args)
+
+        self.assertIn("PATH", environment)
+
 if __name__ == "__main__":
     unittest.main()
