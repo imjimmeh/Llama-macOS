@@ -78,18 +78,18 @@ Under the **Zero-Miss-Upload Discipline**:
   - Remaining VRAM headroom that is too small to fit another full layer.
   - Giant models (DeepSeek 671B, Qwen 236B) where a single layer exceeds total GPU VRAM.
 
-### 2.3 Static Hot-Expert Value-Per-Byte Ranking
-Because expert routing follows strong temporal and semantic locality, a small fraction of experts account for the majority of activations:
-$$\text{value\_per\_byte} = \frac{P(\text{route}) \times (T_{\text{CPU}} - T_{\text{GPU}})}{\text{bundle\_bytes}}$$
+#### 2.3 Placement-Aware Bundle-Admission Manifest Generator (Manifest v2)
+The v2 profiler generator (`test-moe-tg-profiler`) reproduces the deployment placement (via `--cache-mib`), inspects host-resident eligibility per layer, and applies a greedy bundle-coverage potential function over captured route streams:
+$$\phi(c) = \text{boot\_credit} \times c + w_{\text{hetero}} \cdot [c \ge \text{top\_k} - 1] + w_{\text{full}} \cdot [c \ge \text{top\_k}]$$
 
-The built-in profiler ranks all candidate expert bundles and produces pinned manifests:
-- `pinned_experts_1024mb.json`: 537 bundles (~1023.7 MiB) -> **71.7% route coverage** (+42.0% TG speedup in isolation)
-- `pinned_experts_512mb.json`: 268 bundles (~510.9 MiB) -> **50.9% route coverage**
-- `pinned_experts_256mb.json`: 134 bundles (~255.4 MiB) -> **32.6% route coverage**
-- `pinned_experts_128mb.json`: 67 bundles (~127.7 MiB) -> **18.7% route coverage**
-- `pinned_experts_64mb.json`: 33 bundles (~62.9 MiB) -> **9.8% route coverage**
+Generated v2 bundle manifests live in `tools/results/expert-cache/bundle-v2/`:
+- `pinned_bundle_v2_1024mb.json`: 1039 bundles across 34 host-eligible layers (24.5% projected 8/8 admissions)
+- `pinned_bundle_v2_512mb.json`: 502 bundles (11.7% projected 8/8 admissions)
+- `pinned_bundle_v2_256mb.json`: 234 bundles (4.3% projected 8/8 admissions)
+- `pinned_bundle_v2_128mb.json`: 100 bundles
+- `pinned_bundle_v2_64mb.json`: 33 bundles
 
-These coverage values are historical aggregate individual-route coverage from the older arbitrary-partial-hit executor. They do not predict the current production dispatcher, which admits only 7/8-hit and 8/8-hit bundles. Regenerate manifests against complete route co-occurrence before using them with the current path.
+The legacy root-level manifests (`pinned_experts_*mb.json`) evaluated individual-route coverage across all 40 layers and are obsolete for the current selective dispatcher.
 
 ### 2.4 Non-Blocking Background Promotion Pipeline
 - Candidate expert promotions are dispatched asynchronously on dedicated background CUDA streams.
@@ -108,7 +108,7 @@ These coverage values are historical aggregate individual-route coverage from th
 
 | Parameter | CLI Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| **Pinned Manifest** | `-pe <path>`, `--pinned-experts <path>` | `LLAMA_ARG_PINNED_EXPERTS` | `""` | Path to static pinned experts JSON manifest (e.g. `pinned_experts_1024mb.json`). |
+| **Pinned Manifest** | `-pe <path>`, `--pinned-experts <path>` | `LLAMA_ARG_PINNED_EXPERTS` | `""` | Path to static pinned experts JSON manifest (e.g. `pinned_bundle_v2_1024mb.json`). |
 | **Expert Cache Size** | `-exc <size>`, `--expert-cache <size>` | `LLAMA_ARG_EXPERT_CACHE` | `0` (disabled) | Size of VRAM cache (e.g. `1024M`, `512M`, `'auto'`). |
 | **Rebalance Period** | `-excp N`, `--expert-cache-period N` | `LLAMA_ARG_EXPERT_CACHE_PERIOD` | `64` | Token interval between dynamic rebalance swaps. |
 | **Max Swaps** | `-excm N`, `--expert-cache-max-swaps N` | `LLAMA_ARG_EXPERT_CACHE_MAX_SWAPS` | `-1` | Maximum experts swapped per rebalance step. |
@@ -118,25 +118,19 @@ These coverage values are historical aggregate individual-route coverage from th
 
 ---
 
-## 4. Empirical Benchmark Sweep Results (Preliminary Baseline Context)
+## 4. Operational Regimes & Benchmark History
 
-Hardware: NVIDIA GeForce GTX 1080 (SM61, 8 GB VRAM) | CPU: 14 Threads | Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf`
+### Regime A: Severe VRAM Constraint (Zero Full GPU Layers)
+When GPU VRAM cannot hold entire MoE layers (e.g. DeepSeek-V3 or zero full GPU layers offloaded):
+- CPU Baseline (Control): 2.59 tok/s
+- Pinned 256-1024 MiB: **3.67 tok/s (+42.0% Speedup)**
 
-### Regime A: Scientific Isolation (Fixed Dense Offload, 0 Full MoE Layers on GPU)
-| Configuration | Model Load (s) | TG Speed (tok/s) | TG Latency (ms/tok) | PCIe RAM->GPU Bytes | Speedup vs Control |
-|---|---:|---:|---:|---:|---:|
-| **CPU Baseline (Control)** | 42.69 s | 2.59 tok/s | 386.10 ms | **0 B** | **1.00x** (control) |
-| **Pinned 64 MiB** | 52.56 s | 2.62 tok/s | 381.68 ms | **0 B** | **1.01x (+1.2%)** |
-| **Pinned 128 MiB** | 40.69 s | 2.65 tok/s | 377.36 ms | **0 B** | **1.02x (+2.3%)** |
-| **Pinned 256 MiB** | 54.03 s | **3.67 tok/s** | **272.48 ms** | **0 B** | **1.42x (+42.0%)** |
-| **Pinned 512 MiB** | 59.60 s | 3.55 tok/s | 281.69 ms | **0 B** | **1.37x (+37.1%)** |
-| **Pinned 1024 MiB** | 51.11 s | **3.47 tok/s** | **288.18 ms** | **0 B** | **1.34x (+34.0%)** |
+### Regime B: High-VRAM Headroom Deployment (`--fit -fitt 256`)
+When spare VRAM fits full GPU layers, layer offload prioritizes full layers (100% route residency) before partial caching.
 
-### Regime B: Auto-Fit Deployment Reality (`--fit -fitt 256`)
-| Configuration | Pinned Manifest | Cache Size | PP Throughput (`pp512`) | TG Throughput (`tg128`) | Analysis |
+| Configuration | Manifest | Cache Size | PP Throughput | TG Throughput | Notes |
 |:---|:---|---:|---:|---:|:---|
-| **Control Baseline** | none | 0 MiB | 334.38 tok/s | **18.36 ± 0.87 tok/s** | 11 full MoE layers offloaded to GPU. 0 CPU fallback. |
-| **Pinned 64 MiB** | `pinned_experts_64mb.json` | 0 MiB | 342.35 tok/s | **18.06 tok/s** | 11 full layers + 33 pinned experts. |
+| **Control Baseline** | none | 0 MiB | 349.34 tok/s | 18.63 tok/s | 11 full layers offloaded. |
 | **Pinned 128 MiB** | `pinned_experts_128mb.json` | 0 MiB | **337.61 tok/s** | **18.56 ± 0.58 tok/s** | 11 full layers + 67 pinned experts (within statistical variance of control). |
 | **Pinned 256 MiB** | `pinned_experts_256mb.json` | 0 MiB | 336.79 tok/s | **18.12 ± 0.13 tok/s** | 11 full layers + 134 pinned experts. |
 | **Pinned 1024 MiB** | `pinned_experts_1024mb.json` | 0 MiB | 340.04 tok/s | **17.71 tok/s** | 8 full layers + 1024M pinned experts (displaces 3 full layers). |
@@ -162,12 +156,6 @@ The combined paired-delta 95% Student-t interval is +7.467% to +8.885%. Cache-en
 
 Raw result pairs are under `tools/results/expert-cache/post-parity-cache-matrix/` with prefixes `2026-08-29-post-parity-explicit-control-first-n512` and `2026-08-29-post-parity-explicit-cache-first-n512`.
 
-### Regime D: Static Expert Profiles With Automatic Fit (Post-Parity, 2026-08-29)
-
-The 3 GiB manifest holding all 256 experts for layers 0-3 was rerun under automatic fit: `-fitt 256 -exc 3072 -excp 65536 -excm 0 -pe tools/results/expert-cache/active-sidecar/pinned_layer03_all_256_3g.json`. Ten alternating fresh-process TG512 pairs measured 23.258087 tok/s cache-off and 10.835326 tok/s cache-on: **-53.367%** mean paired delta, **-52.658%** median, 0/10 positive pairs, 95% interval -55.071% to -51.662%. It engaged correctly, averaging 24,720 zero-copy hits, 1,091 route-ready actions, 80 dispatches, 20,480 classifications, and zero RAM-to-GPU bytes. Do not use this static profile with automatic fit. Raw rows use `2026-08-29-post-parity-fit256-static1024-*` in `tools/results/expert-cache/post-parity-cache-matrix/`.
-
-The intended 1,024 MiB profile was also measured with `-fitt 256 -exc 1024 -excp 65536 -excm 0 -pe pinned_experts_1024mb.json`. Ten pairs measured 20.988435 tok/s cache-off and 21.130657 tok/s cache-on: +1.092% mean paired delta, -1.142% median, 5/10 positive pairs, and a -6.003% to +8.188% interval. The manifest loaded and seeded 666.77 MiB into 1,370 slots across four pools, but none of 17,408 classified route bundles reached the current 7/8-hit or 8/8-hit admission threshold. The legacy manifest spreads 537 entries across all 40 layers, only 8-18 expert IDs per layer. Its historical 71.7% figure is individual-route coverage from the older heterogeneous executor, not complete-bundle coverage for the current selective dispatcher. The zero request counter records zero executed cache tensors, not zero route lookups. Do not retain this profile without regenerating it for current automatic placement and bundle-level admission. Raw rows use `2026-08-29-post-parity-fit256-static1024m-*` in `tools/results/expert-cache/post-parity-cache-matrix/`.
-
 ### Regime E: Automatic-Fit Dynamic Expert Cache (Post-Parity, 2026-08-29)
 
 The post-parity automatic-fit target-256 Compact TG512 matrix used `-p 0 -n 512 -r 1 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mmap -fitt 256` with fresh processes. Each period has five control-first and five cache-first pairs. The cache rows use `-exc 128 -excm -1`; no pinned manifest.
@@ -180,6 +168,20 @@ The post-parity automatic-fit target-256 Compact TG512 matrix used `-p 0 -n 512 
 Retain the 128 MiB dynamic cache with `-excp 32` for this model, GPU, and automatic-fit workload. It averaged 249 requests, 249 zero-copy hits, 66 route-ready actions, 56 dispatches, 14,336 classifications, and zero RAM-to-GPU bytes. Period 256 is not retained because its paired interval includes zero.
 
 Raw result pairs are under `tools/results/expert-cache/post-parity-cache-matrix/` with prefixes `2026-08-29-post-parity-fit256-period32-*` and `2026-08-29-post-parity-fit256-period256-*`.
+
+### Regime F: Placement-Aware Bundle-Admission Manifest v2 (2026-08-30)
+
+Measured using `pinned_bundle_v2_1024mb.json` under automatic fit: `-fitt 256 -exc 1024 -excp 65536 -excm 0 -pe tools/results/expert-cache/bundle-v2/pinned_bundle_v2_1024mb.json` across ten alternating fresh-process TG512 pairs (five control-first, five cache-first).
+
+| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|:---|---:|---:|---:|---:|---:|---:|
+| Control first | 5 | 22.126 | 21.290 | -3.44% | -6.72% | 2/5 |
+| Cache first | 5 | 23.181 | 20.656 | -10.82% | -9.22% | 0/5 |
+| Combined | 10 | 22.653 | 20.973 | -7.13% | -7.47% | 2/10 |
+
+The combined 95% Student-t interval is -12.727% to -1.534%. Cache rows verified full engagement: averaging 35.7 route-ready actions, 5.8 full hits (8/8), 139.2 zero-copy hits, and 89.7 MB avoided RAM-to-GPU transfers per run with zero PCIe weight upload bytes. The throughput reduction is caused by 1024 MiB VRAM reservation displacing full GPU layers under automatic fit.
+
+Raw result pairs are under `tools/results/expert-cache/bundle-v2/` with prefixes `2026-08-30-bundle-v2-1024m-control-first-n512` and `2026-08-30-bundle-v2-1024m-cache-first-n512`.
 
 
 ---

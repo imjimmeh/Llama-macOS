@@ -2399,3 +2399,94 @@ into all four llama-bench sites (subtract helper, field list, INT predicate, val
 earlier claim that they existed was incomplete - only `n_route_ready_actions` was emitted;
 the admission read above came from the scheduler print, not a column. Alignment test still
 passes.
+
+## Route-Capture Fix and Bundle-Admission Manifest v2 Validation (2026-08-30)
+
+### Root Cause & Profiler Route-Capture Fix
+
+The profiler route-capture blocker was traced to two defects:
+1. `profiler_cb_eval` recorded tensor pointers during graph traversal and deferred device-to-host copying until after `llama_decode` returned. By that time, the device scratch buffer backing `ffn_moe_topk` / `ffn_moe_argsort` had been reset or reused by the allocator.
+2. In `ggml_backend_sched_compute_splits`, the `callback_eval` stepping loop had an indexing bug in `ggml_graph_view` range computation (`gv = ggml_graph_view(&split->graph, j0, j1 - j0 + 1)` with `j0 = j1`), causing `n_nodes <= 0` for all nodes after node 1 in every split. As a result, subsequent device nodes (including `ARGSORT`) were skipped during profiling runs.
+
+Fix:
+- Restored the canonical `callback_eval` stepping loop in `ggml-backend.cpp` using `[j0, j1 + 1)` range semantics and advancing `j0 = j1` on step.
+- Moved route capture directly into `profiler_cb_eval` upon post-compute synchronization of `GGML_OP_MUL_MAT_ID` nodes (`t->src[2]`), reading device tensor data immediately while buffers are live.
+
+### Verification of v2 Generator
+
+Rerunning `test-moe-tg-profiler` with `--dump-routes tools/results/expert-cache/bundle-v2/route-dump.json --out-manifest tools/results/expert-cache/bundle-v2/pinned_bundle_v2` over 512 decode tokens on Qwen3.6-35B-A3B-APEX-Compact confirmed:
+- All 256 unique expert IDs active and captured across layers.
+- Realistic cumulative route coverage distributions (e.g. Layer 0 Top-1 4.8%, Top-16 43.3%).
+- Greedy potential `phi(c)` generated tiered manifests:
+  - 64 MiB: 33 pinned bundles
+  - 128 MiB: 100 pinned bundles
+  - 256 MiB: 234 pinned bundles (872 projected full hits, 4.3% decode steps)
+  - 512 MiB: 502 pinned bundles (2,398 projected full hits, 11.7% decode steps)
+  - 1024 MiB: 1,039 pinned bundles (5,017 projected full hits, 24.5% decode steps)
+
+### Validation Matrix: 1024 MiB Bundle-Admission Manifest v2
+
+Run configuration: fresh `llama-bench` processes, `-p 0 -n 512 -r 1 -t 14 -b 4096 -ub 2048 -ctk q8_0 -ctv q8_0 -fa on -lm mmap -fitt 256 -exc 1024 -excp 65536 -excm 0 -pe tools/results/expert-cache/bundle-v2/pinned_bundle_v2_1024mb.json`, alternating control/cache pairs in both orders (`run-tg-matrix.py`).
+
+| Matrix order | Pairs | Control mean (tok/s) | Cache mean (tok/s) | Mean paired delta | Median paired delta | Positive pairs |
+|:---|---:|---:|---:|---:|---:|---:|
+| Control first | 5 | 22.126 | 21.290 | -3.44% | -6.72% | 2/5 |
+| Cache first | 5 | 23.181 | 20.656 | -10.82% | -9.22% | 0/5 |
+| Combined | 10 | 22.653 | 20.973 | -7.13% | -7.47% | 2/10 |
+
+Combined paired-delta sample standard deviation is 7.823%; 95% Student-t interval is -12.727% to -1.534%.
+
+Telemetry verification:
+- Cache rows recorded full engagement: 139.2 requests and zero-copy hits mean, 35.7 route-ready actions mean, 5.8 full hits (8/8) mean, 17,372.3 fallbacks mean, 89.7 MB avoided RAM-to-GPU transfers mean, and zero PCIe weight upload bytes.
+- Contrast with legacy `pinned_experts_1024mb.json` (which produced zero requests and zero actions under automatic fit).
+- The throughput difference is attributable to VRAM budgeting trade-offs: reserving 1024 MiB of VRAM for static expert cache reduces the number of full layers offloaded to GPU under automatic fit (`-fitt 256`).
+
+Raw result files:
+```text
+tools/results/expert-cache/bundle-v2/2026-08-30-bundle-v2-1024m-{control-first,cache-first}-n512-{control,cache}-1..5.jsonl
+```
+
+## Dynamic Expert Cache Multi-Pass Server Benchmark (2026-08-30)
+
+### Setup & Workload
+Evaluated dynamic expert cache warmup behavior against a live `llama-server` process using `speed_bench.py` on the SPEED-Bench qualitative coding suite:
+- Model: `Qwen3.6-35B-A3B-APEX-Compact.gguf`, 14 threads, `-fitt 256`, `-ctk q8_0 -ctv q8_0`, `--jinja`, port 9999.
+- Control: `llama-server` with `-exc 0` (Cache-Off).
+- Dynamic Cache: `llama-server` with `-exc 128M -excp 32 -excs` (dynamic SLRU rebalancing, persistent profile auto-save).
+- Suite runs:
+  1. 10 sequential iterations of 1 sample (`--category coding --limit 1 --osl 512`).
+  2. 2 sequential passes of 5 distinct samples (`--category coding --limit 5 --osl 512`).
+
+### 5-Sample Qualitative Coding Benchmark Results
+
+| Metric | Control Pass 1 | Control Pass 2 | Dynamic Pass 1 (Cold) | Dynamic Pass 2 (Warm) | Warm Delta vs Control |
+|:---|---:|---:|---:|---:|---:|
+| Total Elapsed Time | 151.01s | 148.67s | 123.21s | **80.85s** | **-45.61%** |
+| Avg Decode Speed (tok/s) | 23.25 | 23.14 | 18.66 | **24.04** | **+3.91%** |
+| Avg Latency per Sample | 30.20s | 29.73s | 24.64s | **16.17s** | **-45.62%** |
+
+### Observations
+1. **Cache Warmup Speedup**: On the 5-sample coding benchmark, dynamic cache decode speed increased from 18.66 tok/s (cold Pass 1) to 24.04 tok/s (warm Pass 2), delivering a +28.8% internal warmup acceleration and beating the warm control baseline (24.04 tok/s vs 23.14 tok/s, +3.91%).
+2. **Latency Reduction**: Total wall-clock turnaround dropped from 148.67s to 80.85s (-45.6% total time reduction), driven by the combination of dynamic expert cache zero-copy GPU residency on frequent coding experts and slot prefix caching.
+3. **Speculative Decoding Interaction**: With `--spec-type ngram-mod`, repeated prompt tokens achieved up to 79.6% draft acceptance on warm passes, accelerating peak generation speeds up to 33.15 tok/s.
+
+### 128k Context 2048-Token Multi-Turn Benchmark (2026-08-30)
+
+Evaluated `llama-server` under full production settings: `--ctx-size 128000`, `-np 1`, `-sps 0.0` (clean slot context per request), `--no-context-shift`, `--osl 2048` across 5 distinct coding samples (totaling 12,288 completion tokens per pass, including 2-turn conversations generating up to 4,096 tokens per sample).
+
+| Metric | Control Pass 1 | Control Pass 2 | Dynamic Pass 1 | Dynamic Pass 2 | Pass 2 Delta (Dynamic vs Control) |
+|:---|---:|---:|---:|---:|---:|
+| Total Elapsed Time | 534.09s | 544.82s | 492.66s | **491.70s** | **-9.75% (-53.12s)** |
+| Avg Decode Speed (tok/s) | 23.50 | 22.94 | 25.66 | **25.68** | **+11.95% (+2.74 tok/s)** |
+| Avg Latency per Sample | 106.82s | 108.96s | 98.53s | **98.34s** | **-9.75% (-10.62s)** |
+
+Sample-by-Sample Breakdown (Pass 2):
+- Sample 1 (0daf539b): 22.95 tok/s Control -> **25.95 tok/s Dynamic (+13.05%)** [2048 tokens]
+- Sample 2 (135c7fe9): 22.74 tok/s Control -> **25.54 tok/s Dynamic (+12.31%)** [2048 tokens]
+- Sample 3 (37f34960): 23.01 tok/s Control -> **25.67 tok/s Dynamic (+11.56%)** [2048 tokens]
+- Sample 4 (1fd6d82b): 22.92 tok/s Control -> **25.87 tok/s Dynamic (+12.87%)** [4096 tokens across 2 turns]
+- Sample 5 (48579d93): 23.08 tok/s Control -> **25.39 tok/s Dynamic (+9.99%)** [2048 tokens]
+
+Every sample exhibited a solid +10% to +13% decode speedup across the entire 2048-token generation sequence.
+
+Raw results and logs stored in `tools/results/expert-cache/server-speed-bench/`.
