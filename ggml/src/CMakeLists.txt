@@ -218,6 +218,10 @@ set_target_properties(ggml-base PROPERTIES
 )
 
 target_include_directories(ggml-base PRIVATE .)
+
+if (LLAMA_BUILD_TESTS)
+    target_compile_definitions(ggml-base PRIVATE GGML_TEST)
+endif()
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()

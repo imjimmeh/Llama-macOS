@@ -205,6 +205,11 @@ extern "C" {
 
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
+    typedef bool (*ggml_backend_event_elapsed_us_t)(
+            ggml_backend_event_t start,
+            ggml_backend_event_t end,
+            uint64_t * elapsed_us);
+
     // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
@@ -319,6 +324,19 @@ extern "C" {
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+
+#ifdef GGML_TEST
+    struct ggml_backend_sched_partial_executor_test_state {
+        int32_t n_route_ready_dispatches;
+        int32_t n_partial_executors;
+        bool all_dispatches_share_executor;
+    };
+
+    GGML_API bool ggml_backend_sched_get_partial_executor_test_state(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_partial_executor_test_state * state);
+#endif
+
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
@@ -448,6 +466,23 @@ extern "C" {
         uint64_t hetero_merge_us;
         uint64_t hetero_wait_us;
         uint64_t hetero_partial_distribution[8];
+
+        uint64_t hetero_partial_exec_by_hits[9];
+        uint64_t hetero_partial_gpu_routes_executed;
+        uint64_t hetero_partial_cpu_routes_executed;
+        size_t   hetero_partial_activation_d2h_bytes;
+        size_t   hetero_partial_cpu_result_h2d_bytes;
+        size_t   hetero_partial_weight_h2d_bytes;
+        uint64_t hetero_partial_partition_us;
+        uint64_t hetero_partial_activation_d2h_us;
+        uint64_t hetero_partial_gpu_hit_submit_us;
+        uint64_t hetero_partial_gpu_hit_elapsed_us;
+        uint64_t hetero_partial_cpu_miss_compute_us;
+        uint64_t hetero_partial_cpu_result_h2d_us;
+        uint64_t hetero_partial_join_wait_gpu_us;
+        uint64_t hetero_partial_join_wait_cpu_us;
+        uint64_t hetero_partial_scatter_us;
+        uint64_t hetero_partial_total_us;
     };
 
     GGML_API void                 ggml_backend_sched_set_expert_cache_prefetch(ggml_backend_sched_t sched, bool enabled);

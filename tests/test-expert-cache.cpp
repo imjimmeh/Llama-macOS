@@ -1341,6 +1341,531 @@ static void test_hit_mask_matrix_partitioning() {
 
     printf("  hit-mask matrix partitioning tests passed\n");
 }
+static void test_partial_route_snapshot_validation() {
+    printf("testing partial route snapshot validation...\n");
+
+    struct ggml_moe_partial_route_snapshot snapshot = {};
+    const int32_t hit_positions[] = { 0, 2, 3, 4, 5, 6, 7 };
+    snapshot.n_hits = 7;
+    snapshot.n_misses = 1;
+    for (int32_t i = 0; i < snapshot.n_hits; ++i) {
+        snapshot.hits[i].route = hit_positions[i];
+        snapshot.hits[i].bundle_resident = true;
+    }
+    snapshot.misses[0].route = 1;
+    require(ggml_moe_partial_route_snapshot_is_valid(&snapshot, 8));
+
+    require(ggml_moe_partial_executor_execute(nullptr, nullptr, nullptr, &snapshot, nullptr, nullptr) ==
+        GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED);
+
+    snapshot.misses[0].route = 7;
+    require(!ggml_moe_partial_route_snapshot_is_valid(&snapshot, 8));
+    snapshot.misses[0].route = 1;
+    snapshot.hits[0].route = 1;
+    require(!ggml_moe_partial_route_snapshot_is_valid(&snapshot, 8));
+    snapshot.hits[0].route = 0;
+    snapshot.hits[0].bundle_resident = false;
+    require(!ggml_moe_partial_route_snapshot_is_valid(&snapshot, 8));
+
+    printf("  partial route snapshot validation tests passed\n");
+}
+
+static void test_partial_executor_persistence() {
+    printf("testing partial executor persistent state...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_tensor * up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu_device);
+    require(host_buft != nullptr);
+    ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, host_buft);
+    require(weights_buffer != nullptr);
+
+    struct ggml_expert_bundle_weights weights = {
+        gate,
+        up,
+        down,
+        nullptr,
+        false,
+    };
+    ggml_moe_partial_executor_t executor = ggml_moe_partial_executor_new(
+        gpu_backend, cpu_backend, &weights, 2, 2, GGML_MOE_PARTIAL_MAX_ROUTES, false);
+    require(executor != nullptr);
+
+    struct ggml_moe_partial_executor_test_state state = {};
+    require(ggml_moe_partial_executor_get_test_state(executor, &state));
+    for (int32_t i = 0; i < GGML_MOE_PARTIAL_MAX_ROUTES - 1; ++i) {
+        require(state.gpu_variants[i]);
+        require(state.cpu_variants[i]);
+    }
+    require(state.has_merge_buffer);
+    require(state.has_cpu_upload_buffer);
+    require(state.exchange_buffer != nullptr);
+    require(ggml_backend_buffer_get_type(state.exchange_buffer) == host_buft);
+    for (bool event : state.events) {
+        require(event);
+    }
+
+    ggml_moe_partial_executor_free(executor);
+    ggml_backend_buffer_free(weights_buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  partial executor persistent state tests passed\n");
+}
+
+static void test_partial_executor_scheduler_catalog() {
+    printf("testing partial executor scheduler catalog...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * gate_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_tensor * up_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_tensor * down_a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_tensor * gate_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_tensor * up_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_tensor * down_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_set_name(gate_a, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(up_a, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down_a, "blk.0.ffn_down_exps.weight");
+    ggml_set_name(gate_b, "blk.1.ffn_gate_exps.weight");
+    ggml_set_name(up_b, "blk.1.ffn_up_exps.weight");
+    ggml_set_name(down_b, "blk.1.ffn_down_exps.weight");
+
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 1, 1);
+    ggml_tensor * route_input_a = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 8, 1);
+    ggml_tensor * route_input_b = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 8, 1);
+    ggml_tensor * ids_a = ggml_dup(ctx, route_input_a);
+    ggml_tensor * ids_b = ggml_dup(ctx, route_input_b);
+    ggml_tensor * gate_out_a = ggml_mul_mat_id(ctx, gate_a, input, ids_a);
+    ggml_tensor * up_out_a = ggml_mul_mat_id(ctx, up_a, input, ids_a);
+    ggml_tensor * gate_out_b = ggml_mul_mat_id(ctx, gate_b, input, ids_b);
+    ggml_tensor * up_out_b = ggml_mul_mat_id(ctx, up_b, input, ids_b);
+    ggml_tensor * output_a = ggml_mul_mat_id(ctx, down_a, ggml_swiglu_split(ctx, gate_out_a, up_out_a), ids_a);
+    ggml_tensor * output_b = ggml_mul_mat_id(ctx, down_b, ggml_swiglu_split(ctx, gate_out_b, up_out_b), ids_b);
+    ggml_tensor * output = ggml_add(ctx, output_a, output_b);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
+    require(buffer != nullptr);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    require(sched != nullptr);
+    ggml_backend_sched_set_expert_cache(sched, 1024 * 1024);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_a, up_a, down_a);
+    ggml_backend_sched_register_expert_bundle(sched, 1, gate_b, up_b, down_b);
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    require(ggml_backend_sched_alloc_graph(sched, graph));
+
+    struct ggml_backend_sched_partial_executor_test_state state = {};
+    require(ggml_backend_sched_get_partial_executor_test_state(sched, &state));
+    require(state.n_route_ready_dispatches == 2);
+    require(state.n_partial_executors == 1);
+    require(state.all_dispatches_share_executor);
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  partial executor scheduler catalog tests passed\n");
+}
+
+static void test_partial_executor_exact_mask(
+        ggml_backend_dev_t gpu_device,
+        const char * mask) {
+    const int32_t d_model = 2;
+    const int32_t d_ff = 2;
+    const int32_t top_k = GGML_MOE_PARTIAL_MAX_ROUTES;
+    const int32_t n_experts = GGML_MOE_PARTIAL_MAX_ROUTES;
+    int32_t n_hits = 0;
+    for (int32_t route = 0; route < top_k; ++route) {
+        require(mask[route] == 'G' || mask[route] == 'C');
+        n_hits += mask[route] == 'G';
+    }
+    require(n_hits > 0 && n_hits < top_k);
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * gate_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, d_ff, n_experts);
+    ggml_tensor * up_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, d_ff, n_experts);
+    ggml_tensor * down_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_ff, d_model, n_experts);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, 1, 1);
+    ggml_tensor * route_input = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, 1);
+    ggml_tensor * route_ids = ggml_dup(ctx, route_input);
+    ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(up_weights, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down_weights, "blk.0.ffn_down_exps.weight");
+
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, input, route_ids);
+    ggml_tensor * up = ggml_mul_mat_id(ctx, up_weights, input, route_ids);
+    ggml_tensor * activation = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * output = ggml_mul_mat_id(ctx, down_weights, activation, route_ids);
+
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu_device);
+    require(host_buft != nullptr);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, host_buft);
+    require(buffer != nullptr);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<float> gate_data((size_t) d_model * d_ff * n_experts, 0.0f);
+    std::vector<float> up_data((size_t) d_model * d_ff * n_experts, 0.0f);
+    std::vector<float> down_data((size_t) d_ff * d_model * n_experts, 0.0f);
+    for (int32_t expert = 0; expert < n_experts; ++expert) {
+        const size_t offset = (size_t) expert * d_model * d_ff;
+        gate_data[offset + 0] = 0.5f + 0.125f * expert;
+        gate_data[offset + 3] = 0.5f + 0.125f * expert;
+        up_data[offset + 0] = 0.75f + 0.0625f * expert;
+        up_data[offset + 3] = 0.75f + 0.0625f * expert;
+        down_data[offset + 0] = 1.0f + 0.25f * expert;
+        down_data[offset + 3] = 1.0f + 0.25f * expert;
+    }
+    const float input_data[] = { 1.0f, 2.0f };
+    const int32_t route_data[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    ggml_backend_tensor_set(gate_weights, gate_data.data(), 0, ggml_nbytes(gate_weights));
+    ggml_backend_tensor_set(up_weights, up_data.data(), 0, ggml_nbytes(up_weights));
+    ggml_backend_tensor_set(down_weights, down_data.data(), 0, ggml_nbytes(down_weights));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    ggml_backend_tensor_set(route_input, route_data, 0, sizeof(route_data));
+
+    ggml_cgraph * reference_graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(reference_graph, output);
+    require(ggml_backend_graph_compute(cpu_backend, reference_graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> expected(ggml_nelements(output));
+    ggml_backend_tensor_get(output, expected.data(), 0, ggml_nbytes(output));
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(gpu_backend, 4096);
+    require(cache != nullptr);
+    ggml_backend_expert_cache_register_bundle(cache, 0, gate_weights, up_weights, down_weights);
+    for (int32_t route = 0; route < top_k; ++route) {
+        if (mask[route] == 'G') {
+            ggml_backend_expert_cache_seed(cache, gate_weights, route, 1);
+            ggml_backend_expert_cache_seed(cache, up_weights, route, 1);
+            ggml_backend_expert_cache_seed(cache, down_weights, route, 1);
+        }
+    }
+    ggml_backend_synchronize(gpu_backend);
+
+    struct ggml_moe_partial_route_snapshot snapshot = {};
+    require(ggml_backend_expert_cache_partition_bundle_routes(
+        cache, 0, route_data, top_k, 1,
+        snapshot.hits, &snapshot.n_hits, snapshot.misses, &snapshot.n_misses) == n_hits);
+    require(snapshot.n_hits == n_hits);
+    require(snapshot.n_misses == top_k - n_hits);
+    require(ggml_moe_partial_route_snapshot_is_valid(&snapshot, top_k));
+
+    struct ggml_moe_bundle_plan bundle = {};
+    bundle.layer = 0;
+    bundle.kind = GGML_MOE_BUNDLE_SEPARATE_GATE_UP;
+    bundle.route_ids = route_ids;
+    bundle.gate_node = gate;
+    bundle.up_node = up;
+    bundle.act_node = activation;
+    bundle.down_node = output;
+    bundle.layer_input = input;
+    bundle.valid = true;
+
+    struct ggml_expert_bundle_weights weights = {
+        gate_weights,
+        up_weights,
+        down_weights,
+        nullptr,
+        false,
+    };
+    ggml_moe_partial_executor_t executor = ggml_moe_partial_executor_new(
+        gpu_backend, cpu_backend, &weights, d_model, d_ff, top_k, false);
+    require(executor != nullptr);
+
+    struct ggml_moe_partial_activation executor_activation = {
+        input->data,
+        ggml_nbytes(input),
+    };
+    struct ggml_backend_expert_cache_stats stats = {};
+    const bool require_concurrent = n_hits == 7;
+    std::vector<float> sentinel(expected.size(), -99.0f);
+    if (require_concurrent) {
+        ggml_backend_tensor_set(output, sentinel.data(), 0, ggml_nbytes(output));
+        test_original_synchronize = gpu_backend->iface.synchronize;
+        require(test_original_synchronize != nullptr);
+        test_synchronize_calls = 0;
+        gpu_backend->iface.synchronize = test_count_synchronize;
+    }
+    require(ggml_moe_partial_executor_execute(
+        executor, &bundle, cache, &snapshot, &executor_activation, &stats) == GGML_MOE_PARTIAL_EXECUTOR_SUCCESS);
+    if (require_concurrent) {
+        std::vector<float> executor_output(expected.size());
+        ggml_backend_tensor_get(output, executor_output.data(), 0, ggml_nbytes(output));
+        for (size_t i = 0; i < executor_output.size(); ++i) {
+            require(fabsf(executor_output[i] - expected[i]) < 1e-5f);
+        }
+
+        const float alternate_input_data[] = { 2.0f, 1.0f };
+        ggml_backend_tensor_set(input, alternate_input_data, 0, sizeof(alternate_input_data));
+        require(ggml_backend_graph_compute(cpu_backend, reference_graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(output, expected.data(), 0, ggml_nbytes(output));
+        ggml_backend_tensor_set(output, sentinel.data(), 0, ggml_nbytes(output));
+        require(ggml_moe_partial_executor_execute(
+            executor, &bundle, cache, &snapshot, &executor_activation, &stats) == GGML_MOE_PARTIAL_EXECUTOR_SUCCESS);
+        ggml_backend_tensor_get(output, executor_output.data(), 0, ggml_nbytes(output));
+        for (size_t i = 0; i < executor_output.size(); ++i) {
+            require(fabsf(executor_output[i] - expected[i]) < 1e-5f);
+        }
+        gpu_backend->iface.synchronize = test_original_synchronize;
+        require(test_synchronize_calls == 0);
+    }
+    const int32_t execution_count = require_concurrent ? 2 : 1;
+    require(stats.hetero_partial_exec_by_hits[n_hits] == (uint64_t) execution_count);
+    require(stats.hetero_partial_gpu_routes_executed == (uint64_t) execution_count * n_hits);
+    require(stats.hetero_partial_cpu_routes_executed == (uint64_t) execution_count * (top_k - n_hits));
+    require(stats.hetero_partial_weight_h2d_bytes == 0);
+
+    struct ggml_moe_partial_executor_test_state state = {};
+    require(ggml_moe_partial_executor_get_test_state(executor, &state));
+    ggml_tensor * gpu_output = state.gpu_outputs[n_hits - 1];
+    ggml_tensor * cpu_output = state.cpu_outputs[snapshot.n_misses - 1];
+    require(gpu_output != nullptr);
+    require(cpu_output != nullptr);
+    std::vector<float> packed_gpu((size_t) n_hits * d_model);
+    std::vector<float> packed_cpu((size_t) snapshot.n_misses * d_model);
+    ggml_backend_tensor_get(gpu_output, packed_gpu.data(), 0, packed_gpu.size() * sizeof(float));
+    ggml_backend_tensor_get(cpu_output, packed_cpu.data(), 0, packed_cpu.size() * sizeof(float));
+
+    std::vector<float> actual(expected.size(), 0.0f);
+    for (int32_t i = 0; i < snapshot.n_hits; ++i) {
+        memcpy(actual.data() + (size_t) snapshot.hits[i].route * d_model,
+            packed_gpu.data() + (size_t) i * d_model, (size_t) d_model * sizeof(float));
+    }
+    for (int32_t i = 0; i < snapshot.n_misses; ++i) {
+        memcpy(actual.data() + (size_t) snapshot.misses[i].route * d_model,
+            packed_cpu.data() + (size_t) i * d_model, (size_t) d_model * sizeof(float));
+    }
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+
+    ggml_moe_partial_executor_free(executor);
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
+static void test_partial_executor_exact_route_paths() {
+    printf("testing partial executor exact route paths...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    const char * masks[] = {
+        "GCCCCCCC",
+        "GGCCCCCC",
+        "GGGCCCCC",
+        "GGGGGCCC",
+        "CGGGGGGG",
+        "GGGGGGGC",
+        "CCGGGGGG",
+        "GGGCGGGC",
+        "GGGGCCCC",
+        "GCGCGCGC",
+        "CCGGGGCC",
+    };
+    for (const char * mask : masks) {
+        test_partial_executor_exact_mask(gpu_device, mask);
+    }
+
+    printf("  partial executor exact route path tests passed\n");
+}
+
+static void test_partial_executor_scheduler_feature_gate() {
+    printf("testing partial executor scheduler feature gate...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    const char * env_name = "GGML_EXPERT_CACHE_HETERO_CONCURRENT";
+    const char * env_prior = getenv(env_name);
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    const int32_t top_k = GGML_MOE_PARTIAL_MAX_ROUTES;
+    ggml_tensor * gate_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, top_k);
+    ggml_tensor * up_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, top_k);
+    ggml_tensor * down_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, top_k);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 1, 1);
+    ggml_tensor * route_input = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, 1);
+    ggml_set_input(input);
+    ggml_set_input(route_input);
+    ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(up_weights, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down_weights, "blk.0.ffn_down_exps.weight");
+
+    ggml_tensor * route_ids = ggml_dup(ctx, route_input);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, input, route_ids);
+    ggml_tensor * up = ggml_mul_mat_id(ctx, up_weights, input, route_ids);
+    ggml_tensor * activation = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * output = ggml_mul_mat_id(ctx, down_weights, activation, route_ids);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
+    require(buffer != nullptr);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<float> gate_data((size_t) 2 * 2 * top_k, 0.0f);
+    std::vector<float> up_data((size_t) 2 * 2 * top_k, 0.0f);
+    std::vector<float> down_data((size_t) 2 * 2 * top_k, 0.0f);
+    for (int32_t expert = 0; expert < top_k; ++expert) {
+        gate_data[(size_t) expert * 4 + 0] = 0.5f + 0.125f * expert;
+        gate_data[(size_t) expert * 4 + 3] = 0.5f + 0.125f * expert;
+        up_data[(size_t) expert * 4 + 0] = 0.75f + 0.0625f * expert;
+        up_data[(size_t) expert * 4 + 3] = 0.75f + 0.0625f * expert;
+        down_data[(size_t) expert * 4 + 0] = 1.0f + 0.25f * expert;
+        down_data[(size_t) expert * 4 + 3] = 1.0f + 0.25f * expert;
+    }
+    const float input_data[] = { 1.0f, 2.0f };
+    const int32_t ids[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    ggml_backend_tensor_set(gate_weights, gate_data.data(), 0, ggml_nbytes(gate_weights));
+    ggml_backend_tensor_set(up_weights, up_data.data(), 0, ggml_nbytes(up_weights));
+    ggml_backend_tensor_set(down_weights, down_data.data(), 0, ggml_nbytes(down_weights));
+    ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
+    ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    require(ggml_backend_graph_compute(cpu_backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> expected(ggml_nelements(output));
+    ggml_backend_tensor_get(output, expected.data(), 0, ggml_nbytes(output));
+
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    require(sched != nullptr);
+    ggml_backend_sched_set_expert_cache(sched, 1024 * 1024);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
+
+    // seven resident experts, one miss: the 7/8 admission mask
+    for (int32_t expert = 0; expert < 7; ++expert) {
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_weights, expert, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, up_weights, expert, 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, down_weights, expert, 1));
+    }
+    ggml_backend_sched_expert_cache_sync(sched);
+    require(ggml_backend_sched_alloc_graph(sched, graph));
+
+    struct ggml_backend_sched_partial_executor_test_state exec_state = {};
+    require(ggml_backend_sched_get_partial_executor_test_state(sched, &exec_state));
+    require(exec_state.n_route_ready_dispatches == 1);
+    require(exec_state.n_partial_executors == 1);
+
+    const float sentinel = -99.0f;
+    std::vector<float> actual(expected.size(), sentinel);
+    ggml_backend_expert_cache_stats baseline = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &baseline));
+
+    // gate off: the existing serial heterogeneous path must serve the 7/8 mask
+    _putenv_s(env_name, "0");
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats serial_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &serial_stats));
+    require(serial_stats.hetero_hit_histogram[7] == baseline.hetero_hit_histogram[7] + 1);
+    require(serial_stats.hetero_partial_exec_by_hits[7] == baseline.hetero_partial_exec_by_hits[7]);
+
+    // gate on: only the concurrent executor may serve the 7/8 mask
+    _putenv_s(env_name, "1");
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats concurrent_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &concurrent_stats));
+    require(concurrent_stats.hetero_partial_exec_by_hits[7] == serial_stats.hetero_partial_exec_by_hits[7] + 1);
+    require(concurrent_stats.hetero_partial_gpu_routes_executed ==
+        serial_stats.hetero_partial_gpu_routes_executed + 7);
+    require(concurrent_stats.hetero_partial_cpu_routes_executed ==
+        serial_stats.hetero_partial_cpu_routes_executed + 1);
+    require(concurrent_stats.hetero_partial_weight_h2d_bytes == 0);
+    require(concurrent_stats.hetero_partial_total_us > 0);
+    require(concurrent_stats.hetero_partial_activation_d2h_bytes == 0);
+    if (env_prior != nullptr) {
+        _putenv_s(env_name, env_prior);
+    } else {
+        _putenv_s(env_name, "");
+    }
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  partial executor scheduler feature gate tests passed\n");
+}
+
+
 
 static void test_multi_token_repeated_experts() {
     printf("testing multi-token repeated expert routing...\n");
@@ -2076,6 +2601,10 @@ static void test_route_ready_cross_split_sidecar() {
     };
     const float input_data[] = { 1.0f, 2.0f, 3.0f };
     const int32_t ids[] = { 0, 1 };
+    const std::vector<float> expected = {
+        0.54829395f, 2.6423912f, 0.0f,
+        0.77807415f, 3.6552930f, 0.0f,
+    };
     ggml_backend_tensor_set(gate_weights, gate_data, 0, sizeof(gate_data));
     ggml_backend_tensor_set(up_weights, up_data, 0, sizeof(up_data));
     ggml_backend_tensor_set(down_weights, down_data, 0, sizeof(down_data));
@@ -2092,12 +2621,17 @@ static void test_route_ready_cross_split_sidecar() {
     ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
     require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
 
-    std::vector<float> expected(ggml_nelements(output));
-    ggml_backend_tensor_get(output, expected.data(), 0, ggml_nbytes(output));
+    std::vector<float> first_actual(expected.size());
+    ggml_backend_tensor_get(output, first_actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < first_actual.size(); ++i) {
+        require(fabsf(first_actual[i] - expected[i]) < 1e-5f);
+    }
     ggml_backend_expert_cache_stats first_stats = {};
     require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &first_stats));
     require(first_stats.n_route_ready_dispatches == 1);
     require(first_stats.n_route_ready_classifications == 1);
+    ggml_backend_sched_expert_cache_sync(sched);
+
 
     ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
     ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
@@ -2112,16 +2646,15 @@ static void test_route_ready_cross_split_sidecar() {
     require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &second_stats));
     require(second_stats.n_route_ready_dispatches == 1);
     require(second_stats.n_route_ready_classifications == 2);
-    require(second_stats.n_route_ready_actions <= 1);
-    // compute 1 never has resident slots; compute 2 admission class varies with
-    // async seeding timing, so only require a consistent mask histogram
-    require(second_stats.n_route_ready_mask_counts[0] >= 1);
-    int mask_sum = 0;
-    for (int k = 0; k < 9; k++) {
-        mask_sum += (int) second_stats.n_route_ready_mask_counts[k];
+    require(second_stats.n_route_ready_actions == 1);
+    require(second_stats.n_route_ready_mask_counts[0] == 1);
+    require(second_stats.n_route_ready_mask_counts[2] == 1);
+    for (int k = 1; k < 9; ++k) {
+        if (k != 2) {
+            require(second_stats.n_route_ready_mask_counts[k] == 0);
+        }
     }
-    require(mask_sum == 2);
-    require(second_stats.n_zero_copy_hits <= 6);
+    require(second_stats.n_zero_copy_hits == 6);
 
     ggml_backend_sched_free(sched);
     ggml_backend_buffer_free(weights_buffer);
@@ -2304,6 +2837,7 @@ int main() {
     test_route_census_classifies_original_graph();
     test_event_query_contract();
     test_registered_bundle_keeps_cpu_base_placement();
+    test_partial_executor_scheduler_feature_gate();
     test_rebalance_does_not_synchronize_gpu();
     test_route_plan_groups_shared_ids();
     test_slot_pools_and_remapping();
@@ -2329,6 +2863,10 @@ int main() {
     test_gpu_slot_map_remapping();
 
     test_hit_mask_matrix_partitioning();
+    test_partial_route_snapshot_validation();
+    test_partial_executor_persistence();
+    test_partial_executor_scheduler_catalog();
+    test_partial_executor_exact_route_paths();
     test_multi_token_repeated_experts();
     test_dynamic_map_metadata_and_device_maps();
     test_route_ready_sidecar_full_hit();

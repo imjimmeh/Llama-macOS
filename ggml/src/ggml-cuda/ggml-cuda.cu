@@ -4297,6 +4297,22 @@ static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
 }
 
+static bool ggml_backend_cuda_event_elapsed_us(
+        ggml_backend_event_t start,
+        ggml_backend_event_t end,
+        uint64_t * elapsed_us) {
+    if (start == nullptr || end == nullptr || elapsed_us == nullptr) {
+        return false;
+    }
+
+    float elapsed_ms = 0.0f;
+    if (cudaEventElapsedTime(&elapsed_ms, (cudaEvent_t) start->context, (cudaEvent_t) end->context) != cudaSuccess) {
+        return false;
+    }
+    *elapsed_us = (uint64_t) (elapsed_ms * 1000.0f + 0.5f);
+    return true;
+}
+
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
@@ -5341,7 +5357,7 @@ static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_
     ggml_cuda_set_device(dev_ctx->device);
 
     cudaEvent_t event;
-    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDefault));
 
     return new ggml_backend_event {
         /* .device  = */ dev,
@@ -5481,6 +5497,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_event_elapsed_us") == 0) {
+        return (void *)ggml_backend_cuda_event_elapsed_us;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

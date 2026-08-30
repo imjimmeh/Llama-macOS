@@ -7,6 +7,8 @@
 #include "ggml-cuda/moe-hetero.cuh"
 #endif
 
+#include <array>
+
 #include <cassert>
 #include <cinttypes>
 #include <cmath>
@@ -82,6 +84,71 @@ void ggml_moe_hetero_scratch_free(ggml_moe_hetero_scratch_t scratch) {
     delete scratch;
 }
 
+enum {
+    GGML_MOE_PARTIAL_VARIANT_COUNT = GGML_MOE_PARTIAL_MAX_ROUTES - 1,
+    GGML_MOE_PARTIAL_EVENT_COUNT = 9,
+    GGML_MOE_PARTIAL_EVENT_ACTIVATION_START = 0,
+    GGML_MOE_PARTIAL_EVENT_ACTIVATION_END,
+    GGML_MOE_PARTIAL_EVENT_GPU_GRAPH_START,
+    GGML_MOE_PARTIAL_EVENT_GPU_GRAPH_END,
+    GGML_MOE_PARTIAL_EVENT_CPU_UPLOAD_START,
+    GGML_MOE_PARTIAL_EVENT_CPU_UPLOAD_END,
+    GGML_MOE_PARTIAL_EVENT_SCATTER_START,
+    GGML_MOE_PARTIAL_EVENT_SCATTER_END,
+    GGML_MOE_PARTIAL_EVENT_FINAL_OUTPUT,
+};
+
+struct ggml_moe_partial_gpu_variant {
+    struct ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    struct ggml_tensor * input = nullptr;
+    struct ggml_tensor * gate_ids = nullptr;
+    struct ggml_tensor * up_ids = nullptr;
+    struct ggml_tensor * down_ids = nullptr;
+    struct ggml_tensor * output = nullptr;
+    struct ggml_cgraph * graph = nullptr;
+    struct ggml_tensor gate_slot = {};
+    struct ggml_tensor up_slot = {};
+    struct ggml_tensor down_slot = {};
+};
+
+struct ggml_moe_partial_cpu_variant {
+    struct ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    struct ggml_tensor * input = nullptr;
+    struct ggml_tensor * ids = nullptr;
+    struct ggml_tensor * output = nullptr;
+    struct ggml_cgraph * graph = nullptr;
+    struct ggml_tensor gate = {};
+    struct ggml_tensor up = {};
+    struct ggml_tensor down = {};
+};
+
+struct ggml_moe_partial_executor {
+    ggml_backend_t gpu_backend;
+    ggml_backend_t cpu_backend;
+    struct ggml_expert_bundle_weights template_weights;
+    int64_t d_model;
+    int64_t d_ff;
+    int32_t top_k;
+    bool is_fused;
+    std::array<struct ggml_moe_partial_gpu_variant, GGML_MOE_PARTIAL_VARIANT_COUNT> gpu = {};
+    std::array<struct ggml_moe_partial_cpu_variant, GGML_MOE_PARTIAL_VARIANT_COUNT> cpu = {};
+    struct ggml_context * merge_ctx = nullptr;
+    ggml_backend_buffer_t merge_buffer = nullptr;
+    struct ggml_tensor * merge = nullptr;
+    struct ggml_tensor * cpu_upload = nullptr;
+    struct ggml_context * exchange_ctx = nullptr;
+    ggml_backend_buffer_t exchange_buffer = nullptr;
+    struct ggml_tensor * exchange_activation = nullptr;
+    struct ggml_tensor * exchange_hit_ids = nullptr;
+    struct ggml_tensor * exchange_miss_ids = nullptr;
+    struct ggml_tensor * exchange_miss_output = nullptr;
+    std::array<ggml_backend_event_t, GGML_MOE_PARTIAL_EVENT_COUNT> events = {};
+    ggml_backend_event_elapsed_us_t event_elapsed_us = nullptr;
+    bool poisoned = false;
+};
+
 struct ggml_moe_route_ready_sidecar {
     ggml_backend_t gpu_backend;
     ggml_backend_t cpu_backend;
@@ -154,6 +221,194 @@ static void ggml_moe_route_ready_sidecar_copy_slot(
 static void ggml_moe_route_ready_sidecar_unbind_slot(struct ggml_tensor * slot) {
     slot->buffer = nullptr;
     slot->data = nullptr;
+}
+
+static void ggml_moe_partial_gpu_variant_free(struct ggml_moe_partial_gpu_variant * variant) {
+    if (variant->buffer != nullptr) {
+        ggml_backend_buffer_free(variant->buffer);
+        variant->buffer = nullptr;
+    }
+    if (variant->ctx != nullptr) {
+        ggml_free(variant->ctx);
+        variant->ctx = nullptr;
+    }
+}
+
+static void ggml_moe_partial_cpu_variant_free(struct ggml_moe_partial_cpu_variant * variant) {
+    if (variant->buffer != nullptr) {
+        ggml_backend_buffer_free(variant->buffer);
+        variant->buffer = nullptr;
+    }
+    if (variant->ctx != nullptr) {
+        ggml_free(variant->ctx);
+        variant->ctx = nullptr;
+    }
+}
+
+static bool ggml_moe_partial_executor_init_gpu_variant(
+        ggml_moe_partial_executor_t executor,
+        struct ggml_moe_partial_gpu_variant * variant,
+        int32_t n_routes) {
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    variant->ctx = ggml_init(params);
+    if (variant->ctx == nullptr) {
+        return false;
+    }
+
+    ggml_moe_route_ready_sidecar_copy_slot(
+        &variant->gate_slot, executor->is_fused ? executor->template_weights.gate_up : executor->template_weights.gate);
+    if (!executor->is_fused) {
+        ggml_moe_route_ready_sidecar_copy_slot(&variant->up_slot, executor->template_weights.up);
+    }
+    ggml_moe_route_ready_sidecar_copy_slot(&variant->down_slot, executor->template_weights.down);
+
+    variant->input = ggml_new_tensor_3d(variant->ctx, GGML_TYPE_F32, executor->d_model, 1, 1);
+    variant->gate_ids = ggml_new_tensor_2d(variant->ctx, GGML_TYPE_I32, n_routes, 1);
+    variant->up_ids = executor->is_fused ? variant->gate_ids :
+        ggml_new_tensor_2d(variant->ctx, GGML_TYPE_I32, n_routes, 1);
+    variant->down_ids = ggml_new_tensor_2d(variant->ctx, GGML_TYPE_I32, n_routes, 1);
+
+    struct ggml_tensor * gate = nullptr;
+    struct ggml_tensor * up = nullptr;
+    if (executor->is_fused) {
+        struct ggml_tensor * gate_up = ggml_mul_mat_id(variant->ctx, &variant->gate_slot, variant->input, variant->gate_ids);
+        gate = ggml_view_3d(variant->ctx, gate_up, executor->d_ff, n_routes, 1, gate_up->nb[1], gate_up->nb[2], 0);
+        up = ggml_view_3d(variant->ctx, gate_up, executor->d_ff, n_routes, 1, gate_up->nb[1], gate_up->nb[2],
+            executor->d_ff * gate_up->nb[0]);
+    } else {
+        gate = ggml_mul_mat_id(variant->ctx, &variant->gate_slot, variant->input, variant->gate_ids);
+        up = ggml_mul_mat_id(variant->ctx, &variant->up_slot, variant->input, variant->up_ids);
+    }
+    variant->output = ggml_mul_mat_id(
+        variant->ctx, &variant->down_slot, ggml_swiglu_split(variant->ctx, gate, up), variant->down_ids);
+    variant->graph = ggml_new_graph(variant->ctx);
+    ggml_build_forward_expand(variant->graph, variant->output);
+    variant->buffer = ggml_backend_alloc_ctx_tensors(variant->ctx, executor->gpu_backend);
+
+    ggml_moe_route_ready_sidecar_unbind_slot(&variant->gate_slot);
+    if (!executor->is_fused) {
+        ggml_moe_route_ready_sidecar_unbind_slot(&variant->up_slot);
+    }
+    ggml_moe_route_ready_sidecar_unbind_slot(&variant->down_slot);
+    return variant->buffer != nullptr;
+}
+
+static bool ggml_moe_partial_executor_init_cpu_variant(
+        ggml_moe_partial_executor_t executor,
+        struct ggml_moe_partial_cpu_variant * variant,
+        int32_t n_routes) {
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    variant->ctx = ggml_init(params);
+    if (variant->ctx == nullptr) {
+        return false;
+    }
+
+    ggml_moe_route_ready_sidecar_copy_slot(
+        &variant->gate, executor->is_fused ? executor->template_weights.gate_up : executor->template_weights.gate);
+    if (!executor->is_fused) {
+        ggml_moe_route_ready_sidecar_copy_slot(&variant->up, executor->template_weights.up);
+    }
+    ggml_moe_route_ready_sidecar_copy_slot(&variant->down, executor->template_weights.down);
+
+    variant->input = ggml_new_tensor_3d(variant->ctx, GGML_TYPE_F32, executor->d_model, 1, 1);
+    variant->ids = ggml_new_tensor_2d(variant->ctx, GGML_TYPE_I32, n_routes, 1);
+
+    struct ggml_tensor * gate = nullptr;
+    struct ggml_tensor * up = nullptr;
+    if (executor->is_fused) {
+        struct ggml_tensor * gate_up = ggml_mul_mat_id(variant->ctx, &variant->gate, variant->input, variant->ids);
+        gate = ggml_view_3d(variant->ctx, gate_up, executor->d_ff, n_routes, 1, gate_up->nb[1], gate_up->nb[2], 0);
+        up = ggml_view_3d(variant->ctx, gate_up, executor->d_ff, n_routes, 1, gate_up->nb[1], gate_up->nb[2],
+            executor->d_ff * gate_up->nb[0]);
+    } else {
+        gate = ggml_mul_mat_id(variant->ctx, &variant->gate, variant->input, variant->ids);
+        up = ggml_mul_mat_id(variant->ctx, &variant->up, variant->input, variant->ids);
+    }
+    variant->output = ggml_mul_mat_id(
+        variant->ctx, &variant->down, ggml_swiglu_split(variant->ctx, gate, up), variant->ids);
+    variant->graph = ggml_new_graph(variant->ctx);
+    ggml_build_forward_expand(variant->graph, variant->output);
+    variant->buffer = ggml_backend_alloc_ctx_tensors(variant->ctx, executor->cpu_backend);
+
+    ggml_moe_route_ready_sidecar_unbind_slot(&variant->gate);
+    if (!executor->is_fused) {
+        ggml_moe_route_ready_sidecar_unbind_slot(&variant->up);
+    }
+    ggml_moe_route_ready_sidecar_unbind_slot(&variant->down);
+    return variant->buffer != nullptr;
+}
+
+static bool ggml_moe_partial_executor_init_merge_buffers(ggml_moe_partial_executor_t executor) {
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    executor->merge_ctx = ggml_init(params);
+    if (executor->merge_ctx == nullptr) {
+        return false;
+    }
+    executor->merge = ggml_new_tensor_3d(
+        executor->merge_ctx, GGML_TYPE_F32, executor->d_model, GGML_MOE_PARTIAL_MAX_ROUTES, 1);
+    executor->cpu_upload = ggml_new_tensor_3d(
+        executor->merge_ctx, GGML_TYPE_F32, executor->d_model, GGML_MOE_PARTIAL_MAX_ROUTES, 1);
+    executor->merge_buffer = ggml_backend_alloc_ctx_tensors(executor->merge_ctx, executor->gpu_backend);
+    return executor->merge_buffer != nullptr;
+}
+
+static bool ggml_moe_partial_executor_init_exchange(ggml_moe_partial_executor_t executor) {
+    ggml_backend_dev_t gpu_device = ggml_backend_get_device(executor->gpu_backend);
+    ggml_backend_buffer_type_t host_buft = gpu_device ? ggml_backend_dev_host_buffer_type(gpu_device) : nullptr;
+    if (host_buft == nullptr) {
+        return false;
+    }
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    executor->exchange_ctx = ggml_init(params);
+    if (executor->exchange_ctx == nullptr) {
+        return false;
+    }
+    executor->exchange_activation = ggml_new_tensor_3d(executor->exchange_ctx, GGML_TYPE_F32, executor->d_model, 1, 1);
+    executor->exchange_hit_ids = ggml_new_tensor_2d(
+        executor->exchange_ctx, GGML_TYPE_I32, 3 * GGML_MOE_PARTIAL_MAX_ROUTES, 1);
+    executor->exchange_miss_ids = ggml_new_tensor_2d(
+        executor->exchange_ctx, GGML_TYPE_I32, GGML_MOE_PARTIAL_MAX_ROUTES, 1);
+    executor->exchange_miss_output = ggml_new_tensor_2d(
+        executor->exchange_ctx, GGML_TYPE_F32, executor->d_model, GGML_MOE_PARTIAL_MAX_ROUTES);
+    executor->exchange_buffer = ggml_backend_alloc_ctx_tensors_from_buft(executor->exchange_ctx, host_buft);
+    if (executor->exchange_buffer == nullptr) {
+        return false;
+    }
+
+    const bool pinned = ggml_backend_buffer_get_type(executor->exchange_buffer) == host_buft;
+    GGML_LOG_DEBUG("%s: exchange buffer %s pinned=%d\n", __func__,
+        ggml_backend_buffer_name(executor->exchange_buffer), (int) pinned);
+    return pinned;
+}
+
+static bool ggml_moe_partial_executor_init_events(ggml_moe_partial_executor_t executor) {
+    ggml_backend_dev_t gpu_device = ggml_backend_get_device(executor->gpu_backend);
+    if (gpu_device == nullptr) {
+        return false;
+    }
+    for (ggml_backend_event_t & event : executor->events) {
+        event = ggml_backend_event_new(gpu_device);
+        if (event == nullptr) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool ggml_moe_route_ready_sidecar_bind_weights(
@@ -817,18 +1072,437 @@ enum ggml_status ggml_backend_moe_hetero_execute_serial(
     return GGML_STATUS_SUCCESS;
 }
 
-// Phase 2: Event-driven concurrent execution engine (staged for Milestone 6)
-enum ggml_status ggml_backend_moe_hetero_execute_concurrent(
+bool ggml_moe_partial_route_snapshot_is_valid(
+        const struct ggml_moe_partial_route_snapshot * snapshot,
+        int32_t top_k) {
+    if (snapshot == nullptr || top_k <= 1 || top_k > GGML_MOE_PARTIAL_MAX_ROUTES ||
+        snapshot->n_hits <= 0 || snapshot->n_misses <= 0 ||
+        snapshot->n_hits > GGML_MOE_PARTIAL_MAX_ROUTES ||
+        snapshot->n_misses > GGML_MOE_PARTIAL_MAX_ROUTES ||
+        snapshot->n_hits + snapshot->n_misses != top_k) {
+        return false;
+    }
+
+    bool written[GGML_MOE_PARTIAL_MAX_ROUTES] = {};
+    const struct ggml_cache_route_bundle * route_groups[] = {
+        snapshot->hits,
+        snapshot->misses,
+    };
+    const int32_t route_counts[] = {
+        snapshot->n_hits,
+        snapshot->n_misses,
+    };
+    for (int32_t group = 0; group < 2; ++group) {
+        for (int32_t i = 0; i < route_counts[group]; ++i) {
+            const struct ggml_cache_route_bundle & route = route_groups[group][i];
+            if (route.route < 0 || route.route >= top_k || written[route.route] ||
+                (group == 0 && !route.bundle_resident)) {
+                return false;
+            }
+            written[route.route] = true;
+        }
+    }
+
+    for (int32_t route = 0; route < top_k; ++route) {
+        if (!written[route]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+ggml_moe_partial_executor_t ggml_moe_partial_executor_new(
         ggml_backend_t gpu_backend,
         ggml_backend_t cpu_backend,
+        const struct ggml_expert_bundle_weights * template_weights,
+        int64_t d_model,
+        int64_t d_ff,
+        int32_t top_k,
+        bool is_fused) {
+    if (gpu_backend == nullptr || cpu_backend == nullptr || template_weights == nullptr ||
+        d_model <= 0 || d_ff <= 0 || top_k != GGML_MOE_PARTIAL_MAX_ROUTES ||
+        template_weights->is_fused != is_fused || template_weights->down == nullptr ||
+        template_weights->down->ne[0] != d_ff || template_weights->down->ne[1] != d_model ||
+        (is_fused ?
+            (template_weights->gate_up == nullptr || template_weights->gate_up->ne[0] != d_model ||
+                template_weights->gate_up->ne[1] != 2 * d_ff) :
+            (template_weights->gate == nullptr || template_weights->up == nullptr ||
+                template_weights->gate->ne[0] != d_model || template_weights->gate->ne[1] != d_ff ||
+                template_weights->up->ne[0] != d_model || template_weights->up->ne[1] != d_ff))) {
+        return nullptr;
+    }
+
+    auto * executor = new ggml_moe_partial_executor {
+        gpu_backend,
+        cpu_backend,
+        *template_weights,
+        d_model,
+        d_ff,
+        top_k,
+        is_fused,
+    };
+    ggml_backend_dev_t gpu_device = ggml_backend_get_device(gpu_backend);
+    ggml_backend_reg_t gpu_reg = gpu_device ? ggml_backend_dev_backend_reg(gpu_device) : nullptr;
+    executor->event_elapsed_us = gpu_reg ?
+        (ggml_backend_event_elapsed_us_t) ggml_backend_reg_get_proc_address(gpu_reg, "ggml_backend_event_elapsed_us") :
+        nullptr;
+    if (executor->event_elapsed_us == nullptr ||
+        !ggml_moe_partial_executor_init_merge_buffers(executor) ||
+        !ggml_moe_partial_executor_init_exchange(executor) ||
+        !ggml_moe_partial_executor_init_events(executor)) {
+        ggml_moe_partial_executor_free(executor);
+        return nullptr;
+    }
+    for (int32_t i = 0; i < GGML_MOE_PARTIAL_VARIANT_COUNT; ++i) {
+        if (!ggml_moe_partial_executor_init_gpu_variant(executor, &executor->gpu[i], i + 1) ||
+            !ggml_moe_partial_executor_init_cpu_variant(executor, &executor->cpu[i], i + 1)) {
+            ggml_moe_partial_executor_free(executor);
+            return nullptr;
+        }
+    }
+    return executor;
+}
+
+void ggml_moe_partial_executor_free(ggml_moe_partial_executor_t executor) {
+    if (executor == nullptr) {
+        return;
+    }
+    for (ggml_backend_event_t event : executor->events) {
+        ggml_backend_event_free(event);
+    }
+    for (struct ggml_moe_partial_gpu_variant & variant : executor->gpu) {
+        ggml_moe_partial_gpu_variant_free(&variant);
+    }
+    for (struct ggml_moe_partial_cpu_variant & variant : executor->cpu) {
+        ggml_moe_partial_cpu_variant_free(&variant);
+    }
+    if (executor->merge_buffer != nullptr) {
+        ggml_backend_buffer_free(executor->merge_buffer);
+    }
+    if (executor->merge_ctx != nullptr) {
+        ggml_free(executor->merge_ctx);
+    }
+    if (executor->exchange_buffer != nullptr) {
+        ggml_backend_buffer_free(executor->exchange_buffer);
+    }
+    if (executor->exchange_ctx != nullptr) {
+        ggml_free(executor->exchange_ctx);
+    }
+    delete executor;
+}
+
+#ifdef GGML_TEST
+bool ggml_moe_partial_executor_get_test_state(
+        ggml_moe_partial_executor_t executor,
+        struct ggml_moe_partial_executor_test_state * state) {
+    if (executor == nullptr || state == nullptr) {
+        return false;
+    }
+    *state = {};
+    for (int32_t i = 0; i < GGML_MOE_PARTIAL_VARIANT_COUNT; ++i) {
+        const struct ggml_moe_partial_gpu_variant & gpu = executor->gpu[i];
+        const struct ggml_moe_partial_cpu_variant & cpu = executor->cpu[i];
+        state->gpu_variants[i] = gpu.ctx != nullptr && gpu.buffer != nullptr &&
+            gpu.input != nullptr && gpu.gate_ids != nullptr && gpu.up_ids != nullptr && gpu.down_ids != nullptr &&
+            gpu.output != nullptr && gpu.graph != nullptr;
+        state->cpu_variants[i] = cpu.ctx != nullptr && cpu.buffer != nullptr &&
+            cpu.input != nullptr && cpu.ids != nullptr && cpu.output != nullptr && cpu.graph != nullptr;
+        state->gpu_outputs[i] = gpu.output;
+        state->cpu_outputs[i] = cpu.output;
+
+    }
+    state->has_merge_buffer = executor->merge != nullptr && executor->merge_buffer != nullptr;
+    state->has_cpu_upload_buffer = executor->cpu_upload != nullptr && executor->merge_buffer != nullptr;
+    state->exchange_buffer = executor->exchange_buffer;
+    for (int32_t i = 0; i < GGML_MOE_PARTIAL_EVENT_COUNT; ++i) {
+        state->events[i] = executor->events[i] != nullptr;
+    }
+    return true;
+}
+#endif
+
+static void ggml_moe_partial_executor_bind_gpu(
+        ggml_moe_partial_executor_t executor,
+        struct ggml_moe_partial_gpu_variant * variant,
+        struct ggml_tensor * const slot_tensors[3]) {
+    ggml_moe_route_ready_sidecar_copy_slot(&variant->gate_slot, slot_tensors[0]);
+    if (!executor->is_fused) {
+        ggml_moe_route_ready_sidecar_copy_slot(&variant->up_slot, slot_tensors[1]);
+    }
+    ggml_moe_route_ready_sidecar_copy_slot(&variant->down_slot, slot_tensors[2]);
+}
+
+static void ggml_moe_partial_executor_unbind_gpu(
+        ggml_moe_partial_executor_t executor,
+        struct ggml_moe_partial_gpu_variant * variant) {
+    ggml_moe_route_ready_sidecar_unbind_slot(&variant->gate_slot);
+    if (!executor->is_fused) {
+        ggml_moe_route_ready_sidecar_unbind_slot(&variant->up_slot);
+    }
+    ggml_moe_route_ready_sidecar_unbind_slot(&variant->down_slot);
+}
+
+static void ggml_moe_partial_executor_bind_cpu(
+        ggml_moe_partial_executor_t executor,
+        struct ggml_moe_partial_cpu_variant * variant,
+        const struct ggml_expert_bundle_weights * weights) {
+    ggml_moe_route_ready_sidecar_copy_slot(&variant->gate, executor->is_fused ? weights->gate_up : weights->gate);
+    if (!executor->is_fused) {
+        ggml_moe_route_ready_sidecar_copy_slot(&variant->up, weights->up);
+    }
+    ggml_moe_route_ready_sidecar_copy_slot(&variant->down, weights->down);
+}
+
+static void ggml_moe_partial_executor_unbind_cpu(
+        ggml_moe_partial_executor_t executor,
+        struct ggml_moe_partial_cpu_variant * variant) {
+    ggml_moe_route_ready_sidecar_unbind_slot(&variant->gate);
+    if (!executor->is_fused) {
+        ggml_moe_route_ready_sidecar_unbind_slot(&variant->up);
+    }
+    ggml_moe_route_ready_sidecar_unbind_slot(&variant->down);
+}
+
+enum ggml_moe_partial_executor_result ggml_moe_partial_executor_execute(
+        ggml_moe_partial_executor_t executor,
         const struct ggml_moe_bundle_plan * bundle,
         ggml_backend_expert_cache_t cache,
-        const int32_t * ids_data,
-        int32_t top_k,
-        ggml_moe_hetero_scratch_t scratch,
+        const struct ggml_moe_partial_route_snapshot * snapshot,
+        const struct ggml_moe_partial_activation * activation,
         struct ggml_backend_expert_cache_stats * stats) {
+    if (executor == nullptr || bundle == nullptr || cache == nullptr || activation == nullptr ||
+        !ggml_moe_partial_route_snapshot_is_valid(snapshot, executor ? executor->top_k : 0) ||
+        bundle->route_ids == nullptr || bundle->is_fused != executor->is_fused ||
+        bundle->layer_input->type != GGML_TYPE_F32 || bundle->down_node->type != GGML_TYPE_F32 ||
+        bundle->layer_input->ne[0] != executor->d_model || bundle->layer_input->ne[1] != 1 ||
+        bundle->layer_input->ne[2] != 1 || bundle->layer_input->nb[0] != sizeof(float) ||
+        bundle->layer_input->nb[1] != (size_t) executor->d_model * sizeof(float) ||
+        bundle->layer_input->nb[2] != (size_t) executor->d_model * sizeof(float) ||
+        bundle->down_node->ne[0] != executor->d_model || bundle->down_node->ne[1] != executor->top_k ||
+        bundle->down_node->ne[2] != 1 || bundle->down_node->nb[0] != sizeof(float) ||
+        bundle->down_node->nb[1] != (size_t) executor->d_model * sizeof(float) ||
+        bundle->down_node->nb[2] != (size_t) executor->d_model * executor->top_k * sizeof(float) ||
+        bundle->route_ids->type != GGML_TYPE_I32 || bundle->route_ids->ne[0] != executor->top_k ||
+        bundle->route_ids->ne[1] != 1 || bundle->route_ids->ne[2] != 1 ||
+        bundle->route_ids->nb[0] != sizeof(int32_t) ||
+        bundle->route_ids->nb[1] != (size_t) executor->top_k * sizeof(int32_t) ||
+        ggml_nbytes(bundle->layer_input) != activation->nbytes) {
+        return GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED;
+    }
 
-    // Fall back to verified serial implementation during initial Phase 1 gating
-    return ggml_backend_moe_hetero_execute_serial(gpu_backend, cpu_backend, bundle, cache, ids_data, top_k, scratch, stats);
+    const struct ggml_tensor * gate = bundle->is_fused ? bundle->gate_up_node : bundle->gate_node;
+    const struct ggml_tensor * up = bundle->is_fused ? nullptr : bundle->up_node;
+    if (gate == nullptr || gate->type != GGML_TYPE_F32 || gate->ne[0] != (bundle->is_fused ? 2 * executor->d_ff : executor->d_ff) ||
+        gate->ne[1] != executor->top_k || gate->ne[2] != 1 ||
+        (!bundle->is_fused && (up == nullptr || up->type != GGML_TYPE_F32 ||
+            up->ne[0] != executor->d_ff || up->ne[1] != executor->top_k || up->ne[2] != 1))) {
+        return GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED;
+    }
+
+    const struct ggml_expert_bundle_weights * template_weights = &executor->template_weights;
+    struct ggml_expert_bundle_weights weights = {};
+    if (!ggml_backend_expert_cache_get_bundle_weights(cache, bundle->layer, &weights) ||
+        weights.is_fused != executor->is_fused || weights.down == nullptr ||
+        weights.down->type != template_weights->down->type ||
+        weights.down->ne[0] != executor->d_ff || weights.down->ne[1] != executor->d_model ||
+        weights.down->buffer == nullptr || !ggml_backend_buffer_is_host(weights.down->buffer) ||
+        (executor->is_fused ?
+            (weights.gate_up == nullptr || weights.gate_up->type != template_weights->gate_up->type ||
+                weights.gate_up->ne[0] != executor->d_model || weights.gate_up->ne[1] != 2 * executor->d_ff ||
+                weights.gate_up->buffer == nullptr || !ggml_backend_buffer_is_host(weights.gate_up->buffer)) :
+            (weights.gate == nullptr || weights.up == nullptr ||
+                weights.gate->type != template_weights->gate->type ||
+                weights.up->type != template_weights->up->type ||
+                weights.gate->ne[0] != executor->d_model || weights.gate->ne[1] != executor->d_ff ||
+                weights.up->ne[0] != executor->d_model || weights.up->ne[1] != executor->d_ff ||
+                weights.gate->buffer == nullptr || !ggml_backend_buffer_is_host(weights.gate->buffer) ||
+                weights.up->buffer == nullptr || !ggml_backend_buffer_is_host(weights.up->buffer)))) {
+        return GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED;
+    }
+
+    struct ggml_tensor * slot_tensors[] = {
+        ggml_backend_expert_cache_find_slot_tensor(cache, executor->is_fused ? weights.gate_up : weights.gate),
+        executor->is_fused ? nullptr : ggml_backend_expert_cache_find_slot_tensor(cache, weights.up),
+        ggml_backend_expert_cache_find_slot_tensor(cache, weights.down),
+    };
+    if (slot_tensors[0] == nullptr || slot_tensors[2] == nullptr ||
+        (!executor->is_fused && slot_tensors[1] == nullptr)) {
+        return GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED;
+    }
+
+    int32_t hit_gate_slots[GGML_MOE_PARTIAL_MAX_ROUTES] = {};
+    int32_t hit_up_slots[GGML_MOE_PARTIAL_MAX_ROUTES] = {};
+    int32_t hit_down_slots[GGML_MOE_PARTIAL_MAX_ROUTES] = {};
+    int32_t miss_expert_ids[GGML_MOE_PARTIAL_MAX_ROUTES] = {};
+    for (int32_t i = 0; i < snapshot->n_hits; ++i) {
+        const struct ggml_cache_route_bundle & route = snapshot->hits[i];
+        hit_gate_slots[i] = executor->is_fused ? route.gate_up_slot : route.gate_slot;
+        hit_up_slots[i] = executor->is_fused ? route.gate_up_slot : route.up_slot;
+        hit_down_slots[i] = route.down_slot;
+        const int32_t slots[] = { hit_gate_slots[i], hit_up_slots[i], hit_down_slots[i] };
+        for (int32_t projection = 0; projection < 3; ++projection) {
+            if (slot_tensors[projection] != nullptr &&
+                (slots[projection] < 0 || slots[projection] >= slot_tensors[projection]->ne[2])) {
+                return GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED;
+            }
+        }
+    }
+    for (int32_t i = 0; i < snapshot->n_misses; ++i) {
+        miss_expert_ids[i] = snapshot->misses[i].expert;
+        if (miss_expert_ids[i] < 0 || miss_expert_ids[i] >= weights.down->ne[2]) {
+            return GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED;
+        }
+    }
+
+    ggml_backend_buffer_t output_buffer = bundle->down_node->view_src ?
+        bundle->down_node->view_src->buffer : bundle->down_node->buffer;
+    ggml_backend_dev_t gpu_device = ggml_backend_get_device(executor->gpu_backend);
+    ggml_backend_buffer_type_t host_buft = gpu_device ? ggml_backend_dev_host_buffer_type(gpu_device) : nullptr;
+    if (output_buffer == nullptr || !ggml_backend_buffer_is_host(output_buffer) ||
+        executor->exchange_buffer == nullptr || executor->exchange_activation == nullptr ||
+        executor->exchange_hit_ids == nullptr || executor->exchange_miss_ids == nullptr ||
+        executor->exchange_miss_output == nullptr ||
+        host_buft == nullptr || ggml_backend_buffer_get_type(executor->exchange_buffer) != host_buft ||
+        gpu_device == nullptr || gpu_device->iface.event_new == nullptr ||
+        executor->gpu_backend->iface.set_tensor_async == nullptr ||
+        executor->gpu_backend->iface.get_tensor_async == nullptr ||
+        executor->gpu_backend->iface.cpy_tensor_async == nullptr) {
+        return GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED;
+    }
+
+    struct ggml_moe_partial_gpu_variant * gpu = &executor->gpu[snapshot->n_hits - 1];
+    struct ggml_moe_partial_cpu_variant * cpu = &executor->cpu[snapshot->n_misses - 1];
+    if (executor->poisoned || gpu->graph == nullptr || cpu->graph == nullptr ||
+        gpu->output == nullptr || cpu->output == nullptr) {
+        return executor->poisoned ? GGML_MOE_PARTIAL_EXECUTOR_LAUNCH_FAILED : GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED;
+    }
+
+    const void * activation_host = activation->host_data;
+    if (activation_host == nullptr && ggml_backend_buffer_is_host(bundle->layer_input->buffer)) {
+        activation_host = bundle->layer_input->data;
+    }
+    if (activation_host == nullptr) {
+        return GGML_MOE_PARTIAL_EXECUTOR_NOT_ADMITTED;
+    }
+
+    int32_t * hit_ids_base = (int32_t *) executor->exchange_hit_ids->data;
+    memcpy(executor->exchange_activation->data, activation_host, activation->nbytes);
+    memcpy(hit_ids_base, hit_gate_slots, (size_t) snapshot->n_hits * sizeof(int32_t));
+    memcpy(hit_ids_base + GGML_MOE_PARTIAL_MAX_ROUTES, hit_up_slots, (size_t) snapshot->n_hits * sizeof(int32_t));
+    memcpy(hit_ids_base + 2 * GGML_MOE_PARTIAL_MAX_ROUTES, hit_down_slots, (size_t) snapshot->n_hits * sizeof(int32_t));
+    memcpy(executor->exchange_miss_ids->data, miss_expert_ids, (size_t) snapshot->n_misses * sizeof(int32_t));
+    ggml_backend_tensor_set(cpu->input, executor->exchange_activation->data, 0, activation->nbytes);
+    ggml_backend_tensor_set(cpu->ids, executor->exchange_miss_ids->data, 0,
+        (size_t) snapshot->n_misses * sizeof(int32_t));
+
+    ggml_backend_expert_cache_reserve_bundle_slots(cache, bundle->layer, snapshot->hits, snapshot->n_hits);
+    ggml_moe_partial_executor_bind_gpu(executor, gpu, slot_tensors);
+    ggml_moe_partial_executor_bind_cpu(executor, cpu, &weights);
+
+    const int64_t t_start = ggml_time_us();
+    ggml_backend_tensor_set_async(executor->gpu_backend, gpu->input, executor->exchange_activation->data, 0,
+        activation->nbytes);
+    ggml_backend_tensor_set_async(executor->gpu_backend, gpu->gate_ids, hit_ids_base, 0,
+        (size_t) snapshot->n_hits * sizeof(int32_t));
+    if (!executor->is_fused) {
+        ggml_backend_tensor_set_async(executor->gpu_backend, gpu->up_ids,
+            hit_ids_base + GGML_MOE_PARTIAL_MAX_ROUTES, 0, (size_t) snapshot->n_hits * sizeof(int32_t));
+    }
+    ggml_backend_tensor_set_async(executor->gpu_backend, gpu->down_ids,
+        hit_ids_base + 2 * GGML_MOE_PARTIAL_MAX_ROUTES, 0, (size_t) snapshot->n_hits * sizeof(int32_t));
+    const int64_t t_submit_done = ggml_time_us();
+    ggml_backend_event_record(executor->events[GGML_MOE_PARTIAL_EVENT_GPU_GRAPH_START], executor->gpu_backend);
+    if (ggml_backend_graph_compute_async(executor->gpu_backend, gpu->graph) != GGML_STATUS_SUCCESS) {
+        ggml_moe_partial_executor_unbind_gpu(executor, gpu);
+        ggml_moe_partial_executor_unbind_cpu(executor, cpu);
+        ggml_backend_expert_cache_release_bundle_slots(cache, bundle->layer, snapshot->hits, snapshot->n_hits, nullptr);
+        return GGML_MOE_PARTIAL_EXECUTOR_LAUNCH_FAILED;
+    }
+    ggml_backend_event_record(executor->events[GGML_MOE_PARTIAL_EVENT_GPU_GRAPH_END], executor->gpu_backend);
+
+    const int64_t t_cpu_start = ggml_time_us();
+    if (ggml_backend_graph_compute(executor->cpu_backend, cpu->graph) != GGML_STATUS_SUCCESS) {
+        ggml_backend_event_synchronize(executor->events[GGML_MOE_PARTIAL_EVENT_GPU_GRAPH_END]);
+        ggml_moe_partial_executor_unbind_gpu(executor, gpu);
+        ggml_moe_partial_executor_unbind_cpu(executor, cpu);
+        ggml_backend_expert_cache_release_bundle_slots(cache, bundle->layer, snapshot->hits, snapshot->n_hits, nullptr);
+        executor->poisoned = true;
+        return GGML_MOE_PARTIAL_EXECUTOR_LAUNCH_FAILED;
+    }
+    const int64_t t_cpu_done = ggml_time_us();
+
+    ggml_backend_tensor_get(cpu->output, executor->exchange_miss_output->data, 0,
+        (size_t) snapshot->n_misses * executor->d_model * sizeof(float));
+    ggml_backend_event_record(executor->events[GGML_MOE_PARTIAL_EVENT_CPU_UPLOAD_START], executor->gpu_backend);
+    ggml_backend_tensor_set_async(executor->gpu_backend, executor->cpu_upload, executor->exchange_miss_output->data, 0,
+        (size_t) snapshot->n_misses * executor->d_model * sizeof(float));
+    ggml_backend_event_record(executor->events[GGML_MOE_PARTIAL_EVENT_CPU_UPLOAD_END], executor->gpu_backend);
+
+    const int64_t t_join_gpu_start = ggml_time_us();
+    ggml_backend_event_synchronize(executor->events[GGML_MOE_PARTIAL_EVENT_GPU_GRAPH_END]);
+    const int64_t t_join_gpu_done = ggml_time_us();
+    ggml_backend_event_synchronize(executor->events[GGML_MOE_PARTIAL_EVENT_CPU_UPLOAD_END]);
+    const int64_t t_join_cpu_done = ggml_time_us();
+
+    const int64_t t_scatter_start = ggml_time_us();
+    ggml_backend_event_record(executor->events[GGML_MOE_PARTIAL_EVENT_SCATTER_START], executor->gpu_backend);
+    for (int32_t i = 0; i < snapshot->n_hits; ++i) {
+        struct ggml_tensor src_row = *gpu->output;
+        struct ggml_tensor dst_row = *executor->merge;
+        src_row.ne[1] = 1;
+        dst_row.ne[1] = 1;
+        src_row.nb[2] = src_row.nb[1];
+        src_row.nb[3] = src_row.nb[2];
+        dst_row.nb[2] = dst_row.nb[1];
+        dst_row.nb[3] = dst_row.nb[2];
+        src_row.data = (uint8_t *) src_row.data + (size_t) i * src_row.nb[1];
+        dst_row.data = (uint8_t *) dst_row.data + (size_t) snapshot->hits[i].route * dst_row.nb[1];
+        ggml_backend_tensor_copy_async(executor->gpu_backend, executor->gpu_backend, &src_row, &dst_row);
+    }
+    for (int32_t i = 0; i < snapshot->n_misses; ++i) {
+        struct ggml_tensor src_row = *executor->cpu_upload;
+        struct ggml_tensor dst_row = *executor->merge;
+        src_row.ne[1] = 1;
+        dst_row.ne[1] = 1;
+        src_row.nb[2] = src_row.nb[1];
+        src_row.nb[3] = src_row.nb[2];
+        dst_row.nb[2] = dst_row.nb[1];
+        dst_row.nb[3] = dst_row.nb[2];
+        src_row.data = (uint8_t *) src_row.data + (size_t) i * src_row.nb[1];
+        dst_row.data = (uint8_t *) dst_row.data + (size_t) snapshot->misses[i].route * dst_row.nb[1];
+        ggml_backend_tensor_copy_async(executor->gpu_backend, executor->gpu_backend, &src_row, &dst_row);
+    }
+    ggml_backend_event_record(executor->events[GGML_MOE_PARTIAL_EVENT_SCATTER_END], executor->gpu_backend);
+    const int64_t t_scatter_done = ggml_time_us();
+
+    ggml_backend_tensor_get_async(executor->gpu_backend, executor->merge, bundle->down_node->data, 0,
+        ggml_nbytes(bundle->down_node));
+    ggml_backend_event_record(executor->events[GGML_MOE_PARTIAL_EVENT_FINAL_OUTPUT], executor->gpu_backend);
+    ggml_backend_event_synchronize(executor->events[GGML_MOE_PARTIAL_EVENT_FINAL_OUTPUT]);
+    const int64_t t_done = ggml_time_us();
+
+    uint64_t gpu_hit_elapsed = 0;
+    executor->event_elapsed_us(
+        executor->events[GGML_MOE_PARTIAL_EVENT_GPU_GRAPH_START],
+        executor->events[GGML_MOE_PARTIAL_EVENT_GPU_GRAPH_END],
+        &gpu_hit_elapsed);
+    ggml_moe_partial_executor_unbind_gpu(executor, gpu);
+    ggml_moe_partial_executor_unbind_cpu(executor, cpu);
+    ggml_backend_expert_cache_release_bundle_slots(cache, bundle->layer, snapshot->hits, snapshot->n_hits, nullptr);
+
+    if (stats != nullptr) {
+        stats->hetero_partial_exec_by_hits[snapshot->n_hits]++;
+        stats->hetero_partial_gpu_routes_executed += snapshot->n_hits;
+        stats->hetero_partial_cpu_routes_executed += snapshot->n_misses;
+        stats->hetero_partial_gpu_hit_submit_us += (uint64_t) (t_submit_done - t_start);
+        stats->hetero_partial_gpu_hit_elapsed_us += gpu_hit_elapsed;
+        stats->hetero_partial_cpu_miss_compute_us += (uint64_t) (t_cpu_done - t_cpu_start);
+        stats->hetero_partial_cpu_result_h2d_bytes += (size_t) snapshot->n_misses * executor->d_model * sizeof(float);
+        stats->hetero_partial_join_wait_gpu_us += (uint64_t) (t_join_gpu_done - t_join_gpu_start);
+        stats->hetero_partial_join_wait_cpu_us += (uint64_t) (t_join_cpu_done - t_join_gpu_done);
+        stats->hetero_partial_scatter_us += (uint64_t) (t_scatter_done - t_scatter_start);
+        stats->hetero_partial_total_us += (uint64_t) (t_done - t_start);
+    }
+    return GGML_MOE_PARTIAL_EXECUTOR_SUCCESS;
 }
 

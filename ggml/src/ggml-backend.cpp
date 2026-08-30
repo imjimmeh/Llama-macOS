@@ -892,6 +892,21 @@ struct ggml_backend_sched {
         bool valid = false;
     };
     std::vector<ggml_backend_sched_route_bundle_plan> bundle_plans;
+    struct ggml_backend_sched_partial_executor_entry {
+        ggml_backend_t gpu_backend = nullptr;
+        ggml_backend_t cpu_backend = nullptr;
+        int64_t d_model = 0;
+        int64_t d_ff = 0;
+        int32_t top_k = 0;
+        bool is_fused = false;
+        enum ggml_type gate_type = GGML_TYPE_COUNT;
+        enum ggml_type up_type = GGML_TYPE_COUNT;
+        enum ggml_type down_type = GGML_TYPE_COUNT;
+        ggml_moe_partial_executor_t executor = nullptr;
+    };
+    std::vector<ggml_backend_sched_partial_executor_entry> partial_executors;
+
+
     struct ggml_backend_sched_route_ready_dispatch {
         const ggml_backend_sched_route_bundle_plan * bundle = nullptr;
         int gpu_cache_backend_id = -1;
@@ -901,6 +916,7 @@ struct ggml_backend_sched {
         int first_bundle_node_idx = -1;
         int last_bundle_node_idx = -1;
         ggml_moe_route_ready_sidecar_t sidecar = nullptr;
+        ggml_moe_partial_executor_t partial_executor = nullptr;
     };
     std::vector<ggml_backend_sched_route_ready_dispatch> route_ready_dispatches;
 
@@ -1329,6 +1345,65 @@ static void ggml_backend_sched_record_route_census(
     }
 }
 
+
+static ggml_moe_partial_executor_t ggml_backend_sched_get_partial_executor(
+        ggml_backend_sched_t sched,
+        int gpu_backend_id,
+        int cpu_backend_id,
+        const ggml_backend_sched::ggml_backend_sched_route_bundle_plan & bundle,
+        int64_t d_model,
+        int64_t d_ff,
+        int32_t top_k) {
+    if (top_k != GGML_MOE_PARTIAL_MAX_ROUTES) {
+        return nullptr;
+    }
+
+    struct ggml_expert_bundle_weights weights = {};
+    ggml_backend_expert_cache_t cache = sched->expert_caches[gpu_backend_id];
+    if (cache == nullptr || !ggml_backend_expert_cache_get_bundle_weights(cache, bundle.layer, &weights) ||
+        weights.is_fused != bundle.is_fused || weights.down == nullptr ||
+        (bundle.is_fused ? weights.gate_up == nullptr : weights.gate == nullptr || weights.up == nullptr)) {
+        return nullptr;
+    }
+
+    const enum ggml_type gate_type = bundle.is_fused ? weights.gate_up->type : weights.gate->type;
+    const enum ggml_type up_type = bundle.is_fused ? GGML_TYPE_COUNT : weights.up->type;
+    for (const auto & entry : sched->partial_executors) {
+        if (entry.gpu_backend == sched->backends[gpu_backend_id] &&
+            entry.cpu_backend == sched->backends[cpu_backend_id] &&
+            entry.d_model == d_model && entry.d_ff == d_ff && entry.top_k == top_k &&
+            entry.is_fused == bundle.is_fused && entry.gate_type == gate_type &&
+            entry.up_type == up_type && entry.down_type == weights.down->type) {
+            return entry.executor;
+        }
+    }
+
+    ggml_moe_partial_executor_t executor = ggml_moe_partial_executor_new(
+        sched->backends[gpu_backend_id],
+        sched->backends[cpu_backend_id],
+        &weights,
+        d_model,
+        d_ff,
+        top_k,
+        bundle.is_fused);
+    if (executor == nullptr) {
+        return nullptr;
+    }
+    sched->partial_executors.push_back({
+        sched->backends[gpu_backend_id],
+        sched->backends[cpu_backend_id],
+        d_model,
+        d_ff,
+        top_k,
+        bundle.is_fused,
+        gate_type,
+        up_type,
+        weights.down->type,
+        executor,
+    });
+    return executor;
+}
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 static void ggml_backend_sched_build_route_ready_dispatches(ggml_backend_sched_t sched) {
     for (auto & dispatch : sched->route_ready_dispatches) {
@@ -1427,9 +1502,14 @@ static void ggml_backend_sched_build_route_ready_dispatches(ggml_backend_sched_t
             d_ff,
             top_k,
             bundle.is_fused);
+
         if (sidecar == nullptr) {
             continue;
         }
+        ggml_moe_partial_executor_t partial_executor = ggml_backend_sched_get_partial_executor(
+            sched, gpu_cache_backend_id, bundle_backend_id, bundle, d_model, d_ff, top_k);
+
+
 
         sched->route_ready_dispatches.push_back({
             &bundle,
@@ -1440,6 +1520,7 @@ static void ggml_backend_sched_build_route_ready_dispatches(ggml_backend_sched_t
             first_bundle_node_idx,
             last_bundle_node_idx,
             sidecar,
+            partial_executor,
         });
         sched->route_census_stats.n_route_ready_dispatches++;
     }
@@ -2237,6 +2318,14 @@ static const struct ggml_tensor * ggml_backend_sched_canonical_bundle_weight(
     return nullptr;
 }
 
+static constexpr int32_t GGML_MOE_PARTIAL_MIN_GPU_HITS = 7;
+
+static bool ggml_expert_cache_hetero_concurrent_enabled() {
+    const char * value = getenv("GGML_EXPERT_CACHE_HETERO_CONCURRENT");
+    return value != nullptr && value[0] == '1';
+}
+
+
 static void ggml_backend_sched_record_route_ready_accesses(
         const ggml_backend_sched::ggml_backend_sched_route_bundle_plan & bundle,
         ggml_backend_expert_cache_t cache,
@@ -2981,6 +3070,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     plan.canonical_route_output = bundle.down_node;
                     plan.is_fused = bundle.is_fused;
                     plan.valid = true;
+                    const bool concurrent_eligible = top_k == GGML_MOE_PARTIAL_MAX_ROUTES &&
+                        n_hits >= GGML_MOE_PARTIAL_MIN_GPU_HITS && n_hits < top_k &&
+                        ggml_expert_cache_hetero_concurrent_enabled() && dispatch->partial_executor != nullptr;
+                    bool bundle_handled = false;
+
 
                     if (n_hits == top_k && n_misses == 0) {
                         ec = ggml_moe_route_ready_sidecar_execute_full_hit(
@@ -2990,7 +3084,88 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         sched->route_census_stats.n_route_ready_actions++;
                         cur_j = dispatch->last_bundle_node_idx + 1;
-                    } else if (n_hits > 0 && n_hits == top_k - 1 && n_hits + n_misses == top_k) {
+                        bundle_handled = true;
+                    } else if (concurrent_eligible) {
+                        struct ggml_moe_partial_route_snapshot snapshot = {};
+                        snapshot.n_hits = n_hits;
+                        snapshot.n_misses = n_misses;
+                        memcpy(snapshot.hits, hits.data(), (size_t) n_hits * sizeof(struct ggml_cache_route_bundle));
+                        memcpy(snapshot.misses, misses.data(), (size_t) n_misses * sizeof(struct ggml_cache_route_bundle));
+                        struct ggml_moe_partial_activation activation = {};
+                        activation.nbytes = ggml_nbytes(plan.layer_input);
+                        if (plan.layer_input->buffer != nullptr && ggml_backend_buffer_is_host(plan.layer_input->buffer)) {
+                            activation.host_data = plan.layer_input->data;
+                        }
+                        const enum ggml_moe_partial_executor_result result = ggml_moe_partial_executor_execute(
+                            dispatch->partial_executor, &plan, cache, &snapshot, &activation, &sched->route_census_stats);
+                        if (result == GGML_MOE_PARTIAL_EXECUTOR_LAUNCH_FAILED) {
+                            return GGML_STATUS_FAILED;
+                        }
+                        if (result == GGML_MOE_PARTIAL_EXECUTOR_SUCCESS) {
+                            sched->route_census_stats.n_route_ready_actions++;
+                            cur_j = dispatch->last_bundle_node_idx + 1;
+                            bundle_handled = true;
+                            if (getenv("GGML_MOE_PARTIAL_VERIFY") != nullptr) {
+                                int cpu_backend_id_v = -1;
+                                for (int b = 0; b < sched->n_backends; b++) {
+                                    if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                        cpu_backend_id_v = b;
+                                        break;
+                                    }
+                                }
+                                struct ggml_tensor * v_down = bundle.down_node;
+                                const size_t v_in_bytes = ggml_nbytes(plan.layer_input);
+                                const size_t v_out_bytes = ggml_nbytes(v_down);
+                                if (sched->cpu_sched_act_x.size() < v_in_bytes) sched->cpu_sched_act_x.resize(v_in_bytes);
+                                if (sched->cpu_sched_down_out.size() < v_out_bytes) sched->cpu_sched_down_out.resize(v_out_bytes);
+                                ggml_backend_tensor_get(plan.layer_input, sched->cpu_sched_act_x.data(), 0, v_in_bytes);
+                                struct ggml_tensor v_src1 = *plan.layer_input;
+                                v_src1.data = sched->cpu_sched_act_x.data();
+                                v_src1.buffer = nullptr;
+                                v_src1.view_src = nullptr;
+                                struct ggml_tensor v_ids = *plan.route_ids;
+                                v_ids.data = route_ids.data();
+                                v_ids.buffer = nullptr;
+                                v_ids.view_src = nullptr;
+                                struct ggml_tensor v_out = *v_down;
+                                v_out.data = sched->cpu_sched_down_out.data();
+                                v_out.buffer = nullptr;
+                                v_out.view_src = nullptr;
+                                v_out.src[0] = v_down->src[0];
+                                v_out.src[1] = &v_src1;
+                                v_out.src[2] = &v_ids;
+                                struct ggml_tensor * v_nodes[1] = { &v_out };
+                                struct ggml_tensor * v_leafs[3] = { v_down->src[0], &v_src1, &v_ids };
+                                struct ggml_cgraph v_graph = {};
+                                v_graph.n_nodes = 1;
+                                v_graph.nodes = v_nodes;
+                                v_graph.leafs = v_leafs;
+                                v_graph.n_leafs = 3;
+                                ggml_backend_graph_compute(sched->backends[cpu_backend_id_v], &v_graph);
+                                ggml_backend_synchronize(sched->backends[cpu_backend_id_v]);
+                                std::vector<float> v_executor((size_t) top_k * v_down->ne[0]);
+                                ggml_backend_tensor_get(v_down, v_executor.data(), 0, v_out_bytes);
+                                float worst = 0.0f;
+                                int worst_route = -1;
+                                for (int32_t r = 0; r < top_k; r++) {
+                                    float row_max = 0.0f;
+                                    for (int32_t d = 0; d < v_down->ne[0]; d++) {
+                                        const float diff = fabsf(v_executor[(size_t) r * v_down->ne[0] + d] -
+                                            sched->cpu_sched_down_out[(size_t) r * v_down->ne[0] + d]);
+                                        row_max = std::max(row_max, diff);
+                                    }
+                                    if (row_max > worst) {
+                                        worst = row_max;
+                                        worst_route = r;
+                                    }
+                                }
+                                fprintf(stderr, "[MOE_PARTIAL_VERIFY] layer=%d hits=%d worst_route=%d max_abs=%.4f\n",
+                                    bundle.layer, n_hits, worst_route, worst);
+                            }
+                        }
+                    }
+                    if (!bundle_handled && !concurrent_eligible &&
+                        n_hits > 0 && n_hits == top_k - 1 && n_hits + n_misses == top_k) {
                         const int64_t d_model = bundle.down_node->ne[0];
                         const int64_t d_ff = bundle.is_fused ? bundle.gate_up_node->ne[0] / 2 : bundle.gate_node->ne[0];
                         if (sched->hetero_scratch == nullptr) {
@@ -3014,7 +3189,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         sched->route_census_stats.n_route_ready_actions++;
                         cur_j = dispatch->last_bundle_node_idx + 1;
-                    } else {
+                        bundle_handled = true;
+                    }
+                    if (!bundle_handled) {
                         // CPU-base fallback: canonical gate/up/act run in the prefix, then
                         // the down node runs on the host with valid activation data
                         struct ggml_tensor * down = bundle.down_node;
@@ -3029,6 +3206,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (cpu_backend_id < 0 || down == nullptr || down->src[1] == NULL) {
                             cur_j = dispatch->first_bundle_node_idx;
                             continue;
+                        }
+                        struct ggml_tensor * route_nodes[] = {
+                            bundle.gate_node,
+                            bundle.up_node,
+                            bundle.gate_up_node,
+                            bundle.down_node,
+                        };
+                        const size_t route_ids_bytes = route_ids.size() * sizeof(int32_t);
+                        for (struct ggml_tensor * node : route_nodes) {
+                            if (node == nullptr || node->src[2] == bundle.route_ids) {
+                                continue;
+                            }
+                            GGML_ASSERT(node->src[2] != nullptr);
+                            GGML_ASSERT(ggml_nbytes(node->src[2]) == route_ids_bytes);
+                            ggml_backend_tensor_set(node->src[2], route_ids.data(), 0, route_ids_bytes);
                         }
                         if (cur_j < j_down) {
                             struct ggml_cgraph pre_view = ggml_graph_view(&split->graph, cur_j, j_down);
@@ -3340,6 +3532,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (auto & dispatch : sched->route_ready_dispatches) {
         ggml_moe_route_ready_sidecar_free(dispatch.sidecar);
     }
+    for (const auto & entry : sched->partial_executors) {
+        ggml_moe_partial_executor_free(entry.executor);
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -3379,6 +3574,34 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph.leafs);
     free(sched);
 }
+
+#ifdef GGML_TEST
+bool ggml_backend_sched_get_partial_executor_test_state(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_partial_executor_test_state * state) {
+    if (sched == nullptr || state == nullptr) {
+        return false;
+    }
+
+    *state = {};
+    state->n_route_ready_dispatches = (int32_t) sched->route_ready_dispatches.size();
+    state->n_partial_executors = (int32_t) sched->partial_executors.size();
+    ggml_moe_partial_executor_t executor = nullptr;
+    for (const auto & dispatch : sched->route_ready_dispatches) {
+        if (dispatch.partial_executor == nullptr) {
+            return true;
+        }
+        if (executor == nullptr) {
+            executor = dispatch.partial_executor;
+        } else if (executor != dispatch.partial_executor) {
+            return true;
+        }
+    }
+    state->all_dispatches_share_executor = executor != nullptr;
+    return true;
+}
+#endif
+
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
@@ -3569,6 +3792,28 @@ void ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched) {
             printf("    %d/8 GPU Hits: %" PRIu64 "\n", k, sched->route_census_stats.hetero_partial_distribution[k]);
         }
         printf("====================================================\n\n");
+    }
+    if (sched->route_census_stats.hetero_partial_exec_by_hits[7] > 0) {
+        printf("\n=== Concurrent Partial Executor Telemetry ===\n");
+        printf("  Executions By Hit Mask  :");
+        for (int k = 1; k < 8; k++) {
+            printf(" %d/8:%" PRIu64, k, sched->route_census_stats.hetero_partial_exec_by_hits[k]);
+        }
+        printf("\n");
+        printf("  GPU Routes Executed     : %" PRIu64 "\n", sched->route_census_stats.hetero_partial_gpu_routes_executed);
+        printf("  CPU Routes Executed     : %" PRIu64 "\n", sched->route_census_stats.hetero_partial_cpu_routes_executed);
+        printf("  Activation D2H Bytes    : %zu\n", sched->route_census_stats.hetero_partial_activation_d2h_bytes);
+        printf("  CPU Result H2D Bytes    : %zu\n", sched->route_census_stats.hetero_partial_cpu_result_h2d_bytes);
+        printf("  Weight H2D Bytes        : %zu (MUST BE 0)\n", sched->route_census_stats.hetero_partial_weight_h2d_bytes);
+        printf("  GPU Hit Submit Us       : %" PRIu64 "\n", sched->route_census_stats.hetero_partial_gpu_hit_submit_us);
+        printf("  GPU Hit Elapsed Us      : %" PRIu64 "\n", sched->route_census_stats.hetero_partial_gpu_hit_elapsed_us);
+        printf("  CPU Miss Compute Us     : %" PRIu64 "\n", sched->route_census_stats.hetero_partial_cpu_miss_compute_us);
+        printf("  CPU Result H2D Us       : %" PRIu64 "\n", sched->route_census_stats.hetero_partial_cpu_result_h2d_us);
+        printf("  Join Wait GPU Us        : %" PRIu64 "\n", sched->route_census_stats.hetero_partial_join_wait_gpu_us);
+        printf("  Join Wait CPU Us        : %" PRIu64 "\n", sched->route_census_stats.hetero_partial_join_wait_cpu_us);
+        printf("  Scatter Us              : %" PRIu64 "\n", sched->route_census_stats.hetero_partial_scatter_us);
+        printf("  Total Us                : %" PRIu64 "\n", sched->route_census_stats.hetero_partial_total_us);
+        printf("=============================================\n\n");
     }
 }
 
