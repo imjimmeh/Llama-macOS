@@ -29,6 +29,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--cache-mib", type=int, default=0)
     parser.add_argument("--cache-period", type=int, default=32)
+    parser.add_argument("--pinned-experts", type=Path, default=None)
+    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--ubatch-size", type=int, default=2048)
     parser.add_argument("--threads", type=int, default=14)
     parser.add_argument("--ctx-size", type=int, default=128000)
     parser.add_argument("--fit-target", type=int, default=256)
@@ -64,20 +67,22 @@ def build_server_command(args: argparse.Namespace) -> list[str]:
         "-c", str(args.ctx_size),
         "-np", "1",
         "-t", str(args.threads),
-        "-b", "4096",
-        "-ub", "2048",
+        "-b", str(args.batch_size),
+        "-ub", str(args.ubatch_size),
         "-ctk", "q8_0",
         "-ctv", "q8_0",
         "-fa", "on",
         "-lm", "mmap",
         "-fitt", str(args.fit_target),
-        "-exc", f"{args.cache_mib}M" if args.cache_mib > 0 else "0",
         "--jinja",
         "-sps", str(args.sps),
         "--no-context-shift",
     ]
+    if args.pinned_experts is not None:
+        cmd.extend(["-pe", str(args.pinned_experts)])
     if args.cache_mib > 0:
         cmd.extend([
+            "-exc", f"{args.cache_mib}M",
             "-excp", str(args.cache_period),
             "-excs",
         ])

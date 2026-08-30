@@ -2489,4 +2489,31 @@ Sample-by-Sample Breakdown (Pass 2):
 
 Every sample exhibited a solid +10% to +13% decode speedup across the entire 2048-token generation sequence.
 
+### Batch & Rebalance Period Grid Sweep (2026-08-30)
+
+Swept batch sizes `(4096, 2048)`, `(2048, 1024)`, `(2048, 512)`, `(1024, 512)`, `(512, 512)`, cache sizes `(64M, 128M, 256M)`, rebalance periods `(16, 32, 64, 128, 256)`, and hybrid pinned v2 manifests on the 128k context 2048-token SPEED-Bench coding suite:
+
+Key Results:
+1. **Batch Sizing**: `b=1024, ub=512` proved optimal, delivering **25.65 tok/s** decode throughput and the lowest per-sample latency (98.55s) by minimizing graph allocation overhead while maintaining full prompt compute saturation.
+2. **Rebalance Period**: `excp = 128` achieved the highest sustained decode speed (**25.65 tok/s**) with minimal rebalance CPU interruption.
+3. **Cache Allocation**: `128M` dynamic cache achieved optimal performance without displacing full GPU layers under automatic fit (`-fitt 256`).
+
+### Head-to-Head Comparison: Baseline Upstream vs Tuned Expert Cache (2026-08-30)
+
+Direct head-to-head comparison between unmodified upstream `llama-server.exe` (`G:/code/AI/llama.cpp`) and tuned `llama-server.exe` with Dynamic Expert Cache (`G:/code/AI/llamacpptuned/llama.cpp`) under identical settings (`-m Qwen3.6-35B-A3B-APEX-Compact.gguf`, `-c 128000 -np 1 -b 1024 -ub 512 -fitt 256 -t 14 -ctk q8_0 -ctv q8_0 -sps 0.0 --no-context-shift`):
+
+| Server Implementation | Pass 1 Speed | Pass 2 Speed | Speedup vs Baseline | Pass 2 Avg Latency |
+|:---|---:|---:|---:|---:|
+| **Baseline Upstream llama.cpp** (`G:/code/AI/llama.cpp`) | 21.85 tok/s | 21.98 tok/s | *baseline (0.00%)* | 110.66s |
+| **Tuned (Dynamic Cache 128M, excp=128)** | **25.10 tok/s** | **25.54 tok/s** | **+16.20% (+3.56 tok/s)** | **99.06s (-11.60s)** |
+
+Sample-by-Sample Head-to-Head (Pass 2):
+- Sample 1 (0daf539b): 20.82 tok/s Baseline -> **25.58 tok/s Tuned (+22.91%)** [2048 tokens]
+- Sample 2 (135c7fe9): 20.95 tok/s Baseline -> **25.88 tok/s Tuned (+23.56%)** [2048 tokens]
+- Sample 3 (37f34960): 20.50 tok/s Baseline -> **25.24 tok/s Tuned (+23.10%)** [2048 tokens]
+- Sample 4 (1fd6d82b): 23.80 tok/s Baseline -> **25.46 tok/s Tuned (+6.98%)** [4096 tokens, 2 turns]
+- Sample 5 (48579d93): 23.81 tok/s Baseline -> **25.51 tok/s Tuned (+7.13%)** [2048 tokens]
+
+Prompt processing speed also improved from 142.18 tok/s to 453.84 tok/s (3.19x faster prompt evaluation) due to optimized graph compute allocations.
+
 Raw results and logs stored in `tools/results/expert-cache/server-speed-bench/`.

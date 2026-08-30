@@ -1,0 +1,50 @@
+[
+  {
+    "config": "Dynamic 128M (b=1024, ub=512, excp=32)",
+    "exc": 128,
+    "excp": 32,
+    "batch": 1024,
+    "ubatch": 512,
+    "pass_1_speed": 25.243957872128444,
+    "pass_2_speed": 25.474340405065455,
+    "pass_1_latency": 100.09276482000423,
+    "pass_2_latency": 99.29164480000327,
+    "elapsed_s": 1026.3631913661957
+  },
+  {
+    "config": "Dynamic 128M (b=1024, ub=512, excp=64)",
+    "exc": 128,
+    "excp": 64,
+    "batch": 1024,
+    "ubatch": 512,
+    "pass_1_speed": 25.134293997711346,
+    "pass_2_speed": 25.43590686608917,
+    "pass_1_latency": 100.42085743999633,
+    "pass_2_latency": 99.44345557999623,
+    "elapsed_s": 1024.9127900600433
+  },
+  {
+    "config": "Dynamic 128M (b=1024, ub=512, excp=128)",
+    "exc": 128,
+    "excp": 128,
+    "batch": 1024,
+    "ubatch": 512,
+    "pass_1_speed": 25.195518503982203,
+    "pass_2_speed": 25.654808247132358,
+    "pass_1_latency": 100.29954321999976,
+    "pass_2_latency": 98.54540640000486,
+    "elapsed_s": 1017.4315450191498
+  },
+  {
+    "config": "Dynamic 128M (b=1024, ub=512, excp=256)",
+    "exc": 128,
+    "excp": 256,
+    "batch": 1024,
+    "ubatch": 512,
+    "pass_1_speed": 23.97780446183876,
+    "pass_2_speed": 24.714742779534095,
+    "pass_1_latency": 84.09420113999803,
+    "pass_2_latency": 102.29729839999928,
+    "elapsed_s": 954.9907841682434
+  }
+]

@@ -1,0 +1,28 @@
+[
+  {
+    "prefix": "baseline-upstream-llamacpp",
+    "server": "G:\\code\\AI\\llama.cpp\\build\\bin\\Release\\llama-server.exe",
+    "cache_mib": 0,
+    "cache_period": 32,
+    "batch": 1024,
+    "ubatch": 512,
+    "pass_1_speed": 21.851853205966023,
+    "pass_2_speed": 21.976111583041043,
+    "pass_1_latency": 112.58095248000173,
+    "pass_2_latency": 110.66400702000246,
+    "elapsed_s": 1152.2171058654785
+  },
+  {
+    "prefix": "tuned-expert-cache-128m",
+    "server": "G:\\code\\AI\\llamacpptuned\\llama.cpp\\build\\bin\\Release\\llama-server.exe",
+    "cache_mib": 128,
+    "cache_period": 128,
+    "batch": 1024,
+    "ubatch": 512,
+    "pass_1_speed": 25.099097212528253,
+    "pass_2_speed": 25.535893535212264,
+    "pass_1_latency": 100.46505032000132,
+    "pass_2_latency": 99.05617390000552,
+    "elapsed_s": 1024.0349819660187
+  }
+]
