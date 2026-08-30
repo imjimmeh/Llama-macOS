@@ -3239,6 +3239,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         cpu_src1.data = sched->cpu_sched_act_x.data();
                         cpu_src1.buffer = NULL;
                         cpu_src1.view_src = NULL;
+                        cpu_src1.nb[0] = ggml_type_size(cpu_src1.type);
+                        for (int d = 1; d < GGML_MAX_DIMS; d++) {
+                            cpu_src1.nb[d] = cpu_src1.nb[d-1] * cpu_src1.ne[d-1];
+                        }
                         std::vector<int32_t> cpu_id_vals(route_ids);
                         for (int32_t r = 0; r < top_k; r++) {
                             if (cpu_id_vals[r] < 0) {
@@ -3249,6 +3253,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         struct ggml_tensor cpu_ids = *plan.route_ids;
                         cpu_ids.data = cpu_id_vals.data();
                         cpu_ids.buffer = NULL;
+                        cpu_ids.nb[0] = sizeof(int32_t);
+                        for (int d = 1; d < GGML_MAX_DIMS; d++) {
+                            cpu_ids.nb[d] = cpu_ids.nb[d-1] * cpu_ids.ne[d-1];
+                        }
                         cpu_ids.view_src = NULL;
                         struct ggml_tensor cpu_out = *down;
                         cpu_out.data = sched->cpu_sched_down_out.data();

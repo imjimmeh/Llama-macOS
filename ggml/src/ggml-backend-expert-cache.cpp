@@ -196,6 +196,14 @@ struct ggml_backend_expert_cache {
     struct ggml_backend_expert_cache_stats stats;
 };
 
+static bool ggml_expert_cache_tensor_is_host(const struct ggml_tensor * tensor) {
+    if (tensor == NULL) {
+        return false;
+    }
+    const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    return buffer == NULL || ggml_backend_buffer_is_host(buffer);
+}
+
 static void ggml_expert_cache_advance_residency_epoch(ggml_backend_expert_cache_t cache) {
     cache->residency_epoch++;
 }
@@ -760,7 +768,7 @@ void ggml_backend_expert_cache_record_access_count(
         int32_t expert_id,
         uint32_t count,
         enum ggml_expert_cache_phase phase) {
-    if (cache == NULL || tensor == NULL || count == 0) {
+    if (cache == NULL || tensor == NULL || count == 0 || !ggml_expert_cache_tensor_is_host(tensor)) {
         return;
     }
     ggml_expert_cache_key key = { tensor, expert_id };
@@ -2000,7 +2008,8 @@ bool ggml_backend_expert_cache_seed(
         const struct ggml_tensor * tensor,
         int32_t expert_id,
         uint32_t frequency) {
-    if (cache == NULL || tensor == NULL || expert_id < 0 || tensor->data == NULL) {
+    if (cache == NULL || tensor == NULL || expert_id < 0 || tensor->data == NULL ||
+        !ggml_expert_cache_tensor_is_host(tensor)) {
         return false;
     }
 

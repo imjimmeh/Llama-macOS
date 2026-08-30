@@ -358,6 +358,45 @@ static void test_rebalance_does_not_synchronize_gpu() {
     printf("  nonblocking rebalance promotion tests passed\n");
 }
 
+static void test_rebalance_ignores_gpu_resident_weights() {
+    printf("testing rebalance ignores GPU-resident weights...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    require(gpu_backend != nullptr);
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(gpu_backend, 4096);
+    require(cache != nullptr);
+    ggml_backend_expert_cache_set_period(cache, 1);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+    ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 2);
+    ggml_set_name(weights, "blk.0.ffn_gate_exps.weight");
+    ggml_backend_buffer_t weights_buffer = ggml_backend_alloc_ctx_tensors(ctx, gpu_backend);
+    require(weights_buffer != nullptr);
+    std::vector<float> values(ggml_nelements(weights), 1.0f);
+    ggml_backend_tensor_set(weights, values.data(), 0, ggml_nbytes(weights));
+
+    require(!ggml_backend_expert_cache_seed(cache, weights, 0, 1));
+    ggml_backend_expert_cache_record_access(cache, weights, 0);
+    ggml_backend_expert_cache_begin_step(cache);
+    require(ggml_backend_expert_cache_find_slot(cache, weights, 0) == -1);
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_backend_buffer_free(weights_buffer);
+    ggml_free(ctx);
+    ggml_backend_free(gpu_backend);
+
+    printf("  GPU-resident weight rebalance tests passed\n");
+}
+
 
 
 
@@ -2619,7 +2658,13 @@ static void test_route_ready_cross_split_sidecar() {
 
     ggml_backend_tensor_set(input, input_data, 0, sizeof(input_data));
     ggml_backend_tensor_set(route_input, ids, 0, sizeof(ids));
+    test_original_synchronize = gpu_backend->iface.synchronize;
+    require(test_original_synchronize != nullptr);
+    test_synchronize_calls = 0;
+    gpu_backend->iface.synchronize = test_count_synchronize;
     require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    gpu_backend->iface.synchronize = test_original_synchronize;
+    require(test_synchronize_calls >= 1);
 
     std::vector<float> first_actual(expected.size());
     ggml_backend_tensor_get(output, first_actual.data(), 0, ggml_nbytes(output));
@@ -2839,6 +2884,7 @@ int main() {
     test_registered_bundle_keeps_cpu_base_placement();
     test_partial_executor_scheduler_feature_gate();
     test_rebalance_does_not_synchronize_gpu();
+    test_rebalance_ignores_gpu_resident_weights();
     test_route_plan_groups_shared_ids();
     test_slot_pools_and_remapping();
     test_manifest_loader_outcome_stats();

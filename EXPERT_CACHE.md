@@ -40,6 +40,8 @@ The partial-hit oracle covers every 0-8 hit mask. Runtime profiling found the 1-
 - Cache residency can place a registered decode `MUL_MAT_ID` on an accelerator without changing general `op_offload` placement. Prompt processing retains normal placement.
 - A route-ready action executes the route-ID producer prefix, synchronizes its split backend, reads IDs once, and remaps every complete Gate/Up/Down slot bundle before any dependent GPU `MUL_MAT_ID` runs. The dispatch record follows the producer and all consumers across scheduler splits.
 - Full route-ready hits execute through the GPU sidecar. A bundle with exactly one missing route uses the serial heterogeneous path. Other incomplete bundles remain on the CPU-base path. None of these paths uploads expert weights during timed decode.
+- GPU-resident weight guard: `record_access_count()` and `seed()` now skip tensors with non-host buffers, preventing memcpy AV during rebalance and seeding on CUDA backend.
+- CPU-base fallback stride fix: activation (`cpu_src1`) and route-ID (`cpu_ids`) clones in the CPU-base fallback path now have strides reset to contiguous layout, fixing garbage output from the fallback path.
 - The full-hit sidecar test asserts one backend synchronization, four backend-stream uploads for an unfused bundle, one backend-stream output download, CPU-reference-equivalent output, and zero expert RAM-to-GPU bytes.
 - Sidecar error handling synchronizes queued uploads before slot release and resets failed GPU-buffer initialization for a retry. Regression coverage includes a failed graph submission, a repeated allocation failure, and two route-ready bundles in one split separated by non-bundle nodes.
 

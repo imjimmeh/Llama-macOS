@@ -2665,3 +2665,52 @@ Consequences:
 
 - The decision gate stands reinforced: concurrent execution stays development-gated behind `GGML_EXPERT_CACHE_HETERO_CONCURRENT=1`, serial remains the 7/8 production policy, and the threshold stays 7.
 - A `GGML_MOE_PARTIAL_VERIFY=1` diagnostic was added to the dispatcher's concurrent branch: after each successful concurrent execution it recomputes the bundle on the host and logs the worst route-row delta. This is the entry tool for the follow-up session that must debug the engaged-mode crash before forced-engagement configs are retried.
+
+---
+
+## CPU-Base Fallback Correctness Fixes (2026-08-30)
+
+**Scope**: When the route-ready dispatcher selects the CPU-base fallback path for incomplete bundles, the activation tensor must be copied from the GPU split to host memory before the CPU MUL_MAT_ID kernel reads it. Three correctness defects were identified and fixed.
+
+### Bug 1: GPU-Resident Weight Seeding Crash (memcpy AV)
+
+`record_access_count()` and `seed()` in `ggml-backend-expert-cache.cpp` did not check whether the tensor's buffer is host-resident. GPU-resident tensors (allocated via CUDA backend) have device pointers that cannot be memcpy'd to the legacy flat-cache staging buffer.
+
+- **Root cause**: `record_access_count()` reads `tensor->data` and passes it to `ggml_memcpy()` without checking `ggml_backend_buffer_is_host()`. `seed()` does the same for bulk copy into the legacy cache.
+- **Fix**: Added `ggml_expert_cache_tensor_is_host()` helper that checks `buffer == NULL || ggml_backend_buffer_is_host(buffer)`. Applied to both `record_access_count()` and `seed()` entry guards.
+- **Test**: `test_rebalance_ignores_gpu_resident_weights()` creates a GPU-resident weight tensor, asserts `seed()` returns false, and verifies `find_slot()` returns -1.
+
+### Bug 2: Cross-Split Route-ID Producer Not Synchronized
+
+When the route-ID producer runs in a different split from the consumer (split 0 produces IDs for a GPU split that reads them), the GPU split could read stale or uninitialized IDs because the producer's async compute had not completed.
+
+- **Root cause**: `ggml_backend_sched_compute_splits()` only synchronized the split's own backend, not the producer split's backend, before reading IDs.
+- **Fix**: Unconditional `ggml_backend_synchronize(sched->backends[producer_backend_id])` before `ggml_backend_tensor_get(bundle.route_ids, ...)`.
+- **Test**: `test_route_ready_cross_split_sidecar` hooks `gpu_backend->iface.synchronize`, verifies it is called at least once when producer and consumer are on different splits.
+
+### Bug 3: CPU-Base Fallback Clone Stride Corruption
+
+The CPU-base fallback path creates `cpu_src1` (activation clone) and `cpu_ids` (route-ID clone) as shallow copies of GPU tensors, then re-points `data` to host buffers. However, it does not reset the `nb[]` strides to match the host buffer layout. If the source tensor has non-contiguous strides (common for view tensors or tensors whose source was processed via scheduler split paths), the CPU MUL_MAT_ID kernel reads garbage data, producing incorrect output ("User User User User...").
+
+- **Root cause**: `cpu_src1.nb[]` and `cpu_ids.nb[]` retain the original GPU tensor's strides, which may describe a different memory layout than the host buffer where `data` now points.
+- **Fix**: Reset strides to contiguous layout after pointer reassignment:
+  - `cpu_src1.nb[0] = ggml_type_size(cpu_src1.type); for (d=1..3) nb[d] = nb[d-1] * ne[d-1];`
+  - `cpu_ids.nb[0] = sizeof(int32_t); for (d=1..3) nb[d] = nb[d-1] * ne[d-1];`
+- **Note**: `cpu_out` stride reset was not needed because `cpu_out` is a fresh clone of `down` which has correct contiguous strides from `ggml_new_tensor_impl`.
+- **Verification**: Server 64-token request with cache-on now produces coherent output matching cache-off baseline. `test_route_ready_full_hit_sidecar` passes with all43 test cases.
+
+### Files Modified
+
+1. `ggml/src/ggml-backend-expert-cache.cpp`: `ggml_expert_cache_tensor_is_host()` helper (~line 199), applied to `record_access_count()` and `seed()`.
+2. `ggml/src/ggml-backend.cpp`: Unconditional `ggml_backend_synchronize(producer_backend_id)` at line ~3030, stride reset for `cpu_src1` at line ~3242, stride reset for `cpu_ids` at line ~3255.
+3. `tests/test-expert-cache.cpp`: `test_rebalance_ignores_gpu_resident_weights()`, cross-split sync verification hook.
+
+### Telemetry Context
+
+Server telemetry with `-ngl 99 -ncmoe 1 -exc 128M -excp 32`:
+```text
+expert cache = no requests (8040 MUL_MAT_ID inputs, 0 eligible ops, 0 capacity bypasses, 201 CPU backend bypasses, 7839 non-host bypasses)
+expert route census = 1560 nodes, 520 plans, 39 CPU-host, 0 non-CPU-host, 1521 non-host, batch bands [1=120, 2-8=1080, 9-31=0, 32+=360]
+```
+0 cache requests because `-ngl 99` makes all MoE weights GPU-resident. 39 CPU-host plans = route-ready fallback paths. The fallback path is the active path producing output.
+
