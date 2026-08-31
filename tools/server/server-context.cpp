@@ -1254,6 +1254,7 @@ private:
         }
 
         // try speculative decoding
+        params_base.speculative.ngram_mod.model_weight_bytes = llama_model_size(model_tgt);
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));

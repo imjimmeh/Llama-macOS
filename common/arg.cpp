@@ -4318,7 +4318,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-ngram-mod-size"}, "SIZE",
-        "size of ngram-mod hash pool in bytes (e.g. 16M, 256M, 1G; default: 32M)",
+        "size of ngram-mod hash pool (e.g. 16M, 256M, 1G, 10%%; default: 32M)",
         [](common_params & params, const std::string & value) {
             size_t idx = 0;
             double val = std::stod(value, &idx);
@@ -4326,6 +4326,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             while (!unit.empty() && (unit.front() == ' ' || unit.front() == '\t')) unit.erase(unit.begin());
             while (!unit.empty() && (unit.back() == ' ' || unit.back() == '\t')) unit.pop_back();
             for (char & c : unit) c = toupper(c);
+
+            if (unit == "%") {
+                if (val <= 0.0 || val > 100.0) {
+                    throw std::invalid_argument("--spec-ngram-mod-size percentage must be between 0 and 100");
+                }
+                params.speculative.ngram_mod.pool_size_pct = val / 100.0;
+                return;
+            }
+
             if (unit.empty() && val > 0.0 && val < 1024.0 * 1024.0) {
                 LOG_WRN("--spec-ngram-mod-size %s is interpreted as %zu bytes; use a unit such as %sM for MiB\n",
                     value.c_str(), (size_t) val, value.c_str());

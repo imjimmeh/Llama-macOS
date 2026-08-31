@@ -357,6 +357,8 @@ struct common_params_speculative_ngram_mod {
     int32_t n_min = 48;
 
     size_t pool_size_bytes = 0; // 0 = default (4M slots * 8 bytes = 32 MB)
+    double pool_size_pct = 0.0; // > 0: percentage of model weight bytes (overrides pool_size_bytes)
+    size_t model_weight_bytes = 0; // set by server before init, used to resolve pool_size_pct
 };
 
 struct common_params_speculative_ngram_map {

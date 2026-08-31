@@ -1826,11 +1826,18 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
 // default pool: 4M slots * 8 bytes/slot = 32 MB
 static constexpr size_t NGRAM_MOD_DEFAULT_SLOTS = 4 * 1024 * 1024;
 
-static size_t compute_pool_slots(size_t pool_size_bytes) {
-    if (pool_size_bytes == 0) {
+static size_t compute_pool_slots(const common_params_speculative_ngram_mod & cfg) {
+    size_t bytes = cfg.pool_size_bytes;
+
+    if (cfg.pool_size_pct > 0.0 && cfg.model_weight_bytes > 0) {
+        bytes = (size_t)(cfg.model_weight_bytes * cfg.pool_size_pct);
+    }
+
+    if (bytes == 0) {
         return NGRAM_MOD_DEFAULT_SLOTS;
     }
-    const size_t n = pool_size_bytes / sizeof(ngram_mod_slot);
+
+    const size_t n = bytes / sizeof(ngram_mod_slot);
     return n > 0 ? n : NGRAM_MOD_DEFAULT_SLOTS;
 }
 
@@ -1861,7 +1868,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
         , params(params.ngram_mod)
-        , mod(params.ngram_mod.n_match, compute_pool_slots(params.ngram_mod.pool_size_bytes))
+        , mod(params.ngram_mod.n_match, compute_pool_slots(params.ngram_mod))
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
