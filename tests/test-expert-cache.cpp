@@ -3213,6 +3213,143 @@ static void test_cacheless_moe_subset_copy() {
     printf("  cacheless MoE subset copy tests passed\n");
 }
 
+static void test_deterministic_full_hit_latency_fixture() {
+    printf("testing deterministic 8/8 full-hit: native vs sidecar equivalence...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    const int32_t top_k = 8;
+    const int64_t d_model = 64;
+    const int64_t d_ff = 128;
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * gate_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, d_ff, top_k);
+    ggml_tensor * up_weights   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_model, d_ff, top_k);
+    ggml_tensor * down_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_ff, d_model, top_k);
+    ggml_tensor * input        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, 1);
+    ggml_tensor * route_input  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, 1);
+    ggml_set_input(input);
+    ggml_set_input(route_input);
+    ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(up_weights, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down_weights, "blk.0.ffn_down_exps.weight");
+
+    // Build graph: gate, up, swiglu, down
+    ggml_tensor * route_ids = ggml_dup(ctx, route_input);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, input, route_ids);
+    ggml_tensor * up = ggml_mul_mat_id(ctx, up_weights, input, route_ids);
+    ggml_tensor * activation = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * output = ggml_mul_mat_id(ctx, down_weights, activation, route_ids);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
+    require(buffer != nullptr);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    // Fill weights with deterministic values
+    srand(42);
+    std::vector<float> gate_data((size_t)d_model * d_ff * top_k, 0.0f);
+    std::vector<float> up_data((size_t)d_model * d_ff * top_k, 0.0f);
+    std::vector<float> down_data((size_t)d_ff * d_model * top_k, 0.0f);
+    for (int e = 0; e < top_k; e++) {
+        for (int j = 0; j < d_ff; j++) {
+            for (int i = 0; i < d_model; i++) {
+                gate_data[(size_t)e * d_ff * d_model + (size_t)j * d_model + (size_t)i] = 0.01f * (float)(rand() % 100);
+                up_data[(size_t)e * d_ff * d_model + (size_t)j * d_model + (size_t)i] = 0.01f * (float)(rand() % 100);
+            }
+        }
+        for (int i = 0; i < d_model; i++) {
+            for (int j = 0; j < d_ff; j++) {
+                down_data[(size_t)e * d_model * d_ff + (size_t)i * d_ff + (size_t)j] = 0.01f * (float)(rand() % 100);
+            }
+        }
+    }
+    std::vector<float> input_data(d_model, 0.5f);
+    for (int i = 0; i < d_model; i++) input_data[i] = 0.5f + 0.01f * (float)(i % 17);
+    const int32_t route_ids_arr[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+
+    ggml_backend_tensor_set(gate_weights, gate_data.data(), 0, ggml_nbytes(gate_weights));
+    ggml_backend_tensor_set(up_weights, up_data.data(), 0, ggml_nbytes(up_weights));
+    ggml_backend_tensor_set(down_weights, down_data.data(), 0, ggml_nbytes(down_weights));
+    ggml_backend_tensor_set(input, input_data.data(), 0, ggml_nbytes(input));
+    ggml_backend_tensor_set(route_input, route_ids_arr, 0, sizeof(route_ids_arr));
+
+    // Compute CPU reference
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    require(ggml_backend_graph_compute(cpu_backend, graph) == GGML_STATUS_SUCCESS);
+    std::vector<float> expected(ggml_nelements(output));
+    ggml_backend_tensor_get(output, expected.data(), 0, ggml_nbytes(output));
+
+    // Set up scheduler with expert cache
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    require(sched != nullptr);
+    ggml_backend_sched_set_expert_cache(sched, 1024 * 1024);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
+
+    // Seed all 8 route experts
+    for (int i = 0; i < top_k; i++) {
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_weights, route_ids_arr[i], 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, up_weights, route_ids_arr[i], 1));
+        require(ggml_backend_sched_expert_cache_seed(sched, 0, down_weights, route_ids_arr[i], 1));
+    }
+    ggml_backend_sched_expert_cache_sync(sched);
+    require(ggml_backend_sched_alloc_graph(sched, graph));
+
+    // Run via scheduler
+    const float sentinel = -99.0f;
+    std::vector<float> actual(expected.size(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+
+    ggml_backend_expert_cache_stats stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &stats));
+
+    // Verify CPU-reference equivalence
+    // NOTE: 1e-2 tolerance for GPU FMA vs CPU non-FMA accumulation differences
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-2f);
+    }
+
+
+    // Verify sidecar stats
+    require(stats.n_route_ready_classifications == 1);
+    require(stats.n_route_ready_actions == 1);
+    require(stats.n_route_ready_full_hits == 1);
+    require(stats.n_zero_copy_hits > 0);
+    require(stats.bytes_ram_to_gpu == 0);
+
+    // Verify stable route IDs
+    int32_t check_ids[8] = {};
+    ggml_backend_tensor_get(route_input, check_ids, 0, sizeof(check_ids));
+    for (int i = 0; i < 8; i++) {
+        require(check_ids[i] == (int32_t)route_ids_arr[i]);
+    }
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  deterministic 8/8 full-hit fixture tests passed\n");
+}
+
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -3259,6 +3396,7 @@ int main() {
     test_route_ready_two_bundles_same_split_gap();
     test_route_ready_cross_split_sidecar();
 
+    test_deterministic_full_hit_latency_fixture();
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;
 }

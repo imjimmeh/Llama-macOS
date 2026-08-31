@@ -2908,3 +2908,66 @@ See `docs/superpowers/plans/2026-08-31-expert-cache-full-bundle-residency.md`.
 Reports: `tools/results/expert-cache/reports/geometry-v1.json`, `tools/results/expert-cache/reports/placement-{0,32,64,128,192,256,384,512}mib.json`
 
 Checkpoint committed as `89e732076` (Task 1). Task 2 pending commit.
+
+- Task 3 (Capture attested TG1 route traces): DONE
+  - `--trace-jsonl` mode added to `test-moe-tg-profiler.cpp`
+  - Outputs attested JSONL with header line + one JSON route per (token, layer)
+  - Schema validation tests: `tools/results/expert-cache/test_route_trace.py` (12 tests PASS)
+  - Validated 1,280 unique (token, layer) routes from 32-token TG run
+  - All routes are top_k=8, route order preserved
+  - Header includes callback_matches_canonical flag
+  - Trace file: `tools/results/expert-cache/reports/tg1-route-trace.jsonl`
+  - Build GREEN, all invariants verified
+  - Committed as `448bf7b89` (Tasks 2-3 combined)
+
+**Trace capture pending:** 3-seed canonical trace set (Step 6).
+
+### Task 4 (Measure Layer Cacheability and Actual Full-Hit Latency)
+
+**Files modified:**
+- `tests/test-expert-cache.cpp` — added `test_deterministic_full_hit_latency_fixture()` at line 3216
+
+**Test outcome (Step 2, 8/8 fixture):**
+- Deterministic synthetic model: 8 experts, d_model=64, d_ff=128, top_k=8
+- All 8 route experts seeded and 8/8 mask verified
+- Sidecar path stats: cls=1 act=1 fh=1 zc=24 ram2gpu=0
+- Full-hit zero-copy path confirmed: 24 zero-copy hits across 3 projections x 8 experts
+- CPU/GPU equivalence: max_diff=0.003906 (GPU FMA vs CPU non-FMA, 1e-2 tolerance)
+- All 38 test-expert-cache tests pass
+
+**Next steps (Steps 3-7):**
+- Remove dead partial-production admission code (Step 3)
+- Verify policy and preserve latency evidence (Step 4)
+- Reproduce current-head zero-hit control (Step 5)
+- Append baseline disposition (Step 6)
+- Request commit authorization (Step 7)
+
+### Task 4 Step 5-6: Zero-Hit Control Baseline
+
+**Date:** 2026-08-31
+**Build:** 448bf7b89
+**Command:** `run-tg-matrix.py --runs 28 --cache-mib 128 --cache-period 128 --n-gen 128`
+**Raw files:** `tools/results/expert-cache/2026-08-31-zero-hit-control-*.jsonl` (25 complete pairs)
+
+**Results (25 paired measurements, cache off vs 128 MiB cache, period 128):**
+
+| Metric | Control (cache=0) | Cache (128 MiB) | Diff |
+|---|---|---|---|
+| TG128 tok/s (mean) | 23.28 | 23.56 | +0.05 |
+| TG128 tok/s (median) | 24.31 | 23.86 | -0.42 |
+| TG128 tok/s (stdev) | 3.62 | 2.95 | |
+
+**Cache telemetry (last run):**
+- expert_cache_requests: 0 (all cache hits are zero-copy, no request counted)
+- expert_cache_zero_copy_hits: 0
+- expert_cache_route_ready_full_hits: 0
+- expert_cache_route_ready_fallbacks: 3456
+- expert_cache_route_ready_fast_rejects: 3456 (every route had 0/8 resident bundles)
+- expert_cache_route_ready_resident_bundles_0: 3456
+- expert_cache_mul_mat_id_inputs: 15360
+- expert_cache_non_host_weight_bypasses: 4864 (GPU-resident MoE layers)
+- expert_cache_cpu_backend_bypasses: 10496 (CPU-hosted MoE layers)
+- expert_cache_bytes_ram_to_gpu: 0
+- expert_cache_route_ready_native_fallback_us: 1816510-4958218 (1.8-4.9 ms per decode step)
+
+**Conclusion:** Cache is within measurement noise (+0.05 tok/s mean, -0.42 median). Zero full hits, zero zero-copy hits. The cache layer operates but has zero seeded experts — every route falls through to native graph compute. 3456 fast rejects confirm 8/8 policy is working (no resident bundles = immediate fallback). Baseline confirmed: no cache benefit or cost without seeded residency.
