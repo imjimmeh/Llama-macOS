@@ -120,7 +120,7 @@ void ngram_mod_cache_fill_header(
     const auto & s = mod.get_stats();
     header.total_inserts = s.n_inserts;
     header.total_lookups = s.n_lookups;
-    header.total_hits    = s.n_hits;
+    header.flags         = NGRAM_MOD_CACHE_FLAG_FP_INDEX;
 }
 
 static bool atomic_write(const std::string & path, const void * data, size_t len) {
@@ -322,6 +322,13 @@ bool ngram_mod_cache_load(
 
     // tiered files are the cold store, not a hot pool dump
     if (header.flags & NGRAM_MOD_CACHE_FLAG_TIERED) {
+        fclose(f);
+        return false;
+    }
+
+    // older dumps index the pool by full hash; the pool now keys by
+    // fingerprint, so those entries would be unreachable
+    if (!(header.flags & NGRAM_MOD_CACHE_FLAG_FP_INDEX)) {
         fclose(f);
         return false;
     }
@@ -698,7 +705,7 @@ bool ngram_mod_cold_store::flush() {
     // footer checksum over cold slots + cold hits
     header.cold_entry_count = used;
     header.saved_ts = (uint64_t) time(nullptr);
-    header.flags |= NGRAM_MOD_CACHE_FLAG_CLEAN_CLOSE;
+    header.flags |= NGRAM_MOD_CACHE_FLAG_CLEAN_CLOSE | NGRAM_MOD_CACHE_FLAG_FP_INDEX;
 
     ngram_mod_cache_footer footer;
     footer.payload_checksum = xxh64((const uint8_t *) mmap.data + sizeof(header), cold_payload_bytes(capacity));

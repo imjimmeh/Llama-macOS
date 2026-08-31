@@ -23,6 +23,7 @@ static constexpr uint64_t NGRAM_MOD_CACHE_MAX_COLD_SLOTS = 8ULL * 1024 * 1024 * 
 // header flags
 static constexpr uint32_t NGRAM_MOD_CACHE_FLAG_TIERED      = 1u << 0;
 static constexpr uint32_t NGRAM_MOD_CACHE_FLAG_CLEAN_CLOSE = 1u << 1;
+static constexpr uint32_t NGRAM_MOD_CACHE_FLAG_FP_INDEX    = 1u << 2; // pool keyed by fingerprint
 
 struct ngram_mod_cache_header {
     uint32_t magic;

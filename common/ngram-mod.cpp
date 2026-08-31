@@ -23,7 +23,9 @@ size_t common_ngram_mod::hash(const entry_t * tokens) const {
 }
 
 size_t common_ngram_mod::idx(const entry_t * tokens) const {
-    return hash(tokens) % entries.size();
+    // fingerprint index: cold-store entries carry only {fp, token}, so the
+    // hot pool must place and find entries by fp for load-time selection
+    return fp(tokens) % entries.size();
 }
 
 uint32_t common_ngram_mod::fp(const entry_t * tokens) const {
