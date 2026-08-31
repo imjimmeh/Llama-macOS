@@ -156,3 +156,4 @@ AGENTS.local.md
 
 # determinism run artifacts
 scripts/determinism-row-*.json
+.worktrees/
