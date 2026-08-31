@@ -359,6 +359,9 @@ struct common_params_speculative_ngram_mod {
     size_t pool_size_bytes = 0; // 0 = default (4M slots * 8 bytes = 32 MB)
     double pool_size_pct = 0.0; // > 0: percentage of model weight bytes (overrides pool_size_bytes)
     size_t model_weight_bytes = 0; // set by server before init, used to resolve pool_size_pct
+
+    std::string cache_path;         // --spec-ngram-mod-cache PATH
+    int save_interval_sec = 0;      // --spec-ngram-mod-save-interval N (0 = shutdown only)
 };
 
 struct common_params_speculative_ngram_map {

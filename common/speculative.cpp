@@ -8,13 +8,14 @@
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
+#include "ngram-mod-cache.h"
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
 #include <cassert>
-#include <cstring>
+#include <ctime>
 #include <iomanip>
 #include <map>
 #include <cinttypes>
@@ -1863,6 +1864,10 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
     std::vector<seq_info> sinfos;
 
+    // persistence state
+    bool dirty = false;
+    int64_t last_save_ts = 0;
+
     common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
             uint32_t n_seq)
@@ -1882,7 +1887,41 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                     "see: https://github.com/ggml-org/llama.cpp/pull/19164\n", this->params.n_match);
         }
 
+        // attempt to load persistent cache
+        if (!this->params.cache_path.empty()) {
+            ngram_mod_cache_header cache_header;
+            if (ngram_mod_cache_load(this->params.cache_path, mod, cache_header,
+                    this->params.n_match, 0, "", "")) {
+                SPC_TRC("ngram-mod cache loaded: %zu entries, %.3f MB\n",
+                        mod.get_used(), (float)(mod.size_bytes())/1024/1024);
+            } else {
+                SPC_TRC("%s", "ngram-mod cache not loaded (missing or incompatible)\n");
+            }
+        }
+
+        last_save_ts = (int64_t)time(nullptr);
         sinfos.resize(n_seq);
+    }
+
+    ~common_speculative_impl_ngram_mod() override {
+        save_cache();
+    }
+
+    void save_cache() {
+        if (params.cache_path.empty() || !dirty) {
+            return;
+        }
+
+        ngram_mod_cache_header header;
+        ngram_mod_cache_fill_header(header, mod, params.n_match, 0, "", "");
+        header.saved_ts = (uint64_t)time(nullptr);
+
+        if (ngram_mod_cache_save(params.cache_path, mod, header)) {
+            SPC_TRC("ngram-mod cache saved: %zu entries, %.3f MB\n",
+                    mod.get_used(), (float)(mod.size_bytes())/1024/1024);
+            dirty = false;
+            last_save_ts = (int64_t)time(nullptr);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1900,6 +1939,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             mod.add(prompt.data() + i);
         }
 
+        dirty = true;
         sinfo.i_last = prompt.size() - n;
 
         const double f = (double)mod.get_used() / (double)mod.size();
@@ -1936,6 +1976,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                 mod.add(prompt.data() + i);
             }
 
+            dirty = true;
             sinfo.i_last = cur_len - n;
         }
 
@@ -1970,7 +2011,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     }
 
     bool process(const llama_batch & /*batch*/) override {
-        // TODO: implement
+        if (dirty && params.save_interval_sec > 0) {
+            int64_t now = (int64_t)time(nullptr);
+            if (now - last_save_ts >= params.save_interval_sec) {
+                save_cache();
+            }
+        }
         return true;
     }
 

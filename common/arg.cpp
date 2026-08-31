@@ -4354,6 +4354,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-cache"}, "PATH",
+        "path to persistent ngram-mod cache file (enables persistence)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_mod.cache_path = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-save-interval"}, "N",
+        "interval in seconds between periodic cache saves (0 = save only on shutdown, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("save interval must be >= 0");
+            }
+            params.speculative.ngram_mod.save_interval_sec = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",
