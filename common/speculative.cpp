@@ -1842,6 +1842,22 @@ static size_t compute_pool_slots(const common_params_speculative_ngram_mod & cfg
     return n > 0 ? n : NGRAM_MOD_DEFAULT_SLOTS;
 }
 
+static size_t compute_cold_slots(const common_params_speculative_ngram_mod & cfg) {
+    size_t bytes = cfg.cold_size_bytes;
+
+    if (cfg.cold_size_pct > 0.0 && cfg.model_weight_bytes > 0) {
+        bytes = (size_t)(cfg.model_weight_bytes * cfg.cold_size_pct);
+    }
+
+    if (bytes == 0) {
+        return 0; // tiering off
+    }
+
+    // each cold entry costs 8 B slot + 4 B hit counter
+    const size_t n = bytes / (sizeof(ngram_mod_slot) + sizeof(uint32_t));
+    return n > 0 ? n : 1;
+}
+
 struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     common_params_speculative_ngram_mod params;
 
@@ -1868,6 +1884,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     bool dirty = false;
     int64_t last_save_ts = 0;
 
+    // format v2 cold store (mapped; empty when tiering is off)
+    ngram_mod_cold_store cold_store;
+
     common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
             uint32_t n_seq)
@@ -1877,18 +1896,25 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
-        SPC_TRC("- n_match=%d, n_max=%d, n_min=%d\n",
-                this->params.n_match, this->params.n_max, this->params.n_min);
-        SPC_TRC("- pool slots=%zu (%.3f MB)\n",
-                mod.size(), (float)(mod.size_bytes())/1024/1024);
-
-        if (this->params.n_match < 16) {
-            SPC_WRN("ngram_mod n_match=%d is too small - poor quality is possible, "
-                    "see: https://github.com/ggml-org/llama.cpp/pull/19164\n", this->params.n_match);
+        // tiered mode: the cache file becomes the mapped cold store and the
+        // hot table starts empty (load-time hot selection is a later stage)
+        const size_t cold_slots = compute_cold_slots(this->params);
+        if (cold_slots > 0) {
+            if (this->params.cache_path.empty()) {
+                SPC_WRN("%s", "ngram_mod cold store needs --spec-ngram-mod-cache; tiering disabled\n");
+            } else if (cold_store.open(this->params.cache_path, cold_slots,
+                    this->params.n_match, 0, "", "")) {
+                SPC_TRC("ngram-mod cold store: %zu cold slots (%.3f MB mapped)\n",
+                        cold_store.size(),
+                        (float)(cold_store.size() * (sizeof(ngram_mod_slot) + sizeof(uint32_t)))/1024/1024);
+                SPC_TRC("%s", "ngram-mod tiered: hot table starts empty, cold store holds the cache file\n");
+            } else {
+                SPC_WRN("ngram_mod cold store open failed (capacity %zu slots); tiering disabled\n", cold_slots);
+            }
         }
 
-        // attempt to load persistent cache
-        if (!this->params.cache_path.empty()) {
+        // attempt to load persistent cache (non-tiered only)
+        if (!this->params.cache_path.empty() && !cold_store.is_open()) {
             ngram_mod_cache_header cache_header;
             if (ngram_mod_cache_load(this->params.cache_path, mod, cache_header,
                     this->params.n_match, 0, "", "")) {
@@ -1908,6 +1934,19 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     }
 
     void save_cache() {
+        if (cold_store.is_open()) {
+            // tiered: the mapped cold store is the persistence; flush dirty
+            // pages plus the footer checksum and clean-close flag
+            if (cold_store.flush()) {
+                SPC_TRC("ngram-mod cold store flushed: %zu cold entries\n",
+                        cold_store.used_count());
+                last_save_ts = (int64_t)time(nullptr);
+            } else {
+                SPC_WRN("%s", "ngram-mod cold store flush failed\n");
+            }
+            return;
+        }
+
         if (params.cache_path.empty() || !dirty) {
             return;
         }
@@ -2011,7 +2050,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     }
 
     bool process(const llama_batch & /*batch*/) override {
-        if (dirty && params.save_interval_sec > 0) {
+        if (params.save_interval_sec > 0 &&
+                (dirty || (cold_store.is_open() && cold_store.is_dirty()))) {
             int64_t now = (int64_t)time(nullptr);
             if (now - last_save_ts >= params.save_interval_sec) {
                 save_cache();

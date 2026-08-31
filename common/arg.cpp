@@ -1389,6 +1389,46 @@ static std::vector<std::string> parse_csv_row(const std::string& input) {
     return fields;
 }
 
+// parse "SIZE" arguments like 16M, 1G, 10% into byte count / percentage
+static void parse_size_arg(
+        const std::string & value,
+        size_t & bytes,
+        double & pct,
+        const char * opt_name) {
+    size_t idx = 0;
+    double val = std::stod(value, &idx);
+    std::string unit = value.substr(idx);
+    while (!unit.empty() && (unit.front() == ' ' || unit.front() == '\t')) unit.erase(unit.begin());
+    while (!unit.empty() && (unit.back() == ' ' || unit.back() == '\t')) unit.pop_back();
+    for (char & c : unit) c = toupper(c);
+
+    if (unit == "%") {
+        if (val <= 0.0 || val > 100.0) {
+            throw std::invalid_argument(string_format("%s percentage must be between 0 and 100", opt_name));
+        }
+        pct = val / 100.0;
+        return;
+    }
+
+    if (unit.empty() && val > 0.0 && val < 1024.0 * 1024.0) {
+        LOG_WRN("%s %s is interpreted as %zu bytes; use a unit such as %sM for MiB\n",
+            opt_name, value.c_str(), (size_t) val, value.c_str());
+    }
+    if (unit.empty() || unit == "B") {
+        bytes = (size_t)val;
+    } else if (unit == "K" || unit == "KB" || unit == "KIB") {
+        bytes = (size_t)(val * 1024.0);
+    } else if (unit == "M" || unit == "MB" || unit == "MIB") {
+        bytes = (size_t)(val * 1024.0 * 1024.0);
+    } else if (unit == "G" || unit == "GB" || unit == "GIB") {
+        bytes = (size_t)(val * 1024.0 * 1024.0 * 1024.0);
+    } else if (unit == "T" || unit == "TB" || unit == "TIB") {
+        bytes = (size_t)(val * 1024.0 * 1024.0 * 1024.0 * 1024.0);
+    } else {
+        throw std::invalid_argument(string_format("invalid unit in %s: %s", opt_name, unit.c_str()));
+    }
+}
+
 common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
     // per-example default params
     // we define here to make sure it's included in llama-gen-docs
@@ -4316,42 +4356,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_match = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
     add_opt(common_arg(
         {"--spec-ngram-mod-size"}, "SIZE",
         "size of ngram-mod hash pool (e.g. 16M, 256M, 1G, 10%%; default: 32M)",
         [](common_params & params, const std::string & value) {
-            size_t idx = 0;
-            double val = std::stod(value, &idx);
-            std::string unit = value.substr(idx);
-            while (!unit.empty() && (unit.front() == ' ' || unit.front() == '\t')) unit.erase(unit.begin());
-            while (!unit.empty() && (unit.back() == ' ' || unit.back() == '\t')) unit.pop_back();
-            for (char & c : unit) c = toupper(c);
-
-            if (unit == "%") {
-                if (val <= 0.0 || val > 100.0) {
-                    throw std::invalid_argument("--spec-ngram-mod-size percentage must be between 0 and 100");
-                }
-                params.speculative.ngram_mod.pool_size_pct = val / 100.0;
-                return;
-            }
-
-            if (unit.empty() && val > 0.0 && val < 1024.0 * 1024.0) {
-                LOG_WRN("--spec-ngram-mod-size %s is interpreted as %zu bytes; use a unit such as %sM for MiB\n",
-                    value.c_str(), (size_t) val, value.c_str());
-            }
-            if (unit.empty() || unit == "B") {
-                params.speculative.ngram_mod.pool_size_bytes = (size_t)val;
-            } else if (unit == "K" || unit == "KB" || unit == "KIB") {
-                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0);
-            } else if (unit == "M" || unit == "MB" || unit == "MIB") {
-                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0 * 1024.0);
-            } else if (unit == "G" || unit == "GB" || unit == "GIB") {
-                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0 * 1024.0 * 1024.0);
-            } else if (unit == "T" || unit == "TB" || unit == "TIB") {
-                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0 * 1024.0 * 1024.0 * 1024.0);
-            } else {
-                throw std::invalid_argument("invalid unit in --spec-ngram-mod-size: " + unit);
-            }
+            parse_size_arg(value, params.speculative.ngram_mod.pool_size_bytes,
+                           params.speculative.ngram_mod.pool_size_pct, "--spec-ngram-mod-size");
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -4359,6 +4370,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "path to persistent ngram-mod cache file (enables persistence)",
         [](common_params & params, const std::string & value) {
             params.speculative.ngram_mod.cache_path = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-cold-size"}, "SIZE",
+        "size of the on-disk cold store for ngram-mod (e.g. 16M, 1G, 10%%; 0 = tiering off, default: 0)",
+        [](common_params & params, const std::string & value) {
+            parse_size_arg(value, params.speculative.ngram_mod.cold_size_bytes,
+                           params.speculative.ngram_mod.cold_size_pct, "--spec-ngram-mod-cold-size");
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
