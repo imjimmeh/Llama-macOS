@@ -74,6 +74,62 @@ Expected outcome on the compact preset: coding/reasoning workloads repeat
 long sequences, so larger stores should keep helping. This must be measured,
 not assumed.
 
+### Stage A Results (measured 2026-08-31)
+
+**Occupancy / collision curve** (`tests/test-ngram-mod.cpp`, n=24, scale-free;
+1M/4M/16M slot pools agree within noise):
+
+| occupancy | 5% | 10% | 25% | 50% | 75% | 100% |
+|---|---|---|---|---|---|---|
+| overwrite rate | 0.025 | 0.049 | 0.115 | 0.213 | 0.297 | 0.368 |
+| lookup hit rate | 0.975 | 0.951 | 0.884 | 0.787 | 0.703 | 0.632 |
+
+False hits at 100% occupancy: 0 / 100000.
+
+**Pool-size sweep** (`tools/results/ngram-mod/run-ngram-mod-sweep.py`, compact
+preset model, 768 generated tokens, cold = fresh cache, warm = destructor-saved
+cache from the cold run):
+
+| size | mode | lookups | hits | hit_rate | overwrite_rate | t/s |
+|---|---|---|---|---|---|---|
+| 256M | cold | 896 | 288 | 0.321 | 0.173 | 25.3 |
+| 256M | warm | 1158 | 1008 | 0.870 | 0.831 | 44.8 |
+| 512M | cold | 896 | 288 | 0.321 | 0.173 | 25.7 |
+| 512M | warm | 1158 | 1008 | 0.870 | 0.831 | 43.8 |
+| 1G | cold | 896 | 288 | 0.321 | 0.173 | 23.9 |
+| 1G | warm | 1158 | 1008 | 0.870 | 0.831 | 45.9 |
+| 2G | cold | 896 | 288 | 0.321 | 0.173 | 26.2 |
+| 2G | warm | 1158 | 1008 | 0.870 | 0.831 | 43.9 |
+| 4G | cold | 896 | 288 | 0.321 | 0.173 | 26.3 |
+| 4G | warm | N/A | - | - | - | 26.0 |
+
+Raw records: `tools/results/ngram-mod/compact-20260831-ngram-mod-sweep.jsonl`
+(one row per run) and per-run logs `compact-20260831-<size>-<mode>.log`.
+
+Interpretation:
+
+1. Hit quality is occupancy-driven, not size-driven. All pool sizes give
+   identical stats on a 768-token run because only ~900 distinct n-grams are
+   learned (pool occupancy 0.00%). The scale-free micro-benchmark curve is the
+   pool-size evidence: 25% occupancy (the runtime reset threshold) costs hit
+   rate 0.975 -> 0.884; 100% occupancy costs 0.975 -> 0.632.
+2. Persistence dominates the short-run benefit: warm start hits 0.870 vs cold
+   0.321 and TG throughput 44-46 vs 24-26 t/s (+~75%). The value of ngram-mod
+   memory is retained knowledge across sessions, not raw pool size.
+3. The 4G warm row is missing because the v1 loader rejects capacity above
+   `NGRAM_MOD_CACHE_MAX_SLOTS` (256M slots = 2 GB, `ngram-mod-cache.h`). The
+   runtime accepts 4G pools (pool slots = 536870912); only the loader is
+   capped. This 2 GB load cap is itself a scalability limit the Stage B cold
+   store removes (mmap load has no giant heap fread).
+
+**Gate decision: PASS.** Hit coverage does improve past the RAM budget, but
+only through retention, not through a larger hot pool: the 25% occupancy reset
+currently destroys all learned n-grams, and the warm-run evidence shows that
+retained knowledge is worth ~3x hit rate and ~1.75x TG throughput. A cold
+store converts the reset from "wipe everything" to "demote to SSD", preserving
+that value across sessions and removing the 2 GB loader cap. Proceed to
+Stage B.
+
 ## 4. Design Decisions
 
 ### 4.1 Cold store is a writable mmap of the cache file

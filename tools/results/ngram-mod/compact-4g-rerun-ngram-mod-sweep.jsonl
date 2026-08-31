@@ -1,0 +1,2 @@
+{"size": "4G", "mode": "cold", "exit_code": 0, "pool_bytes": null, "lookups": 896, "hits": 288, "miss_fp": 0, "inserts": 913, "overwrites": 158, "hit_rate": 0.32142857142857145, "overwrite_rate": 0.17305585980284777, "decoded_tokens": 769, "tps": 25.117}
+{"size": "4G", "mode": "warm", "exit_code": 0, "pool_bytes": null, "lookups": 896, "hits": 288, "miss_fp": 0, "inserts": 913, "overwrites": 158, "hit_rate": 0.32142857142857145, "overwrite_rate": 0.17305585980284777, "decoded_tokens": 769, "tps": 25.15}
