@@ -355,6 +355,8 @@ struct common_params_speculative_ngram_mod {
 
     int32_t n_max = 64;
     int32_t n_min = 48;
+
+    size_t pool_size_bytes = 0; // 0 = default (4M slots * 8 bytes = 32 MB)
 };
 
 struct common_params_speculative_ngram_map {

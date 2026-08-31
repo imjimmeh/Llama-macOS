@@ -4316,6 +4316,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_match = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-size"}, "SIZE",
+        "size of ngram-mod hash pool in bytes (e.g. 16M, 256M, 1G; default: 32M)",
+        [](common_params & params, const std::string & value) {
+            size_t idx = 0;
+            double val = std::stod(value, &idx);
+            std::string unit = value.substr(idx);
+            while (!unit.empty() && (unit.front() == ' ' || unit.front() == '\t')) unit.erase(unit.begin());
+            while (!unit.empty() && (unit.back() == ' ' || unit.back() == '\t')) unit.pop_back();
+            for (char & c : unit) c = toupper(c);
+            if (unit.empty() && val > 0.0 && val < 1024.0 * 1024.0) {
+                LOG_WRN("--spec-ngram-mod-size %s is interpreted as %zu bytes; use a unit such as %sM for MiB\n",
+                    value.c_str(), (size_t) val, value.c_str());
+            }
+            if (unit.empty() || unit == "B") {
+                params.speculative.ngram_mod.pool_size_bytes = (size_t)val;
+            } else if (unit == "K" || unit == "KB" || unit == "KIB") {
+                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0);
+            } else if (unit == "M" || unit == "MB" || unit == "MIB") {
+                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0 * 1024.0);
+            } else if (unit == "G" || unit == "GB" || unit == "GIB") {
+                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0 * 1024.0 * 1024.0);
+            } else if (unit == "T" || unit == "TB" || unit == "TIB") {
+                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0 * 1024.0 * 1024.0 * 1024.0);
+            } else {
+                throw std::invalid_argument("invalid unit in --spec-ngram-mod-size: " + unit);
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",

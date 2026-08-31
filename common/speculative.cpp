@@ -1823,6 +1823,17 @@ struct common_speculative_impl_ngram_map_k : public common_speculative_impl {
     }
 };
 
+// default pool: 4M slots * 8 bytes/slot = 32 MB
+static constexpr size_t NGRAM_MOD_DEFAULT_SLOTS = 4 * 1024 * 1024;
+
+static size_t compute_pool_slots(size_t pool_size_bytes) {
+    if (pool_size_bytes == 0) {
+        return NGRAM_MOD_DEFAULT_SLOTS;
+    }
+    const size_t n = pool_size_bytes / sizeof(ngram_mod_slot);
+    return n > 0 ? n : NGRAM_MOD_DEFAULT_SLOTS;
+}
+
 struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     common_params_speculative_ngram_mod params;
 
@@ -1850,14 +1861,13 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
             uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
         , params(params.ngram_mod)
-        , mod(params.ngram_mod.n_match, 4*1024*1024)
+        , mod(params.ngram_mod.n_match, compute_pool_slots(params.ngram_mod.pool_size_bytes))
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
-        static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
         SPC_TRC("- n_match=%d, n_max=%d, n_min=%d\n",
                 this->params.n_match, this->params.n_max, this->params.n_min);
-        SPC_TRC("- mod size=%zu (%.3f MB)\n",
+        SPC_TRC("- pool slots=%zu (%.3f MB)\n",
                 mod.size(), (float)(mod.size_bytes())/1024/1024);
 
         if (this->params.n_match < 16) {
@@ -2797,8 +2807,23 @@ void common_speculative_print_stats(const common_speculative * spec) {
             oss << std::fixed << std::setprecision(2) << mean;
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
         }
+        // ngram-mod specific telemetry
+        std::string str_ngram_mod;
+        if (impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) {
+            const auto * nm = dynamic_cast<const common_speculative_impl_ngram_mod *>(impl.get());
+            if (nm) {
+                const auto & s = nm->mod.get_stats();
+                std::ostringstream oss;
+                oss << ", #nm lookups=" << s.n_lookups
+                    << " hits=" << s.n_hits
+                    << " miss_fp=" << s.n_miss_fp
+                    << " inserts=" << s.n_inserts
+                    << " overwrites=" << s.n_overwrites;
+                str_ngram_mod = oss.str();
+            }
+        }
 
-        SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
+        SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
                 impl->n_gen_drafts,
@@ -2806,6 +2831,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
                 str_stats.c_str(),
-                str_perf.c_str());
+                str_perf.c_str(),
+                str_ngram_mod.c_str());
     }
 }
