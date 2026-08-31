@@ -325,17 +325,6 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
-#ifdef GGML_TEST
-    struct ggml_backend_sched_partial_executor_test_state {
-        int32_t n_route_ready_dispatches;
-        int32_t n_partial_executors;
-        bool all_dispatches_share_executor;
-    };
-
-    GGML_API bool ggml_backend_sched_get_partial_executor_test_state(
-        ggml_backend_sched_t sched,
-        struct ggml_backend_sched_partial_executor_test_state * state);
-#endif
 
 
     // Initialize backend buffers from a measure graph

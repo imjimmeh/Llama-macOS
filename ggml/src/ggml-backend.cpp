@@ -892,19 +892,6 @@ struct ggml_backend_sched {
         bool valid = false;
     };
     std::vector<ggml_backend_sched_route_bundle_plan> bundle_plans;
-    struct ggml_backend_sched_partial_executor_entry {
-        ggml_backend_t gpu_backend = nullptr;
-        ggml_backend_t cpu_backend = nullptr;
-        int64_t d_model = 0;
-        int64_t d_ff = 0;
-        int32_t top_k = 0;
-        bool is_fused = false;
-        enum ggml_type gate_type = GGML_TYPE_COUNT;
-        enum ggml_type up_type = GGML_TYPE_COUNT;
-        enum ggml_type down_type = GGML_TYPE_COUNT;
-        ggml_moe_partial_executor_t executor = nullptr;
-    };
-    std::vector<ggml_backend_sched_partial_executor_entry> partial_executors;
 
 
     struct ggml_backend_sched_route_ready_dispatch {
@@ -916,13 +903,10 @@ struct ggml_backend_sched {
         int first_bundle_node_idx = -1;
         int last_bundle_node_idx = -1;
         ggml_moe_route_ready_sidecar_t sidecar = nullptr;
-        ggml_moe_partial_executor_t partial_executor = nullptr;
     };
     std::vector<ggml_backend_sched_route_ready_dispatch> route_ready_dispatches;
 
 
-    // Dedicated Heterogeneous Scratch Owner
-    ggml_moe_hetero_scratch_t hetero_scratch = nullptr;
 
     // Persistent CPU scratch for miss-path host execution
     std::vector<uint8_t> cpu_sched_act_x;
@@ -1347,63 +1331,6 @@ static void ggml_backend_sched_record_route_census(
 }
 
 
-static ggml_moe_partial_executor_t ggml_backend_sched_get_partial_executor(
-        ggml_backend_sched_t sched,
-        int gpu_backend_id,
-        int cpu_backend_id,
-        const ggml_backend_sched::ggml_backend_sched_route_bundle_plan & bundle,
-        int64_t d_model,
-        int64_t d_ff,
-        int32_t top_k) {
-    if (top_k != GGML_MOE_PARTIAL_MAX_ROUTES) {
-        return nullptr;
-    }
-
-    struct ggml_expert_bundle_weights weights = {};
-    ggml_backend_expert_cache_t cache = sched->expert_caches[gpu_backend_id];
-    if (cache == nullptr || !ggml_backend_expert_cache_get_bundle_weights(cache, bundle.layer, &weights) ||
-        weights.is_fused != bundle.is_fused || weights.down == nullptr ||
-        (bundle.is_fused ? weights.gate_up == nullptr : weights.gate == nullptr || weights.up == nullptr)) {
-        return nullptr;
-    }
-
-    const enum ggml_type gate_type = bundle.is_fused ? weights.gate_up->type : weights.gate->type;
-    const enum ggml_type up_type = bundle.is_fused ? GGML_TYPE_COUNT : weights.up->type;
-    for (const auto & entry : sched->partial_executors) {
-        if (entry.gpu_backend == sched->backends[gpu_backend_id] &&
-            entry.cpu_backend == sched->backends[cpu_backend_id] &&
-            entry.d_model == d_model && entry.d_ff == d_ff && entry.top_k == top_k &&
-            entry.is_fused == bundle.is_fused && entry.gate_type == gate_type &&
-            entry.up_type == up_type && entry.down_type == weights.down->type) {
-            return entry.executor;
-        }
-    }
-
-    ggml_moe_partial_executor_t executor = ggml_moe_partial_executor_new(
-        sched->backends[gpu_backend_id],
-        sched->backends[cpu_backend_id],
-        &weights,
-        d_model,
-        d_ff,
-        top_k,
-        bundle.is_fused);
-    if (executor == nullptr) {
-        return nullptr;
-    }
-    sched->partial_executors.push_back({
-        sched->backends[gpu_backend_id],
-        sched->backends[cpu_backend_id],
-        d_model,
-        d_ff,
-        top_k,
-        bundle.is_fused,
-        gate_type,
-        up_type,
-        weights.down->type,
-        executor,
-    });
-    return executor;
-}
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 static void ggml_backend_sched_build_route_ready_dispatches(ggml_backend_sched_t sched) {
@@ -1532,11 +1459,6 @@ static void ggml_backend_sched_build_route_ready_dispatches(ggml_backend_sched_t
         if (sidecar == nullptr) {
             continue;
         }
-        ggml_moe_partial_executor_t partial_executor = ggml_backend_sched_get_partial_executor(
-            sched, gpu_cache_backend_id, bundle_backend_id, bundle, d_model, d_ff, top_k);
-
-
-
         sched->route_ready_dispatches.push_back({
             &bundle,
             gpu_cache_backend_id,
@@ -1546,7 +1468,6 @@ static void ggml_backend_sched_build_route_ready_dispatches(ggml_backend_sched_t
             first_bundle_node_idx,
             last_bundle_node_idx,
             sidecar,
-            partial_executor,
         });
         sched->route_census_stats.n_route_ready_dispatches++;
     }
@@ -2525,14 +2446,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             });
         };
 
-        struct active_hetero_bundle {
-            const ggml_backend_sched::ggml_backend_sched_route_bundle_plan * plan;
-            std::vector<int32_t> ids;
-            int32_t top_k;
-            int j_first = -1;
-            int j_last = -1;
-        };
-        std::vector<active_hetero_bundle> split_hetero_bundles;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -2914,42 +2827,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             rib.offset += ids_bytes_padded;
                             continue;
                         } else {
-                            const char * env_hetero = getenv("GGML_EXPERT_CACHE_HETERO_EXPERIMENTAL");
-                            const bool use_hetero = (env_hetero != nullptr && atoi(env_hetero) > 0);
-                            if (bplan && bplan->valid && use_hetero) {
-                                bool already_registered = false;
-                                for (const auto & ex : split_hetero_bundles) {
-                                    if (ex.plan == bplan) {
-                                        already_registered = true;
-                                        break;
-                                    }
-                                }
-
-                                if (!already_registered) {
-                                    int j_gate = -1, j_up = -1, j_down = -1, j_act = -1;
-                                    for (int k = 0; k < split->graph.n_nodes; k++) {
-                                        struct ggml_tensor * nd = split->graph.nodes[k];
-                                        if (nd == (bplan->is_fused ? bplan->gate_up_node : bplan->gate_node)) j_gate = k;
-                                        if (!bplan->is_fused && nd == bplan->up_node) j_up = k;
-                                        if (nd == bplan->down_node) j_down = k;
-                                        if (bplan->down_node && nd == bplan->down_node->src[1]) j_act = k;
-                                    }
-
-                                    int j_first = j_gate;
-                                    if (j_up >= 0 && (j_first < 0 || j_up < j_first)) j_first = j_up;
-                                    if (j_act >= 0 && (j_first < 0 || j_act < j_first)) j_first = j_act;
-
-                                    int j_last = j_down;
-                                    if (j_gate > j_last) j_last = j_gate;
-                                    if (j_up > j_last) j_last = j_up;
-                                    if (j_act > j_last) j_last = j_act;
-
-                                    if (j_first >= 0 && j_last >= j_first) {
-                                        split_hetero_bundles.push_back({ bplan, ids, (int32_t)ids_tensor->ne[0], j_first, j_last });
-                                    }
-                                }
-                                continue;
-                            } else {
                                 if (bplan && bplan->valid && sched->callback_eval == NULL) {
                                     // all nodes in a valid registered bundle are deferred to
                                     // the route-ready dispatcher for TG, or executed normally in split->graph for PP
@@ -3005,7 +2882,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     node->op = GGML_OP_NONE;
                                     continue;
                                 }
-                            }
                         }
                     }
                 }
@@ -3162,36 +3038,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         cur_j = dispatch->last_bundle_node_idx + 1;
                         bundle_handled = true;
                     }
-                    if (!bundle_handled && n_tokens == 1 &&
-                        (top_k != GGML_MOE_PARTIAL_MAX_ROUTES || n_hits != top_k - 1) &&
-                        n_hits > 0 && n_hits == top_k - 1 && n_hits + n_misses == top_k) {
-                        const int64_t d_model = bundle.down_node->ne[0];
-                        const int64_t d_ff = bundle.is_fused ? bundle.gate_up_node->ne[0] / 2 : bundle.gate_node->ne[0];
-                        if (sched->hetero_scratch == nullptr) {
-                            sched->hetero_scratch = ggml_moe_hetero_scratch_init(
-                                sched->backends[dispatch->gpu_cache_backend_id], d_model, d_ff, 32);
-                        }
-                        if (sched->hetero_scratch == nullptr) {
-                            return GGML_STATUS_FAILED;
-                        }
-                        ec = ggml_backend_moe_hetero_execute_serial(
-                            sched->backends[dispatch->gpu_cache_backend_id],
-                            split_backend,
-                            &plan,
-                            cache,
-                            route_ids.data(),
-                            top_k,
-                            sched->hetero_scratch,
-                            &sched->route_census_stats);
-                        if (ec != GGML_STATUS_SUCCESS) {
-                            return ec;
-                        }
-                        sched->route_census_stats.n_route_ready_actions++;
-                        save_node_for_restore(plan.down_node);
-                        plan.down_node->op = GGML_OP_NONE;
-                        cur_j = dispatch->last_bundle_node_idx + 1;
-                        bundle_handled = true;
-                    }
                     if (!bundle_handled) {
                         const int64_t native_fallback_start = ggml_time_us();
 
@@ -3212,90 +3058,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     struct ggml_cgraph suffix_view = ggml_graph_view(&split->graph, cur_j, split->graph.n_nodes);
                     enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &suffix_view);
                     if (ec != GGML_STATUS_SUCCESS) {
-                        return ec;
-                    }
-                }
-            } else if (!split_hetero_bundles.empty()) {
-                std::sort(split_hetero_bundles.begin(), split_hetero_bundles.end(),
-                    [](const active_hetero_bundle & a, const active_hetero_bundle & b) {
-                        return a.j_first < b.j_first;
-                    });
-
-                int cur_j = 0;
-                for (const auto & hb : split_hetero_bundles) {
-                    if (hb.j_first > cur_j) {
-                        struct ggml_cgraph gv_pre = ggml_graph_view(&split->graph, cur_j, hb.j_first);
-                        enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv_pre);
-                        if (ec != GGML_STATUS_SUCCESS) {
-                            fprintf(stderr, "[ERROR] gv_pre failed: ec=%d cur_j=%d j_first=%d\n", ec, cur_j, hb.j_first);
-                            return ec;
-                        }
-                        ggml_backend_synchronize(split_backend);
-                    }
-
-                    // Execute heterogeneous MoE bundle
-                    int cpu_backend_id = -1;
-                    for (int b = 0; b < sched->n_backends; b++) {
-                        if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                            cpu_backend_id = b;
-                            break;
-                        }
-                    }
-
-                    if (cpu_backend_id >= 0) {
-                        ggml_backend_t cpu_backend = sched->backends[cpu_backend_id];
-                        const int64_t d_model = hb.plan->down_node->ne[0];
-                        const int64_t d_ff = hb.plan->is_fused ? (hb.plan->gate_up_node->ne[0] / 2) : (hb.plan->gate_node ? hb.plan->gate_node->ne[0] : 0);
-                        if (sched->hetero_scratch == nullptr) {
-                            sched->hetero_scratch = ggml_moe_hetero_scratch_init(split_backend, d_model, d_ff, 32);
-                        }
-                        struct ggml_moe_bundle_plan plan = {};
-                        plan.layer = hb.plan->layer;
-                        plan.kind = hb.plan->is_fused ? GGML_MOE_BUNDLE_FUSED_GATE_UP : GGML_MOE_BUNDLE_SEPARATE_GATE_UP;
-                        plan.route_ids = hb.plan->route_ids;
-                        plan.gate_node = hb.plan->gate_node;
-                        plan.up_node = hb.plan->up_node;
-                        plan.gate_up_node = hb.plan->gate_up_node;
-                        plan.act_node = hb.plan->down_node ? hb.plan->down_node->src[1] : nullptr;
-                        plan.down_node = hb.plan->down_node;
-                        plan.layer_input = hb.plan->gate_up_node ? hb.plan->gate_up_node->src[1] : (hb.plan->gate_node ? hb.plan->gate_node->src[1] : nullptr);
-                        plan.canonical_route_output = hb.plan->down_node;
-                        plan.is_fused = hb.plan->is_fused;
-                        plan.valid = hb.plan->valid;
-
-                        ggml_backend_expert_cache_t cache = sched->expert_caches[split_backend_id];
-
-                        const int32_t n_tokens = (int32_t)(plan.route_ids ? plan.route_ids->ne[1] : 1);
-                        const size_t total_ids = (size_t)hb.top_k * n_tokens;
-                        std::vector<int32_t> live_ids(total_ids);
-                        if (plan.route_ids) {
-                            ggml_backend_tensor_get(plan.route_ids, live_ids.data(), 0, total_ids * sizeof(int32_t));
-                        }
-
-                        enum ggml_status ec = ggml_backend_moe_hetero_execute_serial(
-                            split_backend,
-                            cpu_backend,
-                            &plan,
-                            cache,
-                            live_ids.data(),
-                            hb.top_k,
-                            sched->hetero_scratch,
-                            &sched->route_census_stats);
-                        if (ec != GGML_STATUS_SUCCESS) {
-                            fprintf(stderr, "[ERROR] hetero_execute_serial failed: ec=%d layer=%d\n", ec, plan.layer);
-                            return ec;
-                        }
-                        ggml_backend_synchronize(split_backend);
-                    }
-
-                    cur_j = hb.j_last + 1;
-                }
-
-                if (cur_j < split->graph.n_nodes) {
-                    struct ggml_cgraph gv_post = ggml_graph_view(&split->graph, cur_j, split->graph.n_nodes);
-                    enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv_post);
-                    if (ec != GGML_STATUS_SUCCESS) {
-                        fprintf(stderr, "[ERROR] gv_post failed: ec=%d cur_j=%d n_nodes=%d\n", ec, cur_j, split->graph.n_nodes);
                         return ec;
                     }
                 }
@@ -3461,9 +3223,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (auto & dispatch : sched->route_ready_dispatches) {
         ggml_moe_route_ready_sidecar_free(dispatch.sidecar);
     }
-    for (const auto & entry : sched->partial_executors) {
-        ggml_moe_partial_executor_free(entry.executor);
-    }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -3479,10 +3238,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
         sched->remapped_ids_buf[b].buffers.clear();
         sched->remapped_ids_buf[b].tensors.clear();
-    }
-    if (sched->hetero_scratch) {
-        ggml_moe_hetero_scratch_free(sched->hetero_scratch);
-        sched->hetero_scratch = nullptr;
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
@@ -3504,32 +3259,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched);
 }
 
-#ifdef GGML_TEST
-bool ggml_backend_sched_get_partial_executor_test_state(
-        ggml_backend_sched_t sched,
-        struct ggml_backend_sched_partial_executor_test_state * state) {
-    if (sched == nullptr || state == nullptr) {
-        return false;
-    }
-
-    *state = {};
-    state->n_route_ready_dispatches = (int32_t) sched->route_ready_dispatches.size();
-    state->n_partial_executors = (int32_t) sched->partial_executors.size();
-    ggml_moe_partial_executor_t executor = nullptr;
-    for (const auto & dispatch : sched->route_ready_dispatches) {
-        if (dispatch.partial_executor == nullptr) {
-            return true;
-        }
-        if (executor == nullptr) {
-            executor = dispatch.partial_executor;
-        } else if (executor != dispatch.partial_executor) {
-            return true;
-        }
-    }
-    state->all_dispatches_share_executor = executor != nullptr;
-    return true;
-}
-#endif
 
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {

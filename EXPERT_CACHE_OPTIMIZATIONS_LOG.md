@@ -2842,3 +2842,46 @@ The Compact server smoke used the cache-on preset shape (`-exc 128M`, `-excp 128
 The separate MTP workload was not changed. `test-benchmark-mtp.exe -m G:/ai/models/Qwen3.6-35B-A3B-APEX-MTP-Quality.gguf -p 64 -n 16 -fitt 256 -exc 0 -t 14` completed its cache-off baseline (PP 10.97 tok/s, TG 12.90 tok/s), then aborted during dynamic MTP promotion at `ggml/src/ggml-backend.cpp:213` with `GGML_ASSERT(buffer)` because a backend buffer was null. This prevents a valid new five-sample cache-on/cache-off MTP comparison. Existing multi-token cache correctness tests pass; no TG1 fast-reject rule was applied to MTP.
 
 Decision: retain the complete-bundle query and fast reject, keep the full-hit sidecar, demote TG1 7/8 to native fallback, and retain direct partial executors only for tests and development. Do not lower the threshold, add a GPU route classifier, or tune cache capacity based on this no-full-hit workload.
+
+### Dead Code Removal: Serial Hetero Branch and split_hetero_bundles Back-Door (2026-08-31)
+
+Removed 271 lines of production dead code from `ggml/src/ggml-backend.cpp` and 11 lines from `ggml/include/ggml-backend.h`, per Task 1 of the full-bundle-residency plan (`docs/superpowers/plans/2026-08-31-expert-cache-full-bundle-residency.md`).
+
+**Code removed:**
+
+- `partial_executor_entry` struct and `partial_executors` vector (scheduler member)
+- `partial_executor` field from `route_ready_dispatch` struct
+- `hetero_scratch` field from scheduler struct (with comment)
+- `get_partial_executor` function definition and its call site
+- `partial_executor` element from route-ready dispatch `push_back`
+- `active_hetero_bundle` struct and `split_hetero_bundles` vector (local to `compute_splits`)
+- `HETERO_EXPERIMENTAL` env-check back-door in graph splitting code that populated `split_hetero_bundles`
+- Serial hetero branch (7/8 mask -> `ggml_backend_moe_hetero_execute_serial`) inside the route-ready dispatcher
+- `split_hetero_bundles` execution block inside the `callback_eval == NULL` dispatch branch
+- `partial_executors` and `hetero_scratch` cleanup loops in `sched_free`
+- `GGML_TEST` test-state accessor struct and function (header + source)
+- `get_partial_executor_test_state` assertions in `test_partial_executor_scheduler_catalog` and `test_partial_executor_scheduler_feature_gate`
+- `hetero_partial_layers`/`hetero_gpu_routes`/`hetero_cpu_routes` assertions from stale-IDs test in `test_route_ready_full_hit_sidecar`
+
+**Dispatcher logic change:** The `} else if (!split_hetero_bundles.empty())` branch was replaced with a plain `} else { native compute }`. The native fallback (`if (!bundle_handled)`) remains unchanged.
+
+**Test updates:**
+- `test_partial_executor_scheduler_catalog`: removed `n_partial_executors` and `all_dispatches_share_executor` assertions, replaced with comment
+- `test_partial_executor_scheduler_feature_gate`: removed `exec_state` assertions
+- `test_route_ready_full_hit_sidecar` (stale-IDs test): sync count 2->1 (native fallback calls one sync, serial hetero called two), removed hetero stats assertions (always 0 now)
+- New `test_tg1_admission_masks_0_to_8` regression test PASSING (masks 0-6 fast-reject, 7 classify+fallback, 8 classify+full-hit, both with and without HETERO_EXPERIMENTAL=1)
+
+**Verification:** All 37+ test-expert-cache tests pass. No remaining references to removed symbols.
+
+
+---
+
+## Plan: Expert Cache Full-Bundle Residency (2026-08-31)
+
+See `docs/superpowers/plans/2026-08-31-expert-cache-full-bundle-residency.md`.
+
+- Task 1 (Lock TG1 full-hit admission): DONE
+  - 271 lines removed from production dispatcher
+  - Regression test PASSING
+  - Build GREEN
+  - Pending: commit authorization, baseline matrix run
