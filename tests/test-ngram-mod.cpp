@@ -1,14 +1,17 @@
 // ngram-mod pool: occupancy/collision behaviour micro-benchmark
+// plus format v1/v2 persistence round-trips
 //
 // Measures how lookup hit rate and overwrite rate degrade as a direct-mapped
 // hash pool fills up. The curve is scale-free (determined by occupancy, not
 // absolute slot count), so small pools stand in for the real 256M/1G/4G sizes.
 
+#include "ngram-mod-cache.h"
 #include "ngram-mod.h"
 
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -89,9 +92,213 @@ static void test_false_hits(uint16_t n) {
             false_hits++;
         }
     }
-
     printf("  false hits at 100%% occupancy: %zu / %zu\n", false_hits, N);
     require(false_hits < 10); // expects ~0 (1/2^32 per lookup)
+}
+
+// ---- format v1/v2 persistence ----
+
+static const char * COLD_PATH = "test-ngram-mod-cold.bin";
+static const char * V1_PATH   = "test-ngram-mod-v1.bin";
+
+// v1 save/load round-trip (tiering off path)
+static void test_v1_round_trip() {
+    const size_t cap = 1U << 16;
+    common_ngram_mod mod(24, cap);
+
+    std::mt19937 rng(1);
+    std::vector<int32_t> seq(25);
+    for (int i = 0; i < 500; i++) {
+        for (auto & t : seq) {
+            t = (int32_t)(rng() % 1000);
+        }
+        mod.add(seq.data());
+    }
+
+    ngram_mod_cache_header header;
+    ngram_mod_cache_fill_header(header, mod, 24, 0, "", "");
+    require(ngram_mod_cache_save(V1_PATH, mod, header));
+
+    common_ngram_mod loaded(24, cap);
+    ngram_mod_cache_header lh;
+    require(ngram_mod_cache_load(V1_PATH, loaded, lh, 24, 0, "", ""));
+    require(loaded.get_used() == mod.get_used());
+    require(memcmp(loaded.slots(), mod.slots(), cap * sizeof(ngram_mod_slot)) == 0);
+
+    remove(V1_PATH);
+}
+
+// write a genuine v1 file (version 1 header + slots + footer)
+static void write_v1_file(const char * path, const common_ngram_mod & mod, uint32_t n_match) {
+    FILE * f = fopen(path, "wb");
+    require(f != nullptr);
+
+    ngram_mod_cache_header h;
+    memset(&h, 0, sizeof(h));
+    h.magic       = NGRAM_MOD_CACHE_MAGIC;
+    h.version     = 1;
+    h.header_size = NGRAM_MOD_CACHE_HEADER_V1_SIZE;
+    h.slot_size   = sizeof(ngram_mod_slot);
+    h.capacity    = mod.size();
+    h.entry_count = mod.get_used();
+    h.n_match     = n_match;
+
+    const ngram_mod_cache_footer footer = { 0 };
+
+    require(fwrite(&h, 1, NGRAM_MOD_CACHE_HEADER_V1_SIZE, f) == NGRAM_MOD_CACHE_HEADER_V1_SIZE);
+    require(fwrite(mod.slots(), 1, mod.size() * sizeof(ngram_mod_slot), f) == mod.size() * sizeof(ngram_mod_slot));
+    require(fwrite(&footer, 1, sizeof(footer), f) == sizeof(footer));
+    fclose(f);
+}
+
+// v2 cold store: create, write, flush, reopen, crash recovery, validation
+static void test_cold_store_round_trip() {
+    const size_t cap = 1U << 20; // 1M cold slots = 12 MB file
+    remove(COLD_PATH);
+
+    ngram_mod_cold_store store;
+    require(store.open(COLD_PATH, cap, 24, 0, "", ""));
+    require(store.is_open());
+    require(store.size() == cap);
+    require(store.used_count() == 0);
+
+    ngram_mod_slot s;
+    s.fingerprint = 0xDEADBEEF;
+    s.next_token  = 42;
+    store.set_slot(10, s, 7);
+    require(store.used_count() == 1);
+
+    s.fingerprint = 0x12345678;
+    s.next_token  = -3;
+    store.set_slot(10, s, 9); // overwrite in place
+    require(store.used_count() == 1);
+
+    s.fingerprint = 0xCAFEBABE;
+    s.next_token  = 1000;
+    store.set_slot(123456, s, 1);
+    require(store.used_count() == 2);
+
+    require(store.flush());
+
+    // header round-trips: tiered v2 header, expected file size
+    {
+        FILE * f = fopen(COLD_PATH, "rb");
+        require(f != nullptr);
+        ngram_mod_cache_header h;
+        memset(&h, 0, sizeof(h));
+        require(fread(&h, 1, sizeof(h), f) == sizeof(h));
+        require(h.magic == NGRAM_MOD_CACHE_MAGIC);
+        require(h.version == 2);
+        require(h.header_size == sizeof(ngram_mod_cache_header));
+        require(h.hits_size == sizeof(uint32_t));
+        require(h.capacity_cold == cap);
+        require(h.flags & NGRAM_MOD_CACHE_FLAG_TIERED);
+        require(h.flags & NGRAM_MOD_CACHE_FLAG_CLEAN_CLOSE);
+        require(h.cold_entry_count == 2);
+
+        const size_t expect = sizeof(ngram_mod_cache_header)
+            + cap * (sizeof(ngram_mod_slot) + sizeof(uint32_t))
+            + sizeof(ngram_mod_cache_footer);
+        require(fseek(f, 0, SEEK_END) == 0);
+        require(ftell(f) == (long) expect);
+        fclose(f);
+    }
+
+    // reopen: slots + hits persist
+    {
+        ngram_mod_cold_store s2;
+        require(s2.open(COLD_PATH, cap, 24, 0, "", ""));
+        const ngram_mod_slot * got = s2.get_slot(10);
+        require(got != nullptr);
+        require(got->fingerprint == 0x12345678);
+        require(got->next_token == -3);
+        require(s2.get_hits(10) == 9);
+        got = s2.get_slot(123456);
+        require(got != nullptr);
+        require(got->fingerprint == 0xCAFEBABE);
+        require(s2.get_hits(123456) == 1);
+        require(s2.get_slot(0) == nullptr); // empty slot
+        require(s2.used_count() == 2);
+    }
+
+    // crash: clear the clean-close flag; reopen must still work (checksum skipped)
+    {
+        FILE * f = fopen(COLD_PATH, "rb+");
+        require(f != nullptr);
+        const long off = (long) offsetof(ngram_mod_cache_header, flags);
+        require(fseek(f, off, SEEK_SET) == 0);
+        uint32_t flags = 0;
+        require(fread(&flags, 1, sizeof(flags), f) == sizeof(flags));
+        flags &= ~NGRAM_MOD_CACHE_FLAG_CLEAN_CLOSE;
+        require(fseek(f, off, SEEK_SET) == 0);
+        require(fwrite(&flags, 1, sizeof(flags), f) == sizeof(flags));
+        fclose(f);
+
+        ngram_mod_cold_store s3;
+        require(s3.open(COLD_PATH, cap, 24, 0, "", ""));
+        const ngram_mod_slot * got = s3.get_slot(10);
+        require(got != nullptr);
+        require(got->fingerprint == 0x12345678);
+        require(s3.is_dirty()); // crashed store needs a footer rewrite
+    }
+
+    // header validation: wrong n_match must be rejected
+    {
+        ngram_mod_cold_store s4;
+        require(!s4.open(COLD_PATH, cap, 32, 0, "", ""));
+    }
+
+    store.close(); // release the mapping so remove() can delete the file
+    remove(COLD_PATH);
+}
+
+// v1 cache file upgraded in place to a v2 cold store (hits = 0)
+static void test_v1_upgrade() {
+    const size_t v1_cap = 1U << 16;
+    common_ngram_mod mod(24, v1_cap);
+
+    std::mt19937 rng(2);
+    std::vector<int32_t> seq(25);
+    for (int i = 0; i < 1000; i++) {
+        for (auto & t : seq) {
+            t = (int32_t)(rng() % 5000);
+        }
+        mod.add(seq.data());
+    }
+    const size_t v1_used = mod.get_used();
+    require(v1_used > 0);
+
+    write_v1_file(V1_PATH, mod, 24);
+
+    const size_t cold_cap = 1U << 18; // 4x the v1 capacity
+    ngram_mod_cold_store store;
+    require(store.open(V1_PATH, cold_cap, 24, 0, "", ""));
+    require(store.size() == cold_cap);
+    require(store.used_count() == v1_used);
+
+    const ngram_mod_slot * src = mod.slots();
+    for (size_t i = 0; i < v1_cap; i++) {
+        if (src[i].is_empty()) {
+            require(store.get_slot(i) == nullptr);
+        } else {
+            const ngram_mod_slot * got = store.get_slot(i);
+            require(got != nullptr);
+            require(got->fingerprint == src[i].fingerprint);
+            require(got->next_token == src[i].next_token);
+            require(store.get_hits(i) == 0);
+        }
+    }
+    require(store.flush());
+
+    // upgraded file reopens as a valid tiered v2 store
+    {
+        ngram_mod_cold_store s2;
+        require(s2.open(V1_PATH, cold_cap, 24, 0, "", ""));
+        require(s2.used_count() == v1_used);
+    }
+
+    store.close(); // release the mapping so remove() can delete the file
+    remove(V1_PATH);
 }
 
 int main() {
@@ -111,6 +318,11 @@ int main() {
     }
 
     test_false_hits(n);
+
+    printf("test-ngram-mod: persistence round-trips\n");
+    test_v1_round_trip();
+    test_cold_store_round_trip();
+    test_v1_upgrade();
 
     printf("test-ngram-mod: OK\n");
     return 0;
