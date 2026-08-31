@@ -214,6 +214,26 @@ llama-server -m model.gguf --spec-type ngram-mod --spec-ngram-mod-size 10% --spe
 llama-server -m model.gguf --spec-type ngram-mod --spec-ngram-mod-size 1G --spec-ngram-mod-cache ./model.ngram --spec-ngram-mod-save-interval 10
 ```
 
+**Two-tier mode:**
+
+With `--spec-ngram-mod-cold-size`, the cache file becomes a mapped cold
+store on disk and the RAM pool is the hot tier. The hot tier is a
+direct-mapped fingerprint pool; an evicted hot entry is demoted to the cold
+store (keyed by the same fingerprint), and a cold hit is promoted back.
+At startup the hot tier is restored from the cold store, keeping the hottest
+entry of every hot slot (ranked by cold hit counter).
+
+```
+# 1 GB hot pool over a 4 GB on-disk cold store:
+llama-server -m model.gguf --spec-type ngram-mod --spec-ngram-mod-size 1G \
+    --spec-ngram-mod-cache ./model.ngram --spec-ngram-mod-cold-size 4G
+
+# Same, but never consult the cold store at decode time (pure hot tier):
+llama-server -m model.gguf --spec-type ngram-mod --spec-ngram-mod-size 1G \
+    --spec-ngram-mod-cache ./model.ngram --spec-ngram-mod-cold-size 4G \
+    --spec-ngram-mod-cold-fallback off
+```
+
 Applications:
 
 - Iterating over a block of text/code (e.g. in llama.vim)
@@ -231,6 +251,8 @@ The pool exposes telemetry counters via `-lv 4` and through the speculative stat
 - `lookups` / `hits` / `miss_fp` - get() outcomes (fingerprint mismatches count as misses)
 - `inserts` / `overwrites` - add() outcomes (overwrites indicate collision pressure)
 - `used` / `capacity` - occupancy
+- Tiered runs add `cold lookups` / `hits` / `promotes` / `demotes` /
+  `flushes` / `hot_loaded` (startup hot-tier restore count)
 - Persistence events (cache loaded, cache saved) are logged at `SPC_TRC` level
 
 ### Differences between ngram-simple, ngram-map and ngram-mod
@@ -356,6 +378,11 @@ Unsupported samplers and device layouts fall back to CPU sampling. Tensor split 
                                         percentage sizes resolve relative to model weight bytes
 --spec-ngram-mod-cache                  PATH
                                         path to persistent ngram-mod cache file (enables persistence)
+--spec-ngram-mod-cold-size              SIZE
+                                        size of the on-disk cold store (e.g. 16M, 1G, 10%; default: 0 = tiering off)
+                                        percentage sizes resolve relative to model weight bytes; requires --spec-ngram-mod-cache
+--spec-ngram-mod-cold-fallback          on|off
+                                        consult the cold store on a hot miss when tiering is enabled (default: on)
 --spec-ngram-mod-save-interval          N
                                         seconds between periodic cache saves; 0 = shutdown only (default: 0)
 ```

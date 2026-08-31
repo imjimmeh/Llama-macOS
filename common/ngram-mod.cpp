@@ -12,27 +12,25 @@ common_ngram_mod::common_ngram_mod(uint16_t n, size_t size) : n(n), used(0) {
     reset();
 }
 
-size_t common_ngram_mod::idx(const entry_t * tokens) const {
+size_t common_ngram_mod::hash(const entry_t * tokens) const {
     size_t res = 0;
 
     for (size_t i = 0; i < n; ++i) {
         res = res*6364136223846793005ULL + tokens[i];
     }
-
-    res = res % entries.size();
 
     return res;
 }
 
+size_t common_ngram_mod::idx(const entry_t * tokens) const {
+    // fingerprint index: cold-store entries carry only {fp, token}, so the
+    // hot pool must place and find entries by fp for load-time selection
+    return fp(tokens) % entries.size();
+}
+
 uint32_t common_ngram_mod::fp(const entry_t * tokens) const {
-    size_t res = 0;
-
-    for (size_t i = 0; i < n; ++i) {
-        res = res*6364136223846793005ULL + tokens[i];
-    }
-
     // use upper 32 bits as fingerprint
-    return (uint32_t)(res >> 32);
+    return (uint32_t)(hash(tokens) >> 32);
 }
 
 void common_ngram_mod::add(const entry_t * tokens) {

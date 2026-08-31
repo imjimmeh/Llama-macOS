@@ -360,6 +360,10 @@ struct common_params_speculative_ngram_mod {
     double pool_size_pct = 0.0; // > 0: percentage of model weight bytes (overrides pool_size_bytes)
     size_t model_weight_bytes = 0; // set by server before init, used to resolve pool_size_pct
 
+    size_t cold_size_bytes = 0; // 0 = tiering off
+    double cold_size_pct = 0.0; // > 0: percentage of model weight bytes (overrides cold_size_bytes)
+    bool cold_fallback = true; // consult the cold store on a hot miss
+
     std::string cache_path;         // --spec-ngram-mod-cache PATH
     int save_interval_sec = 0;      // --spec-ngram-mod-save-interval N (0 = shutdown only)
 };

@@ -448,14 +448,17 @@ Not needed initially. Growth is rare and single-threaded. Just pause speculation
 
 ## Stage 8: Future Work (not in initial scope)
 
-- mmap-backed persistence
-- Hot/cold tiering
 - Corpus pre-seeding tool (`llama-ngram-mod-build`)
 - Admission policy (probationary table)
 - Richer confidence metadata per entry
 - Multiple continuation candidates
 - Multi-head hashing
 - Sparse cache file format (for large pools)
+
+Done in follow-up work:
+
+- mmap-backed persistence and hot/cold tiering: implemented in
+  `docs/superpowers/plans/2026-08-31-persistent-ngram-mod-hot-cold-tiering.md`
 
 ---
 
@@ -513,13 +516,8 @@ Tested on: Qwen3.5-4B Q4_K_M (2.6 GB), CPU-only, GTX 1080 + Ryzen 7 5700X.
 | Periodic save | Correctly saves on threshold |
 | Telemetry | `lookups`/`hits`/`miss_fp`/`inserts`/`overwrites` all reported |
 | Bug fix | `recount_used()` added to `ngram_mod_cache_load()` - reset cleared counter after fread |
-
-### Pending (Stages 5-8)
-
 - Export telemetry to llama-bench columns and Prometheus metrics
-- Benchmark matrix comparing cold vs warm start impact on TG throughput
 - Dynamic pool growth with `--spec-ngram-mod-grow` / `--spec-ngram-mod-max-size`
-- mmap-backed persistence, hot/cold tiering
 
 ### Verification Strategy
 

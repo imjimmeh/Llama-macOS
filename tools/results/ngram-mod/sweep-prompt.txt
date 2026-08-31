@@ -1,0 +1,20 @@
+Below is a text block. Repeat it exactly twice, one after the other, without any commentary.
+
+The quick brown fox jumps over the lazy dog. The lazy dog sleeps while the fox counts stars. Each star is a memory of a walk in the park. The park gates close at dusk and the fox returns home through the old iron fence.
+
+function compute_stats(items) {
+    let total = 0;
+    for (const item of items) {
+        total += item.value;
+    }
+    return total / items.length;
+}
+
+const config = {
+    retries: 3,
+    timeout: 5000,
+    backoff: 250,
+    maxConcurrent: 8,
+};
+
+Now repeat the block above exactly twice, verbatim, one after another.
