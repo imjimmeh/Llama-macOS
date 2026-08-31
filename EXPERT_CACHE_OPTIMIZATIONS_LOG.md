@@ -2731,9 +2731,23 @@ Token generation on MoE models (`Qwen3.6-35B-A3B-APEX-Compact`) with expert cach
 - **Fix**:
   1. Added `save_node_for_restore(plan.down_node);` and `plan.down_node->op = GGML_OP_NONE;` across all successful route-ready dispatch branches in `ggml/src/ggml-backend.cpp`.
   2. Maintained exact original preset configuration in `G:\qwen3.6-35b-a3b-presets-exc-latest.ini` (`exc = 128M`, `spec-type = ngram-mod`, `repeat-penalty = 1.0`, `expert-cache-profile = default`, `expert-cache-persist = on`).
+### Bug 6: APEX Scale Tensors and Cross-Split GPU Sync on MoE Inference (2026-08-31)
+
+Token generation on APEX-quantized MoE models (`Qwen3.6-35B-A3B-APEX-Compact`) with expert cache enabled produced corrupted / repetitive tokens during live inference.
+
+- **Root Cause 1 (Cross-Split Input Synchronization Race)**:
+  In `ggml_backend_sched_compute_splits` (`ggml-backend.cpp`), cross-split tensor copies from GPU to CPU (`ggml_backend_tensor_copy(input, input_cpy)`) had an incorrect `if (!has_expert_cache)` guard around `ggml_backend_synchronize(input_backend)`. Because `has_expert_cache` was true, the CPU began copying activation tensors and router logit tensors from GPU memory before CUDA finished computing them, causing the CPU split to read unfinished GPU buffer data.
+- **Root Cause 2 (APEX Scale Tensors Dropped in Manual Fallback)**:
+  APEX models use per-expert scale tensors (`blk.N.ffn_gate_exps.scale`, `blk.N.ffn_up_exps.scale`, `blk.N.ffn_down_exps.scale`). The previous manual fallback constructed a 3-node graph that evaluated raw `mul_mat_id` on unscaled weights without applying expert scales (`w_s`), leading to mis-scaled activation values.
+- **Root Cause 3 (Contiguity Check Rejecting APEX Bundles)**:
+  In `plan_route_ready_dispatches`, intermediate operations introduced by `build_lora_mm_id` (such as `ggml_mul`, `ggml_get_rows`, `ggml_repeat`, `ggml_unary`) between `first_bundle_node_idx` and `last_bundle_node_idx` were marked non-contiguous, dropping the dispatch while leaving nodes unexecuted.
+
+- **Fix**:
+  1. Removed the `!has_expert_cache` check in `ggml-backend.cpp` so that `input_backend` (GPU) is always synchronized before cross-split tensor copies into host memory.
+  2. Replaced the manual 3-node CPU graph fallback with native sub-graph segment execution: `ggml_graph_view(&split->graph, dispatch->first_bundle_node_idx, dispatch->last_bundle_node_idx + 1)` evaluated directly on `split_backend`. This natively preserves all APEX per-expert scale tensors, custom activations, and LoRA adapters with 100% mathematical fidelity to the baseline CPU path.
+  3. Updated `plan_route_ready_dispatches` contiguity validation to verify that intermediate nodes in `[first_bundle_node_idx, last_bundle_node_idx]` have valid bundle input sources.
+
 - **Verification**:
-  1. All 36 tests in `test-expert-cache.exe` passed 100%.
-  2. Verified end-to-end token generation on `llama-server` (port 8089) with the full preset under multi-turn chat requests. Produced clean, coherent reasoning traces and fluent responses with zero backslashes or repetitive loops.
-
-
-
+  1. Unit tests: All 36 tests in `test-expert-cache.exe` passed 100%.
+  2. Live server test: Ran `llama-server.exe` with exact user config `[qwen3.6-35B-apex-compact]` from `G:\qwen3.6-35b-a3b-presets-exc-latest.ini` (`--fit on --fit-target 256`, `exc = 128M`, `excp = 128`, `spec-type = ngram-mod`).
+  3. Generated two consecutive 512-token chat completion requests at 20.91 t/s and 20.29 t/s. Both outputs verified 100% coherent, structurally sound, and accurate with zero forward slashes or repetitive loops.

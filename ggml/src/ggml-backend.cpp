@@ -1487,7 +1487,28 @@ static void ggml_backend_sched_build_route_ready_dispatches(ggml_backend_sched_t
             const ggml_tensor * node = split.graph.nodes[node_idx];
             const bool consumer = node == bundle.gate_node || node == bundle.up_node ||
                 node == bundle.gate_up_node || node == bundle.down_node;
-            if (!consumer && node != activation && !ggml_is_view_op(node->op)) {
+            if (consumer || node == activation || ggml_is_view_op(node->op)) {
+                continue;
+            }
+            bool valid_bundle_op = false;
+            if (node->op == GGML_OP_MUL || node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_REPEAT ||
+                node->op == GGML_OP_ADD || node->op == GGML_OP_ADD_ID || node->op == GGML_OP_UNARY ||
+                node->op == GGML_OP_CLAMP || node->op == GGML_OP_GLU) {
+                valid_bundle_op = true;
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    const ggml_tensor * src = node->src[s];
+                    if (src == nullptr) continue;
+                    const bool is_bundle_src = src == bundle.gate_node || src == bundle.up_node ||
+                        src == bundle.gate_up_node || src == bundle.down_node || src == bundle.route_ids ||
+                        src == activation || ggml_is_view_op(src->op) ||
+                        (src->buffer && ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    if (!is_bundle_src) {
+                        valid_bundle_op = false;
+                        break;
+                    }
+                }
+            }
+            if (!valid_bundle_op) {
                 contiguous = false;
                 break;
             }
@@ -2615,14 +2636,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 } else if (!split_backend->iface.cpy_tensor_async ||
                            !split_backend->iface.cpy_tensor_async(
                                input_backend, split_backend, input, input_cpy)) {
-                    if (!has_expert_cache) {
-                        ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(
-                                sched->events[split_backend_id][sched->cur_copy]);
-                        } else {
-                            ggml_backend_synchronize(split_backend);
-                        }
+                    ggml_backend_synchronize(input_backend);
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(
+                            sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
                     }
                     ggml_backend_tensor_copy(input, input_cpy);
                 }
@@ -3153,126 +3172,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         bundle_handled = true;
                     }
                     if (!bundle_handled) {
-                        // CPU-base fallback: compute full FFN bundle on host CPU from layer_input
-                        int cpu_backend_id = -1;
-                        for (int b = 0; b < sched->n_backends; b++) {
-                            if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                                cpu_backend_id = b;
-                                break;
-                            }
-                        }
-                        if (cpu_backend_id < 0 || plan.layer_input == nullptr || plan.down_node == nullptr) {
-                            cur_j = dispatch->first_bundle_node_idx;
-                            continue;
-                        }
-
-                        const size_t in_bytes = ggml_nbytes(plan.layer_input);
-                        const size_t out_bytes = ggml_nbytes(plan.down_node);
-                        if (sched->cpu_sched_act_x.size() < in_bytes) sched->cpu_sched_act_x.resize(in_bytes);
-                        if (sched->cpu_sched_down_out.size() < out_bytes) sched->cpu_sched_down_out.resize(out_bytes);
-
-                        ggml_backend_synchronize(split_backend);
-                        if (plan.layer_input->buffer != nullptr && ggml_backend_buffer_is_host(plan.layer_input->buffer)) {
-                            memcpy(sched->cpu_sched_act_x.data(), plan.layer_input->data, in_bytes);
-                        } else {
-                            ggml_backend_tensor_get(plan.layer_input, sched->cpu_sched_act_x.data(), 0, in_bytes);
-                        }
-
-                        struct ggml_tensor cpu_src1 = *plan.layer_input;
-                        cpu_src1.op = GGML_OP_NONE;
-                        for (int s = 0; s < GGML_MAX_SRC; s++) cpu_src1.src[s] = NULL;
-                        cpu_src1.data = sched->cpu_sched_act_x.data();
-                        cpu_src1.buffer = NULL;
-                        cpu_src1.view_src = NULL;
-                        cpu_src1.view_offs = 0;
-                        cpu_src1.flags = 0;
-                        cpu_src1.nb[0] = ggml_type_size(cpu_src1.type);
-                        for (int d = 1; d < GGML_MAX_DIMS; d++) {
-                            cpu_src1.nb[d] = cpu_src1.nb[d-1] * cpu_src1.ne[d-1];
-                        }
-
-                        std::vector<int32_t> cpu_id_vals(route_ids);
-                        for (size_t r = 0; r < total_ids; r++) {
-                            if (cpu_id_vals[r] < 0) {
-                                cpu_id_vals[r] = 0;
-                            }
-                        }
-                        struct ggml_tensor cpu_ids = *plan.route_ids;
-                        cpu_ids.op = GGML_OP_NONE;
-                        for (int s = 0; s < GGML_MAX_SRC; s++) cpu_ids.src[s] = NULL;
-                        cpu_ids.data = cpu_id_vals.data();
-                        cpu_ids.buffer = NULL;
-                        cpu_ids.view_src = NULL;
-                        cpu_ids.view_offs = 0;
-                        cpu_ids.flags = 0;
-                        cpu_ids.nb[0] = sizeof(int32_t);
-                        for (int d = 1; d < GGML_MAX_DIMS; d++) {
-                            cpu_ids.nb[d] = cpu_ids.nb[d-1] * cpu_ids.ne[d-1];
-                        }
-
-                        struct ggml_init_params cpu_ctx_params = {
-                            /*.mem_size   =*/ 256 * 1024,
-                            /*.mem_buffer =*/ nullptr,
-                            /*.no_alloc   =*/ true,
-                        };
-                        struct ggml_context * cpu_ctx = ggml_init(cpu_ctx_params);
-                        struct ggml_tensor * cpu_down_out = nullptr;
-
-                        struct ggml_expert_bundle_weights weights = {};
-                        const bool has_bundle_weights = cache != nullptr &&
-                            ggml_backend_expert_cache_get_bundle_weights(cache, bundle.layer, &weights);
-
-                        struct ggml_tensor * gate = nullptr;
-                        struct ggml_tensor * up = nullptr;
-                        struct ggml_tensor * gate_up = nullptr;
-                        if (plan.is_fused) {
-                            struct ggml_tensor * gate_up_w = has_bundle_weights && weights.gate_up ? weights.gate_up : plan.gate_up_node->src[0];
-                            struct ggml_tensor * down_w = has_bundle_weights && weights.down ? weights.down : plan.down_node->src[0];
-                            gate_up = ggml_mul_mat_id(cpu_ctx, gate_up_w, &cpu_src1, &cpu_ids);
-                            const int64_t d_ff = gate_up_w->ne[0] / 2;
-                            gate = ggml_view_3d(cpu_ctx, gate_up, d_ff, top_k, n_tokens, gate_up->nb[1], gate_up->nb[2], 0);
-                            up   = ggml_view_3d(cpu_ctx, gate_up, d_ff, top_k, n_tokens, gate_up->nb[1], gate_up->nb[2], d_ff * gate_up->nb[0]);
-                            struct ggml_tensor * act  = ggml_swiglu_split(cpu_ctx, gate, up);
-                            cpu_down_out = ggml_mul_mat_id(cpu_ctx, down_w, act, &cpu_ids);
-                        } else {
-                            struct ggml_tensor * gate_w = has_bundle_weights && weights.gate ? weights.gate : plan.gate_node->src[0];
-                            struct ggml_tensor * up_w   = has_bundle_weights && weights.up ? weights.up : plan.up_node->src[0];
-                            struct ggml_tensor * down_w = has_bundle_weights && weights.down ? weights.down : plan.down_node->src[0];
-                            gate = ggml_mul_mat_id(cpu_ctx, gate_w, &cpu_src1, &cpu_ids);
-                            up   = ggml_mul_mat_id(cpu_ctx, up_w, &cpu_src1, &cpu_ids);
-                            struct ggml_tensor * act  = ggml_swiglu_split(cpu_ctx, gate, up);
-                            cpu_down_out = ggml_mul_mat_id(cpu_ctx, down_w, act, &cpu_ids);
-                        }
-
-                        struct ggml_cgraph * cpu_graph = ggml_new_graph(cpu_ctx);
-                        ggml_build_forward_expand(cpu_graph, cpu_down_out);
-                        ggml_backend_buffer_t cpu_buf = ggml_backend_alloc_ctx_tensors(cpu_ctx, sched->backends[cpu_backend_id]);
-                        if (plan.is_fused && gate_up != nullptr && gate != nullptr && up != nullptr) {
-                            gate->data = (char *) gate_up->data + gate->view_offs;
-                            up->data   = (char *) gate_up->data + up->view_offs;
-                        }
-                        ggml_backend_graph_compute(sched->backends[cpu_backend_id], cpu_graph);
-                        ggml_backend_tensor_get(cpu_down_out, sched->cpu_sched_down_out.data(), 0, out_bytes);
-                        ggml_backend_buffer_free(cpu_buf);
-                        ggml_free(cpu_ctx);
-
-                        const int64_t d_model_row = plan.down_node->ne[0];
-                        for (int32_t t = 0; t < n_tokens; t++) {
-                            for (int32_t r = 0; r < top_k; r++) {
-                                const size_t id_idx = (size_t) t * top_k + r;
-                                if (route_ids[id_idx] < 0) {
-                                    continue;
-                                }
-                                const size_t host_offset = id_idx * d_model_row * sizeof(float);
-                                const size_t dst_offset  = (size_t) t * plan.down_node->nb[2] + (size_t) r * plan.down_node->nb[1];
-                                ggml_backend_tensor_set_async(split_backend, plan.down_node,
-                                    (const uint8_t *) sched->cpu_sched_down_out.data() + host_offset,
-                                    dst_offset, d_model_row * sizeof(float));
-                            }
+                        // CPU fallback: compute native sub-graph segment on split backend
+                        struct ggml_cgraph bundle_view = ggml_graph_view(
+                            &split->graph, dispatch->first_bundle_node_idx, dispatch->last_bundle_node_idx + 1);
+                        ec = ggml_backend_graph_compute_async(split_backend, &bundle_view);
+                        if (ec != GGML_STATUS_SUCCESS) {
+                            return ec;
                         }
                         ggml_backend_synchronize(split_backend);
-                        save_node_for_restore(plan.down_node);
-                        plan.down_node->op = GGML_OP_NONE;
                         cur_j = dispatch->last_bundle_node_idx + 1;
                     }
                 }
