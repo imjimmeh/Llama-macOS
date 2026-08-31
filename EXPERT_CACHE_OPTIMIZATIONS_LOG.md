@@ -2885,3 +2885,26 @@ See `docs/superpowers/plans/2026-08-31-expert-cache-full-bundle-residency.md`.
   - Regression test PASSING
   - Build GREEN
   - Pending: commit authorization, baseline matrix run
+
+- Task 2 (Report MoE geometry and placement): DONE
+  - New tool `tests/test-moe-geometry-report.cpp` with `--geometry-json` and `--placement-json` modes
+  - Schema test `tools/results/expert-cache/test_geometry_report.py` (17 tests PASS)
+  - Schema `tools/results/expert-cache/geometry-schema-v1.json`
+  - 9 report files saved to `tools/results/expert-cache/reports/`
+  - Build GREEN, all invariants verified
+
+**Key geometry findings:**
+
+- **No APEX per-expert scale tensors** in this model (Compact quantization, Q4_K/Q3_K/Q6_K block quantization only)
+- **Two quantization tiers** across 40 layers:
+  - Tier A (5 layers each at start+end): q4_K gate+up + q6_K down, **1,992 KiB per bundle**, 498 MiB per full bank
+  - Tier B (30 middle layers): q3_K for all projections, **1,320 KiB per bundle**, 330 MiB per full bank
+- **Historical ~1.95 MiB estimate validated** for Tier A (within 2%)
+- **27 host-MoE layers** at all deployment capacities 0-256 MiB
+- At 128-256 MiB fit: 12 GPU, 27 CPU, 1 split layer (Layer 12 with only down on CPU)
+- At 0-64 MiB: 13 GPU, 27 CPU, 0 split
+- Full model bank: 40 * ~340 MiB average = ~13.6 GiB for all expert weights
+
+Reports: `tools/results/expert-cache/reports/geometry-v1.json`, `tools/results/expert-cache/reports/placement-{0,32,64,128,192,256,384,512}mib.json`
+
+Checkpoint committed as `89e732076` (Task 1). Task 2 pending commit.

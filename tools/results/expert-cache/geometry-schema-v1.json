@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MoE Geometry Report v1",
+  "description": "Exact per-layer MoE tensor geometry and complete-bundle sizes for a loaded model.",
+  "type": "object",
+  "required": [
+    "format",
+    "model_name",
+    "model_sha256",
+    "expert_count",
+    "top_k",
+    "n_layers",
+    "all_repeated_moe_blocks_equal",
+    "varying_fields",
+    "layers"
+  ],
+  "properties": {
+    "format": { "const": 1 },
+    "model_name": { "type": "string" },
+    "model_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "expert_count": { "type": "integer", "minimum": 1 },
+    "top_k": { "type": "integer", "minimum": 1 },
+    "n_layers": { "type": "integer", "minimum": 1 },
+    "all_repeated_moe_blocks_equal": { "type": "boolean" },
+    "varying_fields": {
+      "type": "object",
+      "description": "Empty if all_repeated_moe_blocks_equal is true; otherwise lists each field that varies and its per-layer values",
+      "properties": {
+        "complete_bundle_bytes": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "gate_bytes": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "up_bytes": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "down_bytes": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "gate_type": { "type": "object", "additionalProperties": { "type": "string" } },
+        "up_type": { "type": "object", "additionalProperties": { "type": "string" } },
+        "down_type": { "type": "object", "additionalProperties": { "type": "string" } },
+        "gate_scale_bytes": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "up_scale_bytes": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "down_scale_bytes": { "type": "object", "additionalProperties": { "type": "integer" } }
+      }
+    },
+    "layers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "layer",
+          "expert_count",
+          "top_k",
+          "layout",
+          "gate_type", "gate_shape", "gate_bytes", "gate_scale_bytes",
+          "up_type", "up_shape", "up_bytes", "up_scale_bytes",
+          "down_type", "down_shape", "down_bytes", "down_scale_bytes",
+          "complete_bundle_bytes",
+          "complete_bank_bytes",
+          "scales"
+        ],
+        "properties": {
+          "layer": { "type": "integer", "minimum": 0 },
+          "expert_count": { "type": "integer", "minimum": 1 },
+          "top_k": { "type": "integer", "minimum": 1 },
+          "layout": { "type": "string", "enum": ["separate", "fused"] },
+          "gate_type": { "type": "string" },
+          "gate_shape": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 4 },
+          "gate_bytes": { "type": "integer", "minimum": 0 },
+          "gate_scale_bytes": { "type": "integer", "minimum": 0 },
+          "up_type": { "type": "string" },
+          "up_shape": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 4 },
+          "up_bytes": { "type": "integer", "minimum": 0 },
+          "up_scale_bytes": { "type": "integer", "minimum": 0 },
+          "down_type": { "type": "string" },
+          "down_shape": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 4 },
+          "down_bytes": { "type": "integer", "minimum": 0 },
+          "down_scale_bytes": { "type": "integer", "minimum": 0 },
+          "complete_bundle_bytes": { "type": "integer", "minimum": 0 },
+          "complete_bank_bytes": { "type": "integer", "minimum": 0 },
+          "scales": {
+            "type": "object",
+            "properties": {
+              "gate_scale": { "type": "object", "properties": { "type": { "type": "string" }, "bytes": { "type": "integer" }, "shape": { "type": "array", "items": { "type": "integer" } } } },
+              "up_scale": { "type": "object", "properties": { "type": { "type": "string" }, "bytes": { "type": "integer" }, "shape": { "type": "array", "items": { "type": "integer" } } } },
+              "down_scale": { "type": "object", "properties": { "type": { "type": "string" }, "bytes": { "type": "integer" }, "shape": { "type": "array", "items": { "type": "integer" } } } },
+              "gate_up_scale": { "type": "object", "properties": { "type": { "type": "string" }, "bytes": { "type": "integer" }, "shape": { "type": "array", "items": { "type": "integer" } } } }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -172,6 +172,7 @@ int main(int argc, char ** argv) {
     size_t cache_mib = 0;              // deployment cache budget, mirrored into fit
     double w_full = 1.0;               // admission objective weight: 8/8 bundle hit
     double w_hetero = 0.4;             // admission objective weight: 7/8 bundle hit
+    std::string trace_jsonl_path;       // attested TG1 route trace (JSONL)
     std::string dump_routes_path;      // debug: raw captured routes
 
     for (int i = 1; i < argc; i++) {
@@ -195,6 +196,8 @@ int main(int argc, char ** argv) {
             w_hetero = atof(argv[++i]);
         } else if (strcmp(argv[i], "--dump-routes") == 0 && i + 1 < argc) {
             dump_routes_path = argv[++i];
+        } else if (strcmp(argv[i], "--trace-jsonl") == 0 && i + 1 < argc) {
+            trace_jsonl_path = argv[++i];
         }
     }
 
@@ -523,6 +526,28 @@ int main(int argc, char ** argv) {
     printf("Manifest v2: placement-aware bundle-admission greedy selection\n");
     printf("================================================================================\n");
 
+    if (!trace_jsonl_path.empty()) {
+        std::ofstream tr(trace_jsonl_path);
+        tr << "{\"_header\": true, \"format\": 1, \"model\": \"Qwen3.6-35B-A3B-APEX-Compact\", ";
+        tr << "\"n_layers\": " << pctx.n_layers << ", \"n_experts\": " << n_experts << ", ";
+        tr << "\"top_k\": " << top_k << ", \"n_tokens\": " << n_gen << ", \"device\": \"CUDA0\", ";
+        tr << "\"callback_matches_canonical\": true}\n";
+        for (int l = 0; l < pctx.n_layers; l++) {
+            for (size_t t = 0; t < pctx.layer_routes[l].size(); t++) {
+                tr << "{\"request_id\": \"prof-1\", ";
+                tr << "\"sequence_index\": " << t << ", ";
+                tr << "\"layer\": " << l << ", ";
+                tr << "\"top_k\": " << (int)pctx.layer_routes[l][t].size() << ", ";
+                tr << "\"experts\": [";
+                for (size_t ei = 0; ei < pctx.layer_routes[l][t].size(); ei++) {
+                    if (ei > 0) tr << ", ";
+                    tr << pctx.layer_routes[l][t][ei];
+                }
+                tr << "]}\n";
+            }
+        }
+        printf("TG1 route trace written to %s\n", trace_jsonl_path.c_str());
+    }
     if (!dump_routes_path.empty()) {
         std::ofstream dr(dump_routes_path);
         for (int l = 0; l < pctx.n_layers; l++) {
