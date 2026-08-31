@@ -9,6 +9,7 @@
 #include "ngram-mod-tier.h"
 #include "ngram-mod.h"
 #include <map>
+#include <set>
 
 #include <cinttypes>
 #include <cstdint>
@@ -94,8 +95,15 @@ static void test_false_hits(uint16_t n) {
             false_hits++;
         }
     }
-    printf("  false hits at 100%% occupancy: %zu / %zu\n", false_hits, N);
-    require(false_hits < 10); // expects ~0 (1/2^32 per lookup)
+    // the pool places by the same 32-bit fingerprint it checks, so at 100%
+    // occupancy only 32-log2(size) fingerprint bits are effective per slot:
+    // ~N * size / 2^32 false hits expected here, not the 1/2^32 of an
+    // h-keyed pool (which would expect ~0)
+    const size_t expect = N * size / (1ULL << 32);
+    printf("  false hits at 100%% occupancy: %zu / %zu (expect ~%zu)\n",
+           false_hits, N, expect);
+    require(false_hits > expect / 4); // sanity band around the expected rate
+    require(false_hits < 4 * expect + 1);
 }
 
 // ---- format v1/v2 persistence ----
@@ -364,39 +372,155 @@ static void test_tier_flush_reset() {
     common_ngram_mod_tier tier(3, 64);
     require(tier.cold.open(path, cold_cap, 3, 0, "", ""));
 
-    // vary a middle token: consecutive last tokens give consecutive hashes,
-    // which mostly share a fingerprint and pile onto one cold slot
-    for (int32_t x = 0; x < 24; x++) {
-        int32_t t[4] = {100, x, 300, 1000 + x};
-        tier.add(t);
+    // pick entries with distinct hot and cold indices so the assertions
+    // below are deterministic (fp keying is a hash; collisions are luck)
+    std::vector<int32_t> chosen;
+    std::vector<int32_t> t(4);
+    std::set<size_t> hot_idx, cold_idx;
+    for (int32_t x = 0; (int32_t) chosen.size() < 24 && x < 100000; x++) {
+        t = {100, x, 300, 1000 + x};
+        const size_t hi = tier.hot.idx(t.data());
+        const size_t ci = (uint32_t)(tier.hot.hash(t.data()) >> 32) % cold_cap;
+        if (hot_idx.insert(hi).second && cold_idx.insert(ci).second) {
+            chosen.push_back(x);
+        }
+    }
+    require(chosen.size() == 24);
+
+    for (const int32_t x : chosen) {
+        t = {100, x, 300, 1000 + x};
+        tier.add(t.data());
     }
     require(tier.hot.get_used() == 24);
 
     tier.flush_reset();
     require(tier.hot.get_used() == 0);
     require(tier.t_stats.n_flushed == 24);
-    require(tier.cold.used_count() == 24); // distinct fp indices for this data
+    require(tier.cold.used_count() == 24); // distinct cold indices by construction
 
     // entries are found via the cold store and promoted on hit
-    int32_t q[3] = {100, 5, 300};
-    require(tier.get(q) == 1005);
-    require(tier.t_stats.n_cold_hits == 1);
-    require(tier.hot.get_used() == 1);
+    for (const int32_t x : chosen) {
+        int32_t q[3] = {100, x, 300};
+        require(tier.get(q) == 1000 + x);
+    }
+    require(tier.t_stats.n_cold_hits == 24);
+    require(tier.hot.get_used() == 24); // each hit promoted into the hot pool
     require(tier.cold.flush());
 
     // a fresh tier over the same file must find the flushed entries
     {
         common_ngram_mod_tier tier2(3, 64);
         require(tier2.cold.open(path, cold_cap, 3, 0, "", ""));
-        int32_t q2[3] = {100, 10, 300};
-        require(tier2.get(q2) == 1010);
-        int32_t q3[3] = {100, 999, 300};
+        const int32_t x0 = chosen.front();
+        int32_t q2[3] = {100, x0, 300};
+        require(tier2.get(q2) == 1000 + x0);
+        int32_t q3[3] = {100, 100000, 300}; // never inserted
         require(tier2.get(q3) == COMMON_NGRAM_MOD_EMPTY);
         tier2.cold.close();
     }
 
     tier.cold.close(); // release the mapping so remove() can delete the file
     remove(path);
+}
+
+// tier: load_hot_from_cold fills the hot pool with the hottest cold entries
+static void test_tier_hot_selection() {
+    const char * path = "test-ngram-mod-tier.bin";
+    remove(path);
+
+    const size_t cold_cap = 1U << 16;
+    const size_t hot_cap = 64;
+    common_ngram_mod_tier tier(3, hot_cap);
+    require(tier.cold.open(path, cold_cap, 3, 0, "", ""));
+
+    // three entries, two colliding on hot slot 3 (fp % 64 == 3)
+    ngram_mod_slot s1 = { 0x10000043u, 111 }; // 0x43 % 64 = 3
+    ngram_mod_slot s2 = { 0x200000C3u, 222 }; // 0xC3 % 64 = 3, hotter
+    ngram_mod_slot s3 = { 0x30000007u, 333 }; // 0x07 % 64 = 7
+    require((size_t)(s1.fingerprint % hot_cap) == 3);
+    require((size_t)(s2.fingerprint % hot_cap) == 3);
+    require((size_t)(s3.fingerprint % hot_cap) == 7);
+    require(s1.fingerprint != s2.fingerprint);
+
+    tier.cold.set_slot(67, s1, 5);
+    tier.cold.set_slot(195, s2, 9);
+    tier.cold.set_slot(7, s3, 1);
+    require(tier.cold.used_count() == 3);
+    require(tier.cold.flush());
+    tier.cold.close();
+
+    // fresh tier: the scan must restore the hotter winner on slot 3
+    common_ngram_mod_tier tier2(3, hot_cap);
+    require(tier2.cold.open(path, cold_cap, 3, 0, "", ""));
+    const size_t n = tier2.load_hot_from_cold();
+    require(n == 2);
+    require(tier2.t_stats.n_hot_loaded == 2);
+    const auto & h3 = tier2.hot.slots()[3];
+    const auto & h7 = tier2.hot.slots()[7];
+    require(!h3.is_empty() && h3.fingerprint == s2.fingerprint && h3.next_token == 222);
+    require(!h7.is_empty() && h7.fingerprint == s3.fingerprint && h7.next_token == 333);
+    tier2.cold.close();
+
+    remove(path);
+}
+
+// non-tiered pool loads reject files that are not fingerprint-keyed
+static void test_old_scheme_rejected() {
+    const size_t cap = 1U << 16;
+    common_ngram_mod mod(24, cap);
+
+    std::mt19937 rng(3);
+    std::vector<int32_t> seq(25);
+    for (int i = 0; i < 200; i++) {
+        for (auto & tok : seq) {
+            tok = (int32_t)(rng() % 1000);
+        }
+        mod.add(seq.data());
+    }
+
+    // v1 files are always keyed by the full hash: non-tiered load must fail
+    write_v1_file(V1_PATH, mod, 24);
+    {
+        common_ngram_mod m(24, cap);
+        ngram_mod_cache_header h;
+        require(!ngram_mod_cache_load(V1_PATH, m, h, 24, 0, "", ""));
+    }
+    remove(V1_PATH);
+
+    // v2 without the FP_INDEX flag is an h-keyed dump: load must fail
+    ngram_mod_cache_header header;
+    ngram_mod_cache_fill_header(header, mod, 24, 0, "", "");
+    require(ngram_mod_cache_save(V1_PATH, mod, header));
+    {
+        const size_t flags_off = offsetof(ngram_mod_cache_header, flags);
+        FILE * f = fopen(V1_PATH, "r+b");
+        require(f != nullptr);
+        uint32_t flags = 0;
+        require(fseek(f, (long) flags_off, SEEK_SET) == 0);
+        require(fread(&flags, sizeof(flags), 1, f) == 1);
+        require(fseek(f, (long) flags_off, SEEK_SET) == 0);
+        flags &= ~NGRAM_MOD_CACHE_FLAG_FP_INDEX;
+        require(fwrite(&flags, sizeof(flags), 1, f) == 1);
+        fclose(f);
+
+        common_ngram_mod m(24, cap);
+        ngram_mod_cache_header h;
+        require(!ngram_mod_cache_load(V1_PATH, m, h, 24, 0, "", ""));
+
+        // restore the bit: the same file must load again
+        f = fopen(V1_PATH, "r+b");
+        require(f != nullptr);
+        require(fseek(f, (long) flags_off, SEEK_SET) == 0);
+        require(fread(&flags, sizeof(flags), 1, f) == 1);
+        require(fseek(f, (long) flags_off, SEEK_SET) == 0);
+        flags |= NGRAM_MOD_CACHE_FLAG_FP_INDEX;
+        require(fwrite(&flags, sizeof(flags), 1, f) == 1);
+        fclose(f);
+
+        require(ngram_mod_cache_load(V1_PATH, m, h, 24, 0, "", ""));
+        require(m.get_used() == mod.get_used());
+    }
+    remove(V1_PATH);
 }
 
 int main() {
@@ -421,8 +545,8 @@ int main() {
     test_v1_round_trip();
     test_tier_hot_cold();
     test_tier_flush_reset();
+    test_tier_hot_selection();
+    test_old_scheme_rejected();
     test_v1_upgrade();
-
-    printf("test-ngram-mod: OK\n");
     return 0;
 }
