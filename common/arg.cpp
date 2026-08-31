@@ -4316,6 +4316,61 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_match = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-size"}, "SIZE",
+        "size of ngram-mod hash pool (e.g. 16M, 256M, 1G, 10%%; default: 32M)",
+        [](common_params & params, const std::string & value) {
+            size_t idx = 0;
+            double val = std::stod(value, &idx);
+            std::string unit = value.substr(idx);
+            while (!unit.empty() && (unit.front() == ' ' || unit.front() == '\t')) unit.erase(unit.begin());
+            while (!unit.empty() && (unit.back() == ' ' || unit.back() == '\t')) unit.pop_back();
+            for (char & c : unit) c = toupper(c);
+
+            if (unit == "%") {
+                if (val <= 0.0 || val > 100.0) {
+                    throw std::invalid_argument("--spec-ngram-mod-size percentage must be between 0 and 100");
+                }
+                params.speculative.ngram_mod.pool_size_pct = val / 100.0;
+                return;
+            }
+
+            if (unit.empty() && val > 0.0 && val < 1024.0 * 1024.0) {
+                LOG_WRN("--spec-ngram-mod-size %s is interpreted as %zu bytes; use a unit such as %sM for MiB\n",
+                    value.c_str(), (size_t) val, value.c_str());
+            }
+            if (unit.empty() || unit == "B") {
+                params.speculative.ngram_mod.pool_size_bytes = (size_t)val;
+            } else if (unit == "K" || unit == "KB" || unit == "KIB") {
+                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0);
+            } else if (unit == "M" || unit == "MB" || unit == "MIB") {
+                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0 * 1024.0);
+            } else if (unit == "G" || unit == "GB" || unit == "GIB") {
+                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0 * 1024.0 * 1024.0);
+            } else if (unit == "T" || unit == "TB" || unit == "TIB") {
+                params.speculative.ngram_mod.pool_size_bytes = (size_t)(val * 1024.0 * 1024.0 * 1024.0 * 1024.0);
+            } else {
+                throw std::invalid_argument("invalid unit in --spec-ngram-mod-size: " + unit);
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-cache"}, "PATH",
+        "path to persistent ngram-mod cache file (enables persistence)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_mod.cache_path = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-save-interval"}, "N",
+        "interval in seconds between periodic cache saves (0 = save only on shutdown, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("save interval must be >= 0");
+            }
+            params.speculative.ngram_mod.save_interval_sec = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",

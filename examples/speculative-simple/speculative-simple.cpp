@@ -114,6 +114,7 @@ int main(int argc, char ** argv) {
     common_sampler_ptr smpl(common_sampler_init(model_tgt, params.sampling));
 
     // init the speculator
+    params.speculative.ngram_mod.model_weight_bytes = llama_model_size(model_tgt);
     const auto & params_spec = params.speculative;
 
     struct common_speculative * spec = common_speculative_init(params.speculative, 1);
