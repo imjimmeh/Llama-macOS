@@ -1895,7 +1895,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
         // tiered mode: the cache file becomes the mapped cold store and the
-        // hot table starts empty (load-time hot selection is a later stage)
+        // hot table is restored from the coldest-stored entries
         const size_t cold_slots = compute_cold_slots(this->params);
         if (cold_slots > 0) {
             if (this->params.cache_path.empty()) {
@@ -1907,7 +1907,18 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                         tier.cold.size(),
                         (float)(tier.cold.size() * (sizeof(ngram_mod_slot) + sizeof(uint32_t)))/1024/1024,
                         tier.cold_fallback ? "on" : "off");
-                SPC_TRC("%s", "ngram-mod tiered: hot table starts empty, cold store holds the cache file\n");
+
+                const int64_t t0 = ggml_time_us();
+                const size_t n_hot = tier.load_hot_from_cold();
+                const double dt = (ggml_time_us() - t0) / 1e6;
+                SPC_TRC("ngram-mod tier: hot slots=%zu (%.3f GB), cold slots=%zu (%.3f GB)\n",
+                        tier.hot.size(),
+                        (double)(tier.hot.size() * sizeof(ngram_mod_slot))/1024/1024/1024,
+                        tier.cold.size(),
+                        (double)(tier.cold.size() * (sizeof(ngram_mod_slot) + sizeof(uint32_t)))/1024/1024/1024);
+                const size_t n_cold = tier.cold.used_count();
+                SPC_TRC("ngram-mod tier: loaded %zu hot entries (top %.0f%% by hotness) in %.3f s\n",
+                        n_hot, n_cold > 0 ? 100.0 * n_hot / n_cold : 0.0, dt);
             } else {
                 SPC_WRN("ngram_mod cold store open failed (capacity %zu slots); tiering disabled\n", cold_slots);
             }
@@ -2920,7 +2931,8 @@ void common_speculative_print_stats(const common_speculative * spec) {
                         << " hits=" << t.n_cold_hits
                         << " promotes=" << t.n_promotions
                         << " demotes=" << t.n_demotions
-                        << " flushes=" << t.n_flushed;
+                        << " flushes=" << t.n_flushed
+                        << " hot_loaded=" << t.n_hot_loaded;
                 }
                 str_ngram_mod = oss.str();
             }

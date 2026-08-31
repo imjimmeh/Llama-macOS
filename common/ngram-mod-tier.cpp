@@ -6,7 +6,7 @@ void common_ngram_mod_tier::add(const int32_t * tokens) {
     if (tiered()) {
         const size_t   h = hot.hash(tokens);
         const uint32_t f = (uint32_t)(h >> 32);
-        const size_t   i = h % hot.size();
+        const size_t   i = f % hot.size(); // slot hot.add() will overwrite
 
         const auto & slot = hot.slots()[i];
         if (!slot.is_empty() && !slot.matches(f)) {
@@ -71,4 +71,32 @@ void common_ngram_mod_tier::flush_reset() {
     }
 
     hot.reset();
+}
+
+size_t common_ngram_mod_tier::load_hot_from_cold() {
+    if (!tiered()) {
+        return 0;
+    }
+
+    const size_t hot_cap = hot.size();
+    auto * hslots = hot.slots();
+    std::vector<uint32_t> hot_hits(hot_cap, 0); // parallel hotness, hot slots have no counter
+
+    for (size_t j = 0; j < cold.size(); j++) {
+        const auto * cs = cold.get_slot(j);
+        if (cs == nullptr) {
+            continue;
+        }
+        const uint32_t hits = cold.get_hits(j);
+        const size_t i = cs->fingerprint % hot_cap;
+        auto & hs = hslots[i];
+        if (hs.is_empty() || hot_hits[i] < hits) {
+            hs = *cs;
+            hot_hits[i] = hits;
+        }
+    }
+
+    hot.recount_used();
+    t_stats.n_hot_loaded = hot.get_used();
+    return t_stats.n_hot_loaded;
 }

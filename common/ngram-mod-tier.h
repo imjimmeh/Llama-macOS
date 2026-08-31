@@ -19,6 +19,7 @@ struct common_ngram_mod_tier {
         size_t n_promotions   = 0; // cold hits promoted into the hot pool
         size_t n_demotions    = 0; // evicted hot entries written to cold
         size_t n_flushed      = 0; // hot entries written to cold on reset
+        size_t n_hot_loaded   = 0; // hot entries restored from cold at startup
     };
 
     stats t_stats;
@@ -38,4 +39,8 @@ struct common_ngram_mod_tier {
     // write all hot entries to cold (preserving cold hit counters), then
     // reset the hot pool
     void flush_reset();
+
+    // startup scan: fill the hot pool with the hottest cold entries
+    // (per hot slot, the cold entry with the most hits wins)
+    size_t load_hot_from_cold();
 };
