@@ -268,6 +268,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-ngram-mod-size SIZE` | size of ngram-mod hash pool (e.g. 16M, 256M, 1G, 10%; default: 32M) |
 | `--spec-ngram-mod-cache PATH` | path to persistent ngram-mod cache file (enables persistence) |
 | `--spec-ngram-mod-cold-size SIZE` | size of the on-disk cold store for ngram-mod (e.g. 16M, 1G, 10%; 0 = tiering off, default: 0) |
+| `--spec-ngram-mod-cold-fallback on\|off` | consult the cold store on a hot miss when tiering is enabled (default: on) |
 | `--spec-ngram-mod-save-interval N` | interval in seconds between periodic cache saves (0 = save only on shutdown, default: 0) |
 | `--spec-ngram-simple-size-n N` | ngram size N for ngram-simple speculative decoding, length of lookup n-gram (default: 12) |
 | `--spec-ngram-simple-size-m N` | ngram size M for ngram-simple speculative decoding, length of draft m-gram (default: 48) |

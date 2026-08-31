@@ -361,6 +361,29 @@ stays near the single-tier 1G rate; cold lookup count is small relative to
 hot; promoted entries appear in hot; 25% occupancy reset no longer drops
 the hit rate to zero (demote works).
 
+**Stage C Results (2026-08-31, MSVC Release)**
+
+- Tier wrapper (`common/ngram-mod-tier.h/.cpp`): cold store is keyed by
+  fingerprint (cold idx = fp % cold size) so demotion needs only the stored
+  {fp, token} pair, and the v1 upgrade now places entries at the same
+  fingerprint index (the Stage B index-to-index copy was unreachable from
+  runtime lookups; fixed).
+- Hot hits never touch the cold mapping (plan 4.3 hot-hit hit-counter bump
+  dropped: it would put a random page touch on the hot path); cold hit
+  counters bump only on cold hits and survive flush merges.
+- Occupancy reset and shutdown flush the whole hot pool to cold before
+  resetting; the low-acceptance reset stays a hard hot wipe per plan.
+- `--spec-ngram-mod-cold-fallback on|off` gates cold lookups (default on).
+- Tests: demotion-on-overwrite, cold-hit promotion (counters verified),
+  fallback-off miss, flush_reset persistence across reopen, v1 upgrade at
+  fingerprint indices (988 v1 entries -> 986 cold, 2 fp-index collisions).
+- Smoke (CPU build, Qwen3.6-35B-APEX-Compact, 512M cold): fresh run fills
+  hot only; warm restart drafts and accepts 47/47 tokens via cold fallback +
+  promotion; with fallback off on the same warm cache: 0 drafts (gate works).
+  Exit state: cold_entry_count=155, flags=3 (tiered + clean close).
+- Telemetry: `statistics` line gains cold lookups/hits/promotes/demotes/
+  flushes when tiered (SPC_TRC, trace log level).
+
 ### Stage D: Load-Time Hot Selection
 
 **Task D1: startup scan**
