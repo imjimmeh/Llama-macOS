@@ -177,16 +177,18 @@ llama-server [...] --spec-type ngram-map-k4v --spec-ngram-map-k4v-size-n 8 --spe
 Add basic ngram hasher for speculative decoding:
 
 - For each ngram, compute a hash using LCG
-- For each computed hash, store the next token
+- For each computed hash, store the next token in a fingerprint+token slot
 - During speculation, iteratively compute the rolling hash of the last n tokens and pick the next token from the storage
 
 Some characteristics:
 
-- Lightweight (~16 MB)
+- Lightweight (default ~32 MB)
 - Constant memory and complexity
+- Configurable pool size (1 MB to many GB)
+- Optional persistent cache that survives server restarts
 - Can generate variable draft lengths (i.e. m is not fixed)
 
-Currently, a single hash pool is shared across all server slots, so different requests can benefit from each other.
+Currently, a single hash pool is shared across all server slots, so different requests can benefit from each other. When persistence is enabled, that shared state also survives server restarts.
 
 **Sample usage:**
 
@@ -199,15 +201,37 @@ Currently, a single hash pool is shared across all server slots, so different re
 llama-server ... --spec-type ngram-mod --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64
 ```
 
+**Persistent and large-pool examples:**
+
+```
+# 512 MB explicit pool with persistence:
+llama-server -m model.gguf --spec-type ngram-mod --spec-ngram-mod-size 512M --spec-ngram-mod-cache ./model.ngram
+
+# Allocate 10% of model weight bytes:
+llama-server -m model.gguf --spec-type ngram-mod --spec-ngram-mod-size 10% --spec-ngram-mod-cache ./model.ngram
+
+# Periodic save every 10 seconds:
+llama-server -m model.gguf --spec-type ngram-mod --spec-ngram-mod-size 1G --spec-ngram-mod-cache ./model.ngram --spec-ngram-mod-save-interval 10
+```
+
 Applications:
 
 - Iterating over a block of text/code (e.g. in llama.vim)
 - Reasoning models (when they have to repeat their thinking in the final answer)
 - Summarization
+- Long-running servers with recurring workloads (when paired with persistence)
 
 Example Video:
 
 - See #19164
+
+Telemetry:
+
+The pool exposes telemetry counters via `-lv 4` and through the speculative statistics output:
+- `lookups` / `hits` / `miss_fp` - get() outcomes (fingerprint mismatches count as misses)
+- `inserts` / `overwrites` - add() outcomes (overwrites indicate collision pressure)
+- `used` / `capacity` - occupancy
+- Persistence events (cache loaded, cache saved) are logged at `SPC_TRC` level
 
 ### Differences between ngram-simple, ngram-map and ngram-mod
 
@@ -327,6 +351,13 @@ Unsupported samplers and device layouts fall back to CPU sampling. Tensor split 
                                         minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48)
 --spec-ngram-mod-n-max                  N
                                         maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64)
+--spec-ngram-mod-size                   SIZE
+                                        size of the ngram-mod hash pool (e.g. 16M, 256M, 1G, 10%; default: 32M)
+                                        percentage sizes resolve relative to model weight bytes
+--spec-ngram-mod-cache                  PATH
+                                        path to persistent ngram-mod cache file (enables persistence)
+--spec-ngram-mod-save-interval          N
+                                        seconds between periodic cache saves; 0 = shutdown only (default: 0)
 ```
 
 ### n-gram Simple Parameters

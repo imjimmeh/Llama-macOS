@@ -463,7 +463,7 @@ Not needed initially. Growth is rare and single-threaded. Just pause speculation
 
 | Option | Type | Default | Stage |
 |---|---|---|---|
-| `--spec-ngram-mod-size SIZE` | SIZE (K/M/G/T/%) | 16M | 1 |
+| `--spec-ngram-mod-size SIZE` | SIZE (K/M/G/T/%) | 32M | 1 |
 | `--spec-ngram-mod-cache PATH` | string | "" | 3 |
 | `--spec-ngram-mod-save-interval N` | seconds | 0 | 4 |
 | `--spec-ngram-mod-max-size SIZE` | SIZE (K/M/G/T/%) | 0 | 7 |
@@ -498,7 +498,30 @@ The one observable change: default pool is now 32 MB (4M slots * 8 bytes) instea
 
 **Recommendation**: Accept 32 MB default. Document in changelog. If upstream maintainers object, it's trivial to reduce slot count.
 
-## Verification Strategy
+## Verification Results (Stages 1-4)
+
+Tested on: Qwen3.5-4B Q4_K_M (2.6 GB), CPU-only, GTX 1080 + Ryzen 7 5700X.
+
+| Test | Result |
+|------|--------|
+| `--spec-ngram-mod-size 64M` | 8M slots (64 MB confirmed) |
+| `--spec-ngram-mod-size 5%` | 17M slots (130.175 MB, correctly 5% of 2.6 GB model) |
+| Default (`--spec-type ngram-mod`) | 32 MB pool (4M slots), backwards compatible |
+| Cache file size | 67 MB for 64 MB pool (208 byte header + 8 byte checksum) |
+| Header validation | magic=0x4E474D44, version=1, all fields validated |
+| **Round-trip** | **Cold: 28 lookups / 0 hits (0%). Warm: 181 lookups / 153 hits (85%).** |
+| Periodic save | Correctly saves on threshold |
+| Telemetry | `lookups`/`hits`/`miss_fp`/`inserts`/`overwrites` all reported |
+| Bug fix | `recount_used()` added to `ngram_mod_cache_load()` - reset cleared counter after fread |
+
+### Pending (Stages 5-8)
+
+- Export telemetry to llama-bench columns and Prometheus metrics
+- Benchmark matrix comparing cold vs warm start impact on TG throughput
+- Dynamic pool growth with `--spec-ngram-mod-grow` / `--spec-ngram-mod-max-size`
+- mmap-backed persistence, hot/cold tiering
+
+### Verification Strategy
 
 After each stage:
 1. Build in Release mode
