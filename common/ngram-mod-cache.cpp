@@ -266,5 +266,8 @@ bool ngram_mod_cache_load(
         return false;
     }
 
+    // recount occupied slots after read (reset() cleared used counter)
+    mod.recount_used();
+
     return true;
 }

@@ -63,6 +63,15 @@ struct common_ngram_mod {
     const stats & get_stats() const { return m_stats; }
     void clear_stats() { m_stats = {}; }
 
+    // cache load support - recount occupied slots after direct slot write
+    void recount_used() {
+        used = 0;
+        for (const auto & s : entries) {
+            if (!s.is_empty()) {
+                used++;
+            }
+        }
+    }
 private:
     size_t n;   // ngram size to hash
     size_t used;
