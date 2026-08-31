@@ -929,6 +929,7 @@ struct ggml_backend_sched {
     std::vector<uint8_t> cpu_sched_down_out;
     std::vector<ggml_cache_route_bundle> sched_hit_routes;
     std::vector<ggml_cache_route_bundle> sched_miss_routes;
+    std::vector<int32_t> route_ready_ids_scratch;
 
     struct ggml_backend_sched_slot_use {
         ggml_backend_expert_cache_t cache = nullptr;
@@ -3051,14 +3052,51 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (ec != GGML_STATUS_SUCCESS) {
                             return ec;
                         }
+                        const int64_t prefix_sync_start = ggml_time_us();
                         ggml_backend_synchronize(split_backend);
+                        sched->route_census_stats.n_route_ready_prefix_sync_us +=
+                            (uint64_t) (ggml_time_us() - prefix_sync_start);
+
                     }
 
                     const auto & bundle = *dispatch->bundle;
                     const int32_t top_k = (int32_t) bundle.route_ids->ne[0];
                     const int32_t n_tokens = (int32_t) bundle.route_ids->ne[1];
                     const size_t total_ids = (size_t) ggml_nelements(bundle.route_ids);
-                    std::vector<int32_t> route_ids(total_ids);
+                    ggml_backend_expert_cache_t cache = sched->expert_caches[dispatch->gpu_cache_backend_id];
+                    const bool complete_bundle_count_check =
+                        n_tokens == 1 && top_k == GGML_MOE_PARTIAL_MAX_ROUTES;
+                    if (complete_bundle_count_check) {
+                        const int32_t resident_bundle_count =
+                            ggml_backend_expert_cache_count_complete_bundles(cache, bundle.layer, top_k);
+                        const int32_t resident_bundle_bucket = std::min(resident_bundle_count, 8);
+                        sched->route_census_stats.n_route_ready_resident_bundle_counts[resident_bundle_bucket]++;
+
+                        // Top-k route IDs are distinct, so fewer than seven complete bundles
+                        // cannot satisfy either TG1 admission path.
+                        if (resident_bundle_count < GGML_MOE_PARTIAL_MIN_GPU_HITS) {
+                            sched->route_census_stats.n_route_ready_fast_rejects++;
+                            sched->route_census_stats.n_route_ready_fallbacks++;
+                            const int64_t native_fallback_start = ggml_time_us();
+                            struct ggml_cgraph bundle_view = ggml_graph_view(
+                                &split->graph, dispatch->first_bundle_node_idx, dispatch->last_bundle_node_idx + 1);
+                            ec = ggml_backend_graph_compute_async(split_backend, &bundle_view);
+                            if (ec != GGML_STATUS_SUCCESS) {
+                                return ec;
+                            }
+                            ggml_backend_synchronize(split_backend);
+                            sched->route_census_stats.n_route_ready_native_fallback_us +=
+                                (uint64_t) (ggml_time_us() - native_fallback_start);
+
+                            cur_j = dispatch->last_bundle_node_idx + 1;
+                            continue;
+                        }
+                    }
+
+                    auto & route_ids = sched->route_ready_ids_scratch;
+                    route_ids.resize(total_ids);
+                    const int64_t route_id_start = ggml_time_us();
+
                     if (dispatch->producer_split != split_id) {
                         const int producer_backend_id = sched->splits[dispatch->producer_split].backend_id;
                         ggml_backend_synchronize(sched->backends[producer_backend_id]);
@@ -3067,27 +3105,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     } else {
                         ggml_backend_tensor_get(bundle.route_ids, route_ids.data(), 0, total_ids * sizeof(int32_t));
                     }
+                    sched->route_census_stats.n_route_ready_route_id_us +=
+                        (uint64_t) (ggml_time_us() - route_id_start);
 
-                    std::vector<ggml_cache_route_bundle> hits(total_ids);
-                    std::vector<ggml_cache_route_bundle> misses(total_ids);
+                    const int64_t route_partition_start = ggml_time_us();
+
+                    ggml_backend_sched_record_route_ready_accesses(
+                        bundle, cache, route_ids.data(), (int32_t) total_ids);
+
+                    auto & hits = sched->sched_hit_routes;
+                    auto & misses = sched->sched_miss_routes;
+                    hits.resize(total_ids);
+                    misses.resize(total_ids);
                     int32_t n_hits = 0;
                     int32_t n_misses = 0;
-                    ggml_backend_expert_cache_t cache = sched->expert_caches[dispatch->gpu_cache_backend_id];
                     ggml_backend_expert_cache_partition_bundle_routes(
                         cache, bundle.layer, route_ids.data(), top_k, n_tokens,
                         hits.data(), &n_hits, misses.data(), &n_misses);
-                    ggml_backend_sched_record_route_ready_accesses(
-                        bundle, cache, route_ids.data(), (int32_t) total_ids);
                     // admission outcome: how close each bundle was to the 7/8 and 8/8 gates
                     if (n_hits >= 0 && n_hits < 9) {
                         sched->route_census_stats.n_route_ready_mask_counts[n_hits]++;
                     }
                     if (n_hits == top_k && n_misses == 0) {
                         sched->route_census_stats.n_route_ready_full_hits++;
-                    } else if (!(n_hits > 0 && n_hits == top_k - 1 && n_hits + n_misses == top_k)) {
+                    } else {
                         sched->route_census_stats.n_route_ready_fallbacks++;
                     }
                     sched->route_census_stats.n_route_ready_classifications++;
+                    sched->route_census_stats.n_route_ready_partition_us +=
+                        (uint64_t) (ggml_time_us() - route_partition_start);
+
 
                     struct ggml_moe_bundle_plan plan = {};
                     plan.layer = bundle.layer;
@@ -3102,11 +3149,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     plan.canonical_route_output = bundle.down_node;
                     plan.is_fused = bundle.is_fused;
                     plan.valid = true;
-                    const bool concurrent_eligible = n_tokens == 1 && top_k == GGML_MOE_PARTIAL_MAX_ROUTES &&
-                        n_hits >= GGML_MOE_PARTIAL_MIN_GPU_HITS && n_hits < top_k &&
-                        ggml_expert_cache_hetero_concurrent_enabled() && dispatch->partial_executor != nullptr;
                     bool bundle_handled = false;
-
                     if (n_tokens == 1 && n_hits == top_k && n_misses == 0) {
                         ec = ggml_moe_route_ready_sidecar_execute_full_hit(
                             dispatch->sidecar, &plan, cache, route_ids.data(), top_k, nullptr);
@@ -3118,31 +3161,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         plan.down_node->op = GGML_OP_NONE;
                         cur_j = dispatch->last_bundle_node_idx + 1;
                         bundle_handled = true;
-                    } else if (concurrent_eligible) {
-                        struct ggml_moe_partial_route_snapshot snapshot = {};
-                        snapshot.n_hits = n_hits;
-                        snapshot.n_misses = n_misses;
-                        memcpy(snapshot.hits, hits.data(), (size_t) n_hits * sizeof(struct ggml_cache_route_bundle));
-                        memcpy(snapshot.misses, misses.data(), (size_t) n_misses * sizeof(struct ggml_cache_route_bundle));
-                        struct ggml_moe_partial_activation activation = {};
-                        activation.nbytes = ggml_nbytes(plan.layer_input);
-                        if (plan.layer_input->buffer != nullptr && ggml_backend_buffer_is_host(plan.layer_input->buffer)) {
-                            activation.host_data = plan.layer_input->data;
-                        }
-                        const enum ggml_moe_partial_executor_result result = ggml_moe_partial_executor_execute(
-                            dispatch->partial_executor, &plan, cache, &snapshot, &activation, &sched->route_census_stats);
-                        if (result == GGML_MOE_PARTIAL_EXECUTOR_LAUNCH_FAILED) {
-                            return GGML_STATUS_FAILED;
-                        }
-                        if (result == GGML_MOE_PARTIAL_EXECUTOR_SUCCESS) {
-                            sched->route_census_stats.n_route_ready_actions++;
-                            save_node_for_restore(plan.down_node);
-                            plan.down_node->op = GGML_OP_NONE;
-                            cur_j = dispatch->last_bundle_node_idx + 1;
-                            bundle_handled = true;
-                        }
                     }
-                    if (!bundle_handled && !concurrent_eligible && n_tokens == 1 &&
+                    if (!bundle_handled && n_tokens == 1 &&
+                        (top_k != GGML_MOE_PARTIAL_MAX_ROUTES || n_hits != top_k - 1) &&
                         n_hits > 0 && n_hits == top_k - 1 && n_hits + n_misses == top_k) {
                         const int64_t d_model = bundle.down_node->ne[0];
                         const int64_t d_ff = bundle.is_fused ? bundle.gate_up_node->ne[0] / 2 : bundle.gate_node->ne[0];
@@ -3172,6 +3193,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         bundle_handled = true;
                     }
                     if (!bundle_handled) {
+                        const int64_t native_fallback_start = ggml_time_us();
+
                         // CPU fallback: compute native sub-graph segment on split backend
                         struct ggml_cgraph bundle_view = ggml_graph_view(
                             &split->graph, dispatch->first_bundle_node_idx, dispatch->last_bundle_node_idx + 1);
@@ -3180,6 +3203,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             return ec;
                         }
                         ggml_backend_synchronize(split_backend);
+                        sched->route_census_stats.n_route_ready_native_fallback_us +=
+                            (uint64_t) (ggml_time_us() - native_fallback_start);
                         cur_j = dispatch->last_bundle_node_idx + 1;
                     }
                 }
@@ -3664,15 +3689,25 @@ void ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
-    if (sched->route_census_stats.n_route_ready_classifications > 0) {
+    if (sched->route_census_stats.n_route_ready_classifications > 0 ||
+        sched->route_census_stats.n_route_ready_fast_rejects > 0) {
         printf("\n=== Route-Ready Admission Telemetry ===\n");
         printf("  Classifications:  %" PRIu64 "\n", sched->route_census_stats.n_route_ready_classifications);
+        printf("  Fast Rejects:     %" PRIu64 "\n", sched->route_census_stats.n_route_ready_fast_rejects);
         printf("  Full-Hit (8/8):   %" PRIu64 "\n", sched->route_census_stats.n_route_ready_full_hits);
         printf("  Fallbacks:        %" PRIu64 "\n", sched->route_census_stats.n_route_ready_fallbacks);
-        printf("  Mask Histogram    :");
+        printf("  Resident Bundles  :");
+        for (int k = 0; k < 9; k++) {
+            printf(" %d:%" PRIu64, k, sched->route_census_stats.n_route_ready_resident_bundle_counts[k]);
+        }
+        printf("\n  Mask Histogram    :");
         for (int k = 0; k < 9; k++) {
             printf(" %d:%" PRIu64, k, sched->route_census_stats.n_route_ready_mask_counts[k]);
         }
+        printf("\n  Prefix Sync Us     : %" PRIu64 "\n", sched->route_census_stats.n_route_ready_prefix_sync_us);
+        printf("  Route ID Us        : %" PRIu64 "\n", sched->route_census_stats.n_route_ready_route_id_us);
+        printf("  Partition Us       : %" PRIu64 "\n", sched->route_census_stats.n_route_ready_partition_us);
+        printf("  Native Fallback Us : %" PRIu64 "\n", sched->route_census_stats.n_route_ready_native_fallback_us);
         printf("\n=====================================\n\n");
     }
     for (int b = 0; b < sched->n_backends; b++) {

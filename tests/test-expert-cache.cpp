@@ -25,6 +25,85 @@ static void require_impl(bool condition, const char * expression, const char * f
 #define require(condition) require_impl((condition), #condition, __FILE__, __LINE__)
 
 
+static void test_complete_bundle_admission_query() {
+    printf("testing live complete-bundle admission query...\n");
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend != nullptr);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_tensor * up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_set_name(gate, "blk.3.ffn_gate_exps.weight");
+    ggml_set_name(up, "blk.3.ffn_up_exps.weight");
+    ggml_set_name(down, "blk.3.ffn_down_exps.weight");
+
+    ggml_backend_expert_cache_t cache = ggml_backend_expert_cache_new(backend, 1024);
+    require(cache != nullptr);
+    ggml_backend_expert_cache_register_bundle(cache, 3, gate, up, down);
+
+    require(ggml_backend_expert_cache_count_complete_bundles(cache, 3, 8) == 0);
+    require(!ggml_backend_expert_cache_has_at_least_complete_bundles(cache, 3, 1));
+    bool needs_load = false;
+    const int32_t loading_slot = ggml_backend_expert_cache_claim_slot_idx(
+        cache, gate, 0, nullptr, 0, &needs_load);
+    require(loading_slot >= 0);
+    require(needs_load);
+    require(ggml_backend_expert_cache_seed(cache, up, 0, 1));
+    require(ggml_backend_expert_cache_seed(cache, down, 0, 1));
+    require(!ggml_backend_expert_cache_has_at_least_complete_bundles(cache, 3, 1));
+    ggml_backend_expert_cache_promote_slot(cache, gate, 0, loading_slot);
+    require(ggml_backend_expert_cache_has_at_least_complete_bundles(cache, 3, 1));
+
+
+    for (int32_t expert_id = 0; expert_id < 6; ++expert_id) {
+        require(ggml_backend_expert_cache_seed(cache, gate, expert_id, 1));
+        require(ggml_backend_expert_cache_seed(cache, up, expert_id, 1));
+        require(ggml_backend_expert_cache_seed(cache, down, expert_id, 1));
+    }
+    require(ggml_backend_expert_cache_count_complete_bundles(cache, 3, 8) == 6);
+    require(ggml_backend_expert_cache_has_at_least_complete_bundles(cache, 3, 6));
+    require(!ggml_backend_expert_cache_has_at_least_complete_bundles(cache, 3, 7));
+
+    require(ggml_backend_expert_cache_seed(cache, gate, 6, 1));
+    require(ggml_backend_expert_cache_seed(cache, up, 6, 1));
+    require(ggml_backend_expert_cache_seed(cache, down, 6, 1));
+    require(ggml_backend_expert_cache_has_at_least_complete_bundles(cache, 3, 7));
+    require(!ggml_backend_expert_cache_has_at_least_complete_bundles(cache, 3, 8));
+
+    require(ggml_backend_expert_cache_seed(cache, gate, 7, 1));
+    require(ggml_backend_expert_cache_seed(cache, up, 7, 1));
+    require(ggml_backend_expert_cache_seed(cache, down, 7, 1));
+    require(ggml_backend_expert_cache_count_complete_bundles(cache, 3, 8) == 8);
+    require(ggml_backend_expert_cache_has_at_least_complete_bundles(cache, 3, 8));
+    require(ggml_backend_expert_cache_count_complete_bundles(cache, 3, 4) == 4);
+
+    ggml_tensor * gate_up = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_tensor * fused_down = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, 8);
+    ggml_set_name(gate_up, "blk.4.ffn_gate_up_exps.weight");
+    ggml_set_name(fused_down, "blk.4.ffn_down_exps.weight");
+    ggml_backend_expert_cache_register_fused_bundle(cache, 4, gate_up, fused_down);
+    require(ggml_backend_expert_cache_seed(cache, gate_up, 0, 1));
+    require(ggml_backend_expert_cache_seed(cache, fused_down, 0, 1));
+    require(ggml_backend_expert_cache_count_complete_bundles(cache, 4, 8) == 1);
+    require(ggml_backend_expert_cache_has_at_least_complete_bundles(cache, 4, 1));
+
+    ggml_backend_expert_cache_free(cache);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  live complete-bundle admission query tests passed\n");
+}
+
+
 static void test_cache_node_selection() {
     printf("testing cached expert node selection...\n");
 
@@ -1841,8 +1920,8 @@ static void test_partial_executor_scheduler_feature_gate() {
     ggml_backend_sched_set_expert_cache(sched, 1024 * 1024);
     ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
 
-    // seven resident experts, one miss: the 7/8 admission mask
-    for (int32_t expert = 0; expert < 7; ++expert) {
+    // six resident experts must fast-reject the route-ready cache actions
+    for (int32_t expert = 0; expert < 6; ++expert) {
         require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_weights, expert, 1));
         require(ggml_backend_sched_expert_cache_seed(sched, 0, up_weights, expert, 1));
         require(ggml_backend_sched_expert_cache_seed(sched, 0, down_weights, expert, 1));
@@ -1857,10 +1936,38 @@ static void test_partial_executor_scheduler_feature_gate() {
 
     const float sentinel = -99.0f;
     std::vector<float> actual(expected.size(), sentinel);
+    ggml_backend_expert_cache_stats fast_reject_before = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &fast_reject_before));
+    _putenv_s(env_name, "0");
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats fast_reject_after = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &fast_reject_after));
+    require(fast_reject_after.n_route_ready_fast_rejects ==
+        fast_reject_before.n_route_ready_fast_rejects + 1);
+    require(fast_reject_after.n_route_ready_classifications ==
+        fast_reject_before.n_route_ready_classifications);
+    require(fast_reject_after.n_route_ready_actions == fast_reject_before.n_route_ready_actions);
+    require(fast_reject_after.n_route_ready_resident_bundle_counts[6] ==
+        fast_reject_before.n_route_ready_resident_bundle_counts[6] + 1);
+    require(fast_reject_after.n_route_ready_route_id_us ==
+        fast_reject_before.n_route_ready_route_id_us);
+    require(fast_reject_after.bytes_ram_to_gpu == fast_reject_before.bytes_ram_to_gpu);
+
+    // seven resident experts, one miss: the 7/8 admission mask
+    require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_weights, 6, 1));
+    require(ggml_backend_sched_expert_cache_seed(sched, 0, up_weights, 6, 1));
+    require(ggml_backend_sched_expert_cache_seed(sched, 0, down_weights, 6, 1));
+    ggml_backend_sched_expert_cache_sync(sched);
+
     ggml_backend_expert_cache_stats baseline = {};
     require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &baseline));
 
-    // gate off: the existing serial heterogeneous path must serve the 7/8 mask
+    // native fallback is the production policy for the measured 7/8 mask
     _putenv_s(env_name, "0");
     ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
     require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
@@ -1870,10 +1977,13 @@ static void test_partial_executor_scheduler_feature_gate() {
     }
     ggml_backend_expert_cache_stats serial_stats = {};
     require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &serial_stats));
-    require(serial_stats.hetero_hit_histogram[7] == baseline.hetero_hit_histogram[7] + 1);
+    require(serial_stats.n_route_ready_classifications ==
+        baseline.n_route_ready_classifications + 1);
+    require(serial_stats.n_route_ready_fallbacks == baseline.n_route_ready_fallbacks + 1);
+    require(serial_stats.n_route_ready_actions == baseline.n_route_ready_actions);
     require(serial_stats.hetero_partial_exec_by_hits[7] == baseline.hetero_partial_exec_by_hits[7]);
 
-    // gate on: only the concurrent executor may serve the 7/8 mask
+    // the concurrent feature flag does not override the production 7/8 policy
     _putenv_s(env_name, "1");
     std::fill(actual.begin(), actual.end(), sentinel);
     ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
@@ -1884,14 +1994,35 @@ static void test_partial_executor_scheduler_feature_gate() {
     }
     ggml_backend_expert_cache_stats concurrent_stats = {};
     require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &concurrent_stats));
-    require(concurrent_stats.hetero_partial_exec_by_hits[7] == serial_stats.hetero_partial_exec_by_hits[7] + 1);
+    require(concurrent_stats.n_route_ready_classifications ==
+        serial_stats.n_route_ready_classifications + 1);
+    require(concurrent_stats.n_route_ready_fallbacks == serial_stats.n_route_ready_fallbacks + 1);
+    require(concurrent_stats.n_route_ready_actions == serial_stats.n_route_ready_actions);
+    require(concurrent_stats.hetero_partial_exec_by_hits[7] == serial_stats.hetero_partial_exec_by_hits[7]);
     require(concurrent_stats.hetero_partial_gpu_routes_executed ==
-        serial_stats.hetero_partial_gpu_routes_executed + 7);
+        serial_stats.hetero_partial_gpu_routes_executed);
     require(concurrent_stats.hetero_partial_cpu_routes_executed ==
-        serial_stats.hetero_partial_cpu_routes_executed + 1);
+        serial_stats.hetero_partial_cpu_routes_executed);
     require(concurrent_stats.hetero_partial_weight_h2d_bytes == 0);
-    require(concurrent_stats.hetero_partial_total_us > 0);
     require(concurrent_stats.hetero_partial_activation_d2h_bytes == 0);
+
+    require(ggml_backend_sched_expert_cache_seed(sched, 0, gate_weights, 7, 1));
+    require(ggml_backend_sched_expert_cache_seed(sched, 0, up_weights, 7, 1));
+    require(ggml_backend_sched_expert_cache_seed(sched, 0, down_weights, 7, 1));
+    ggml_backend_sched_expert_cache_sync(sched);
+    std::fill(actual.begin(), actual.end(), sentinel);
+    ggml_backend_tensor_set(output, actual.data(), 0, ggml_nbytes(output));
+    require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(output, actual.data(), 0, ggml_nbytes(output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        require(fabsf(actual[i] - expected[i]) < 1e-5f);
+    }
+    ggml_backend_expert_cache_stats full_stats = {};
+    require(ggml_backend_sched_get_expert_cache_stats(sched, -1, &full_stats));
+    require(full_stats.n_route_ready_fast_rejects == concurrent_stats.n_route_ready_fast_rejects);
+    require(full_stats.n_route_ready_classifications == concurrent_stats.n_route_ready_classifications + 1);
+    require(full_stats.n_route_ready_full_hits == concurrent_stats.n_route_ready_full_hits + 1);
+
     if (env_prior != nullptr) {
         _putenv_s(env_name, env_prior);
     } else {
@@ -2879,6 +3010,8 @@ static void test_cacheless_moe_subset_copy() {
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
+
+    test_complete_bundle_admission_query();
 
     test_cacheless_moe_subset_copy();
     test_route_census_classifies_original_graph();

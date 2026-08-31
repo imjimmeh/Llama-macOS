@@ -4,6 +4,8 @@
 
 
 #include <algorithm>
+#include <array>
+
 #include <cassert>
 #include <cinttypes>
 #include <cstdio>
@@ -1513,6 +1515,105 @@ bool ggml_backend_expert_cache_is_bundle_resident(
         }
     }
     return true;
+}
+
+int32_t ggml_backend_expert_cache_count_complete_bundles(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        int32_t max_count) {
+    if (cache == nullptr || layer < 0) {
+        return 0;
+    }
+
+    const auto bit = cache->bundle_registrations.find(layer);
+    if (bit == cache->bundle_registrations.end()) {
+        return 0;
+    }
+
+    const auto & reg = bit->second;
+    const struct ggml_tensor * tensors[4] = {};
+    uint8_t bits[4] = {};
+    int n_tensors = 0;
+    if (reg.is_fused) {
+        tensors[n_tensors] = reg.gate_up;
+        bits[n_tensors++] = 1u;
+        tensors[n_tensors] = reg.down;
+        bits[n_tensors++] = 2u;
+    } else {
+        tensors[n_tensors] = reg.gate;
+        bits[n_tensors++] = 1u;
+        tensors[n_tensors] = reg.up;
+        bits[n_tensors++] = 2u;
+        tensors[n_tensors] = reg.down;
+        bits[n_tensors++] = 4u;
+    }
+
+    uint8_t complete_mask = 0;
+    int64_t n_experts = INT64_MAX;
+    for (int i = 0; i < n_tensors; ++i) {
+        if (tensors[i] == nullptr) {
+            continue;
+        }
+        complete_mask |= bits[i];
+        const int64_t tensor_experts = tensors[i]->ne[2] > 0 ? tensors[i]->ne[2] : 256;
+        n_experts = std::min(n_experts, tensor_experts);
+    }
+    if (complete_mask == 0 || n_experts <= 0) {
+        return 0;
+    }
+
+    const int32_t count_limit = max_count > 0 ? max_count : INT32_MAX;
+    std::array<uint8_t, 512> inline_masks = {};
+    std::vector<uint8_t> dynamic_masks;
+    uint8_t * masks = inline_masks.data();
+    if (n_experts > (int64_t) inline_masks.size()) {
+        dynamic_masks.assign((size_t) n_experts, 0);
+        masks = dynamic_masks.data();
+    }
+
+    for (int i = 0; i < n_tensors; ++i) {
+        const struct ggml_tensor * tensor = tensors[i];
+        if (tensor == nullptr) {
+            continue;
+        }
+        ggml_expert_cache_slot_pool * pool =
+            ggml_backend_expert_cache_find_pool(cache, tensor);
+        if (pool == nullptr) {
+            continue;
+        }
+        for (auto & slot : pool->slots) {
+            if (slot.tensor != tensor || slot.expert_id < 0 || slot.expert_id >= n_experts) {
+                continue;
+            }
+            if (ggml_expert_cache_poll_slot(cache, slot)) {
+                masks[slot.expert_id] |= bits[i];
+            }
+        }
+    }
+
+    int32_t count = 0;
+    for (int64_t expert_id = 0; expert_id < n_experts; ++expert_id) {
+        if (masks[expert_id] == complete_mask) {
+            ++count;
+            if (count >= count_limit) {
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+bool ggml_backend_expert_cache_has_at_least_complete_bundles(
+        ggml_backend_expert_cache_t cache,
+        int32_t layer,
+        int32_t minimum) {
+    if (cache == nullptr || layer < 0 || minimum < 0) {
+        return false;
+    }
+    if (minimum == 0) {
+        return true;
+    }
+    return ggml_backend_expert_cache_count_complete_bundles(cache, layer, minimum) >= minimum;
 }
 
 bool ggml_backend_expert_cache_is_layer_fully_resident(

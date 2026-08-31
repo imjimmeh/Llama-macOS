@@ -422,8 +422,7 @@ extern "C" {
         uint64_t probe_host_us;
         uint64_t probe_upload_us;
 
-        // Decode route census. These counters are collected from graph metadata
-        // without reading route IDs or synchronizing a backend.
+        // Decode route census metadata is collected without reading route IDs or synchronizing a backend.
         uint64_t n_route_census_nodes;
         uint64_t n_route_census_cpu_host_nodes;
         uint64_t n_route_census_non_cpu_host_nodes;
@@ -434,11 +433,18 @@ extern "C" {
         uint64_t n_route_census_batch_9_31;
         uint64_t n_route_census_batch_32_plus;
         uint64_t n_route_census_plans;
+        // Route-ready dispatch telemetry.
         uint64_t n_route_ready_actions;
         uint64_t n_route_ready_dispatches;
         uint64_t n_route_ready_classifications;
         uint64_t n_route_ready_full_hits;
         uint64_t n_route_ready_fallbacks;
+        uint64_t n_route_ready_fast_rejects;
+        uint64_t n_route_ready_resident_bundle_counts[9];
+        uint64_t n_route_ready_prefix_sync_us;
+        uint64_t n_route_ready_route_id_us;
+        uint64_t n_route_ready_partition_us;
+        uint64_t n_route_ready_native_fallback_us;
         uint64_t n_route_ready_mask_counts[9];
 
         // Epic 11: Heterogeneous MoE Route Execution Telemetry

@@ -1,0 +1,31 @@
+{"build_commit": "dc20efe03", "build_number": 10542, "cpu_info": "AMD Ryzen 7 5700X 8-Core Processor             ", "gpu_info": "NVIDIA GeForce GTX 1080", "backends": "CUDA", "model_filename": "C:\\Users\\jimme\\.lmstudio\\models\\mudler\\Qwen3.6-35B-A3B-APEX-GGUF\\Qwen3.6-35B-A3B-APEX-Compact.gguf", "model_type": "qwen35moe 35B.A3B Q4_K - Medium", "model_size": 17282099712, "model_n_params": 34660610688, "n_batch": 4096, "n_ubatch": 2048, "n_threads": 14, "cpu_mask": "0x0", "cpu_strict": false, "poll": 50, "type_k": "q8_0", "type_v": "q8_0", "n_gpu_layers": -1, "ffn_split": 0.000000, "n_cpu_moe": 0, "split_mode": "layer", "main_gpu": 0, "no_kv_offload": false, "flash_attn": 1, "devices": "auto", "tensor_split": "0.00", "tensor_buft_overrides": "none", "load_mode": "mlock", "embeddings": false, "no_op_offload": 0, "no_host": false, "fit_target": 256, "fit_min_ctx": 0, "expert_cache_size": 128, "expert_cache_period": 128, "pinned_experts": "none", "n_prompt": 0, "n_gen": 128, "n_depth": 0, "test_time": "2026-08-31T10:45:34Z", "avg_ns": 5330096000, "stddev_ns": 0, "avg_ts": 24.014577, "stddev_ts": 0.000000, "expert_cache_requests": 0, "expert_cache_hits": 0, "expert_cache_zero_copy_hits": 0, "expert_cache_d2d_fallback_hits": 0, "expert_cache_speculative_prefetches": 0, "expert_cache_misses": 0, "expert_cache_mul_mat_id_inputs": 15360, "expert_cache_eligible_ops": 0, "expert_cache_capacity_bypasses": 0, "expert_cache_cpu_backend_bypasses": 10496, "expert_cache_evictions": 0, "expert_cache_non_host_weight_bypasses": 4864, "expert_cache_rebalances": 0, "expert_cache_jit_swaps": 0, "expert_cache_bytes_ram_to_gpu": 0, "expert_cache_bytes_avoided": 0, "expert_cache_cpu_id_remaps": 0, "expert_cache_gpu_id_resolutions": 0, "expert_cache_staging_memcpy_bytes": 0, "expert_cache_direct_pinned_dma_bytes": 0, "expert_cache_dma_ns": 0, "expert_cache_dma_wait_ns": 0, "expert_cache_staging_waits": 0, "expert_cache_probe_layers": 0, "expert_cache_probe_sync_us": 0, "expert_cache_probe_host_us": 0, "expert_cache_probe_upload_us": 0, "expert_cache_route_prefetch_snapshots": 0, "expert_cache_route_prefetch_submitted": 0, "expert_cache_route_prefetch_duplicates": 0, "expert_cache_route_prefetch_stale": 0, "expert_cache_route_prefetch_rejected": 0, "expert_cache_route_census_nodes": 120, "expert_cache_route_census_cpu_host_nodes": 82, "expert_cache_route_census_non_cpu_host_nodes": 0, "expert_cache_route_census_non_host_nodes": 38, "expert_cache_route_census_split_inputs": 15360, "expert_cache_route_census_batch_1": 120, "expert_cache_route_census_batch_2_8": 0, "expert_cache_route_census_batch_9_31": 0, "expert_cache_route_census_batch_32_plus": 0, "expert_cache_route_census_plans": 40, "expert_cache_route_ready_actions": 0, "expert_cache_route_ready_dispatches": 27, "expert_cache_route_ready_classifications": 0, "expert_cache_route_ready_full_hits": 0, "expert_cache_route_ready_fallbacks": 3456, "expert_cache_route_ready_fast_rejects": 3456, "expert_cache_route_ready_resident_bundles_0": 3456, "expert_cache_route_ready_resident_bundles_1": 0, "expert_cache_route_ready_resident_bundles_2": 0, "expert_cache_route_ready_resident_bundles_3": 0, "expert_cache_route_ready_resident_bundles_4": 0, "expert_cache_route_ready_resident_bundles_5": 0, "expert_cache_route_ready_resident_bundles_6": 0, "expert_cache_route_ready_resident_bundles_7": 0, "expert_cache_route_ready_resident_bundles_8": 0, "expert_cache_route_ready_prefix_sync_us": 0, "expert_cache_route_ready_route_id_us": 0, "expert_cache_route_ready_partition_us": 1650186, "expert_cache_route_ready_native_fallback_us": 1647107, "expert_cache_partial_exec_1_hit": 0, "expert_cache_partial_exec_2_hit": 0, "expert_cache_partial_exec_3_hit": 0, "expert_cache_partial_exec_4_hit": 0, "expert_cache_partial_exec_5_hit": 0, "expert_cache_partial_exec_6_hit": 0, "expert_cache_partial_exec_7_hit": 0, "expert_cache_partial_gpu_routes": 0, "expert_cache_partial_cpu_routes": 0, "expert_cache_partial_activation_d2h_bytes": 0, "expert_cache_partial_cpu_result_h2d_bytes": 0, "expert_cache_partial_weight_h2d_bytes": 0, "expert_cache_partial_partition_us": 0, "expert_cache_partial_activation_d2h_us": 0, "expert_cache_partial_gpu_hit_submit_us": 0, "expert_cache_partial_gpu_hit_elapsed_us": 0, "expert_cache_partial_cpu_miss_compute_us": 0, "expert_cache_partial_cpu_result_h2d_us": 0, "expert_cache_partial_join_wait_gpu_us": 0, "expert_cache_partial_join_wait_cpu_us": 0, "expert_cache_partial_scatter_us": 0, "expert_cache_partial_total_us": 0, "samples_ns": [ 5330096000 ],"samples_ts": [ 24.0146 ]}
+
+=== Route-Ready Admission Telemetry ===
+  Classifications:  0
+  Fast Rejects:     3483
+  Full-Hit (8/8):   0
+  Fallbacks:        3483
+  Resident Bundles  : 0:3483 1:0 2:0 3:0 4:0 5:0 6:0 7:0 8:0
+  Mask Histogram    : 0:0 1:0 2:0 3:0 4:0 5:0 6:0 7:0 8:0
+  Prefix Sync Us     : 0
+  Route ID Us        : 0
+  Partition Us       : 1662383
+  Native Fallback Us : 1659111
+
+=====================================
+
+
+=== Route-Ready Admission Telemetry ===
+  Classifications:  0
+  Fast Rejects:     3483
+  Full-Hit (8/8):   0
+  Fallbacks:        3483
+  Resident Bundles  : 0:3483 1:0 2:0 3:0 4:0 5:0 6:0 7:0 8:0
+  Mask Histogram    : 0:0 1:0 2:0 3:0 4:0 5:0 6:0 7:0 8:0
+  Prefix Sync Us     : 0
+  Route ID Us        : 0
+  Partition Us       : 1662383
+  Native Fallback Us : 1659111
+
+=====================================
+

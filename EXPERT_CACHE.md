@@ -4,33 +4,34 @@ The **Expert Cache** provides high-performance heterogeneous inference for Mixtu
 
 ---
 
-## 1. Current Status & Implementation Matrix (Updated 2026-08-29)
+## 1. Current Status & Implementation Matrix (Updated 2026-08-31)
 
 ```text
 CURRENT IMPLEMENTATION STATUS:
 - Route-ready full-hit GPU sidecar: Implemented, tested, and measured.
-- Route-ready one-miss serial heterogeneous execution: Implemented and tested.
+- Direct route-ready one-miss serial heterogeneous execution: Implemented and tested for focused executor coverage; TG1 production dispatch uses native fallback after the latency recheck.
 - Other incomplete route-ready bundles: CPU-base execution.
 - Multi-token prompt processing CPU backend decoupling: Implemented and tested.
 - Windows WDDM and pre-Hopper GPU stability safeguards: Implemented.
 - Timed decode expert-weight upload: 0 bytes in the active route-ready paths.
-- Route-ready admission telemetry: full-hit, fallback, and 0/8-8/8 mask counters exposed to llama-bench.
+- Route-ready admission telemetry: full-hit, fallback, live complete-bundle, and resident-bundle distribution counters exposed to llama-bench.
+- Route-ready TG1 fast reject: Live complete-bundle count below 7 executes the native CPU bundle view without route-ID transfer or route partition allocation.
 - Fallback bundle ordering: the down node runs on the host after its activation input exists, never before.
-- Event-driven dual-device concurrency: Implemented for the direct partial executor (event joins, pinned exchange, GPU canonical scatter, zero backend-wide synchronization). Scheduler dispatch is development-gated behind GGML_EXPERT_CACHE_HETERO_CONCURRENT=1 and admits only 7/8 bundles; the 2026-08-30 mask matrix measured no concurrent win over CPU-base at any mask, so serial remains the production 7/8 path and 0-6 stays CPU-base.
+- Event-driven dual-device concurrency: Implemented for the direct partial executor and retained for focused tests and development. The scheduler demotes TG1 7/8 bundles to the native CPU path after the 2026-08-31 latency recheck; 0-6 stays CPU-base and 8/8 retains the GPU sidecar.
 - Fixed TG1 partial executor: seven persistent exact-K GPU graphs, seven exact-M CPU graphs, GPU-host-pinned exchange storage, and the required event set are constructed during scheduler graph allocation. Direct execution covers every 1/8 through 7/8 mask with overlapped GPU/CPU routes and a canonical host result.
 ```
 
 For the Compact model's `top_k = 8` single-token route-ready workload, production dispatch is intentionally selective:
 ```text
 0-6 hits / 2-8 misses -> CPU-base execution
-7 hits   / 1 miss     -> serial GPU-hit plus CPU-miss heterogeneous execution
+7 hits   / 1 miss     -> native CPU bundle execution
 8 hits   / 0 misses   -> full GPU route-ready sidecar execution
 ```
 
-The partial-hit oracle covers every 0-8 hit mask. Runtime profiling found the 1-6-hit heterogeneous cases slower than the CPU-base path, so they are not admitted by the production route-ready dispatcher.
+The partial-hit oracle covers every 0-8 hit mask. Runtime profiling found the 1-6-hit and 7/8 heterogeneous cases slower than the CPU-base path, so only full 8/8 route-ready bundles are admitted to the scheduler sidecar.
 
 - **Full-Hit Sidecar**: Uses persistent GPU graph storage and stable weight descriptors. Input, remapped IDs, graph execution, and output download are queued on the sidecar backend stream and synchronized once after the download.
-- **One-Miss Heterogeneous Path**: Retains GPU execution for seven resident routes and CPU execution for one miss. It synchronizes the GPU stream after CPU miss work and before reading the GPU result, which preserves graph-replay ordering.
+- **One-Miss Heterogeneous Path**: Remains available for direct executor tests and development. Production TG1 dispatch uses the native CPU bundle for 7/8 because the current APEX latency measurement is slower for both serial and concurrent execution.
 - **Prompt Processing (PP) Scaling**: Multi-token prompt batches use dynamic backend buffer allocation (`ggml_backend_alloc_ctx_tensors`), supporting arbitrary context lengths (tested to 32k+ tokens with 0 pool exhaustion).
 - **Native Tooling**: `llama-bench` supports `-pe / --pinned-experts <path0,path1,...>` alongside `-exc`, `-excp`, and `-fitt`.
 - **Background Promotion Pipeline**: Non-blocking asynchronous promotion worker streams emerging hot experts from host pinned RAM into device slot pools without stalling active decode steps.
@@ -39,7 +40,7 @@ The partial-hit oracle covers every 0-8 hit mask. Runtime profiling found the 1-
 
 - Cache residency can place a registered decode `MUL_MAT_ID` on an accelerator without changing general `op_offload` placement. Prompt processing retains normal placement.
 - A route-ready action executes the route-ID producer prefix, synchronizes its split backend, reads IDs once, and remaps every complete Gate/Up/Down slot bundle before any dependent GPU `MUL_MAT_ID` runs. The dispatch record follows the producer and all consumers across scheduler splits.
-- Full route-ready hits execute through the GPU sidecar. A bundle with exactly one missing route uses the serial heterogeneous path. Other incomplete bundles remain on the CPU-base path. None of these paths uploads expert weights during timed decode.
+- Full route-ready hits execute through the GPU sidecar. A bundle with exactly one missing route is classified but uses the native CPU bundle in production after the latency recheck. Other incomplete bundles remain on the CPU-base path. None of these paths uploads expert weights during timed decode.
 - GPU-resident weight guard: `record_access_count()` and `seed()` now skip tensors with non-host buffers, preventing memcpy AV during rebalance and seeding on CUDA backend.
 - CPU-base fallback stride fix: activation (`cpu_src1`) and route-ID (`cpu_ids`) clones in the CPU-base fallback path now have strides reset to contiguous layout, fixing garbage output from the fallback path.
 - CPU-base fallback full FFN forward: Fallback executes the entire FFN sub-graph (`mul_mat_id` -> `swiglu_split` -> `mul_mat_id`) using host weights, safe leaf tensor metadata (`op = NONE`, null `src[]`), and selective active-route GPU upload, resolving zero-activation forward slash output.
@@ -188,6 +189,20 @@ The combined 95% Student-t interval is -12.727% to -1.534%. Cache rows verified 
 
 Raw result pairs are under `tools/results/expert-cache/bundle-v2/` with prefixes `2026-08-30-bundle-v2-1024m-control-first-n512` and `2026-08-30-bundle-v2-1024m-cache-first-n512`.
 
+### Regime G: Live Complete-Bundle Fast Reject and 7/8 Policy (2026-08-31)
+
+The TG1 scheduler now queries the live slot pools before reading route IDs. A complete bundle is Gate/Up/Down (or fused Gate/Up plus Down) with every slot in `RESIDENT` state. `LOADING` slots are polled with the existing non-blocking event query and count only after their load event completes.
+
+For `top_k = 8`, fewer than seven complete bundles cannot satisfy either admitted route-ready action. The scheduler therefore executes the native CPU bundle graph view directly. This path skips the route-ID device-to-host read, route-access recording, hit/miss vector resizing, and route partitioning while preserving the model's scale, activation, and LoRA nodes. Seven complete bundles are still classified, but their 7/8 result uses the native CPU bundle; eight retain the GPU sidecar. The check remains TG1-only, so multi-token prompt processing does not use this shortcut.
+
+The `llama-bench` telemetry fields are `expert_cache_route_ready_fast_rejects`, `expert_cache_route_ready_resident_bundles_0` through `_8`, `expert_cache_route_ready_prefix_sync_us`, `expert_cache_route_ready_route_id_us`, `expert_cache_route_ready_partition_us`, and `expert_cache_route_ready_native_fallback_us`.
+The final fast-reject matrix used 28 fresh control/cache TG128 pairs. Control averaged 24.732 tok/s and cache averaged 24.662 tok/s, for a mean paired delta of +0.03% with a 95% Student-t interval of -3.78% to +3.84%. Every cache process recorded 3,456 fast rejects, zero route-ready classifications, zero actions, zero full hits, zero RAM-to-GPU expert bytes, a resident-bundle histogram of 3,456 at bucket 0, and zero route-ID and partition time. Native bundle fallback averaged 1.655 seconds per process. Raw records are under `tools/results/expert-cache/2026-08-31-native-fallback-fast-reject-final-{control,cache}-{1..28}.jsonl`. The matrix did not contain any complete bundles, so the later 7/8 policy gate was verified separately; the final post-build one-pair smoke again recorded 3,456 fast rejects and zero route-ID/partition time.
+
+The corrected APEX TG1 latency measurement at 7/8 was CPU-base median 138 us (P95 317 us), serial median 427 us (P95 696 us), and concurrent median 424 us (P95 660 us). Production therefore demotes 7/8 to native fallback and leaves the partial executor available for direct tests and development.
+
+MTP profiling remains separate. The current cache-off harness completed baseline PP at 10.97 tok/s and TG at 12.90 tok/s, then aborted during dynamic MTP promotion at `ggml/src/ggml-backend.cpp:213` because a backend buffer was null. No new five-sample MTP cache comparison was claimed from that run. Multi-token cache remap tests still pass, and the TG1 shortcut remains gated to `ne[1] == 1`.
+
+
 
 ---
 
@@ -195,7 +210,7 @@ Raw result pairs are under `tools/results/expert-cache/bundle-v2/` with prefixes
 
 ### Test Executables
 - `build/bin/Release/test-moe-partial-hit-bench.exe`: Standalone partial-hit heterogeneous execution oracle and latency curve benchmark (Epic 1 / Milestone 1-2).
-- `build/bin/Release/test-expert-cache.exe`: Comprehensive unit test suite covering 20 invariants (slot pools, non-blocking query, SLRU admission, pinned staging ring, async promotions, GPU slot mapping).
+- `build/bin/Release/test-expert-cache.exe`: Comprehensive unit test suite covering cache, slot-pool, route-plan, lifecycle, and telemetry invariants.
 - `build/bin/Release/test-moe-oracle-bench.exe`: Gate A microbenchmark comparing isolated resident GPU vs CPU compute.
 - `build/bin/Release/test-moe-tg-profiler.exe`: Op-level profiler and value-per-byte pinned manifest generator.
 - `build/bin/Release/test-moe-heterogeneous-bench.exe`: Gate B comparative sweep runner benchmarking memory tiers.

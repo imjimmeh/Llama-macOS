@@ -1602,6 +1602,16 @@ static ggml_backend_expert_cache_stats subtract_expert_cache_stats(const ggml_ba
     EXPERT_CACHE_SUBTRACT(n_route_ready_classifications);
     EXPERT_CACHE_SUBTRACT(n_route_ready_full_hits);
     EXPERT_CACHE_SUBTRACT(n_route_ready_fallbacks);
+    EXPERT_CACHE_SUBTRACT(n_route_ready_fast_rejects);
+    for (int k = 0; k < 9; ++k) {
+        GGML_ASSERT(after.n_route_ready_resident_bundle_counts[k] >= before.n_route_ready_resident_bundle_counts[k]);
+        delta.n_route_ready_resident_bundle_counts[k] =
+            after.n_route_ready_resident_bundle_counts[k] - before.n_route_ready_resident_bundle_counts[k];
+    }
+    EXPERT_CACHE_SUBTRACT(n_route_ready_prefix_sync_us);
+    EXPERT_CACHE_SUBTRACT(n_route_ready_route_id_us);
+    EXPERT_CACHE_SUBTRACT(n_route_ready_partition_us);
+    EXPERT_CACHE_SUBTRACT(n_route_ready_native_fallback_us);
     for (int k = 0; k < 9; ++k) {
         GGML_ASSERT(after.hetero_partial_exec_by_hits[k] >= before.hetero_partial_exec_by_hits[k]);
         delta.hetero_partial_exec_by_hits[k] = after.hetero_partial_exec_by_hits[k] - before.hetero_partial_exec_by_hits[k];
@@ -1816,6 +1826,20 @@ struct test {
             "expert_cache_route_ready_classifications",
             "expert_cache_route_ready_full_hits",
             "expert_cache_route_ready_fallbacks",
+            "expert_cache_route_ready_fast_rejects",
+            "expert_cache_route_ready_resident_bundles_0",
+            "expert_cache_route_ready_resident_bundles_1",
+            "expert_cache_route_ready_resident_bundles_2",
+            "expert_cache_route_ready_resident_bundles_3",
+            "expert_cache_route_ready_resident_bundles_4",
+            "expert_cache_route_ready_resident_bundles_5",
+            "expert_cache_route_ready_resident_bundles_6",
+            "expert_cache_route_ready_resident_bundles_7",
+            "expert_cache_route_ready_resident_bundles_8",
+            "expert_cache_route_ready_prefix_sync_us",
+            "expert_cache_route_ready_route_id_us",
+            "expert_cache_route_ready_partition_us",
+            "expert_cache_route_ready_native_fallback_us",
             "expert_cache_partial_exec_1_hit",
             "expert_cache_partial_exec_2_hit",
             "expert_cache_partial_exec_3_hit",
@@ -1909,6 +1933,20 @@ struct test {
             field == "expert_cache_route_ready_classifications" ||
             field == "expert_cache_route_ready_full_hits" ||
             field == "expert_cache_route_ready_fallbacks" ||
+            field == "expert_cache_route_ready_fast_rejects" ||
+            field == "expert_cache_route_ready_resident_bundles_0" ||
+            field == "expert_cache_route_ready_resident_bundles_1" ||
+            field == "expert_cache_route_ready_resident_bundles_2" ||
+            field == "expert_cache_route_ready_resident_bundles_3" ||
+            field == "expert_cache_route_ready_resident_bundles_4" ||
+            field == "expert_cache_route_ready_resident_bundles_5" ||
+            field == "expert_cache_route_ready_resident_bundles_6" ||
+            field == "expert_cache_route_ready_resident_bundles_7" ||
+            field == "expert_cache_route_ready_resident_bundles_8" ||
+            field == "expert_cache_route_ready_prefix_sync_us" ||
+            field == "expert_cache_route_ready_route_id_us" ||
+            field == "expert_cache_route_ready_partition_us" ||
+            field == "expert_cache_route_ready_native_fallback_us" ||
             field == "expert_cache_partial_exec_1_hit" ||
             field == "expert_cache_partial_exec_2_hit" ||
             field == "expert_cache_partial_exec_3_hit" ||
@@ -2064,6 +2102,20 @@ struct test {
                                             std::to_string(expert_cache_stats.n_route_ready_classifications),
                                             std::to_string(expert_cache_stats.n_route_ready_full_hits),
                                             std::to_string(expert_cache_stats.n_route_ready_fallbacks),
+                                            std::to_string(expert_cache_stats.n_route_ready_fast_rejects),
+                                            std::to_string(expert_cache_stats.n_route_ready_resident_bundle_counts[0]),
+                                            std::to_string(expert_cache_stats.n_route_ready_resident_bundle_counts[1]),
+                                            std::to_string(expert_cache_stats.n_route_ready_resident_bundle_counts[2]),
+                                            std::to_string(expert_cache_stats.n_route_ready_resident_bundle_counts[3]),
+                                            std::to_string(expert_cache_stats.n_route_ready_resident_bundle_counts[4]),
+                                            std::to_string(expert_cache_stats.n_route_ready_resident_bundle_counts[5]),
+                                            std::to_string(expert_cache_stats.n_route_ready_resident_bundle_counts[6]),
+                                            std::to_string(expert_cache_stats.n_route_ready_resident_bundle_counts[7]),
+                                            std::to_string(expert_cache_stats.n_route_ready_resident_bundle_counts[8]),
+                                            std::to_string(expert_cache_stats.n_route_ready_prefix_sync_us),
+                                            std::to_string(expert_cache_stats.n_route_ready_route_id_us),
+                                            std::to_string(expert_cache_stats.n_route_ready_partition_us),
+                                            std::to_string(expert_cache_stats.n_route_ready_native_fallback_us),
                                             std::to_string(expert_cache_stats.hetero_partial_exec_by_hits[1]),
                                             std::to_string(expert_cache_stats.hetero_partial_exec_by_hits[2]),
                                             std::to_string(expert_cache_stats.hetero_partial_exec_by_hits[3]),

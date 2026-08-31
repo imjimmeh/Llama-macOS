@@ -282,6 +282,16 @@ GGML_API bool ggml_backend_expert_cache_is_bundle_resident(
     int32_t layer,
     int32_t expert_id);
 
+GGML_API int32_t ggml_backend_expert_cache_count_complete_bundles(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    int32_t max_count);
+
+GGML_API bool ggml_backend_expert_cache_has_at_least_complete_bundles(
+    ggml_backend_expert_cache_t cache,
+    int32_t layer,
+    int32_t minimum);
+
 GGML_API bool ggml_backend_expert_cache_is_layer_fully_resident(
     ggml_backend_expert_cache_t cache,
     int32_t layer);

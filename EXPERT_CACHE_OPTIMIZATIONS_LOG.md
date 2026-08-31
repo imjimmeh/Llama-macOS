@@ -2751,3 +2751,94 @@ Token generation on APEX-quantized MoE models (`Qwen3.6-35B-A3B-APEX-Compact`) w
   1. Unit tests: All 36 tests in `test-expert-cache.exe` passed 100%.
   2. Live server test: Ran `llama-server.exe` with exact user config `[qwen3.6-35B-apex-compact]` from `G:\qwen3.6-35b-a3b-presets-exc-latest.ini` (`--fit on --fit-target 256`, `exc = 128M`, `excp = 128`, `spec-type = ngram-mod`).
   3. Generated two consecutive 512-token chat completion requests at 20.91 t/s and 20.29 t/s. Both outputs verified 100% coherent, structurally sound, and accurate with zero forward slashes or repetitive loops.
+
+### Native CPU Fallback TG128 Rebaseline (2026-08-31)
+
+Build `4344a5e76` replaced the temporary CPU FFN graph fallback with native CPU split graph views. The Compact TG128 matrix was rerun with five alternating cache-off/cache-on pairs:
+
+```text
+python tools/results/expert-cache/run-tg-matrix.py \
+  --model C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf \
+  --runs 5 --cache-mib 128 --cache-period 128 --n-gen 128 \
+  --prefix 2026-08-31-native-fallback
+```
+
+The runner fixes the benchmark to 14 threads, Q8_0 KV, Flash Attention, mlock, batch 4096, ubatch 2048, and `-fitt 256`.
+
+| Pair | Cache off TG tok/s | Cache on TG tok/s | Paired delta |
+|---|---:|---:|---:|
+| 1 | 24.393 | 23.338 | -4.32% |
+| 2 | 25.484 | 24.358 | -4.42% |
+| 3 | 22.135 | 23.375 | +5.60% |
+| 4 | 24.359 | 24.713 | +1.45% |
+| 5 | 24.313 | 22.654 | -6.82% |
+| Mean | 24.137 +/- 1.221 | 23.688 +/- 0.835 | -1.70% |
+
+The paired-delta standard deviation is 5.09%. The approximate 95% Student-t interval is -8.03% to +4.62%, so five pairs do not establish a cache-on regression.
+
+Every cache-on process reported the same admission state:
+
+- 3,483 classifications
+- zero 8/8 full hits
+- 3,479 native CPU fallback bundles
+- four 7/8 serial actions
+- mask histogram `0:3436 1:12 2:20 3:7 4:4 5:0 6:0 7:4 8:0`
+- zero timed expert-weight H2D bytes
+
+This measurement contains no full-hit sidecar benefit. It measures the cost of route-ready classification and fallback segmentation against the cache-off scheduler. The next change must first establish full-hit reachability from current live residency, retain prefix data dependencies, and measure the corrected native fallback before changing partial-hit admission.
+
+### Live Complete-Bundle Fast Reject and TG1 7/8 Policy (2026-08-31)
+
+The route-ready scheduler now queries live slot-pool state before reading route IDs. The new API counts exact complete Gate/Up/Down bundles, including fused Gate/Up plus Down registrations. `LOADING` slots are polled with the existing event query and count only after their load completes. For `top_k = 8`, fewer than seven complete bundles fast-reject to the native CPU bundle view. The fast path skips route-ID device-to-host transfer, access recording, hit/miss vector allocation, and route partitioning while preserving scale, activation, and LoRA nodes.
+
+The fast-reject threshold is enforced only for TG1 (`ne[1] == 1`). Multi-token prompt processing keeps the existing native split-graph path. The direct serial and concurrent partial executors remain available for focused tests and development. Production TG1 policy is now:
+
+```text
+0-6 complete bundles -> native CPU bundle
+7 complete bundles   -> native CPU bundle after classification
+8 complete bundles   -> full GPU route-ready sidecar
+```
+
+The route-ready test added unfused and fused registration cases, incomplete and complete `LOADING` transitions, six/seven/eight bundle counts, and the threshold predicate. The scheduler regression test first failed because the fast path returned a sentinel result instead of the native bundle output, then passed after the fast path used the native graph view. The 7/8 production policy test verifies classification and native fallback with both the concurrent feature flag disabled and enabled; the direct executor is not selected.
+
+The `llama-bench` field/value alignment was corrected at the same time. Six pre-existing route-census fields were missing from `get_fields()` even though their values were already emitted, which shifted every later expert-cache result column. The corrected exporter includes the live resident-bundle histogram and fast-reject/fallback timing fields. Internal route mask counters remain available to scheduler statistics but are not exported as separate bench columns.
+
+The final fast-reject matrix used 28 fresh alternating TG128 pairs:
+
+```text
+python tools/results/expert-cache/run-tg-matrix.py --model C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf --runs 28 --cache-mib 128 --cache-period 128 --n-gen 128 --prefix 2026-08-31-native-fallback-fast-reject-final
+```
+
+Control averaged 24.732 tok/s (SD 1.379) and cache averaged 24.662 tok/s (SD 1.845). The mean paired delta was +0.028%, with a 95% Student-t interval of -3.780% to +3.835%; 12 of 28 cache pairs were faster. Every cache run recorded 3,456 fast rejects, a resident-bundle histogram of `0:3456`, zero route-ready classifications/actions/full hits, zero route-ID and partition time, and zero RAM-to-GPU expert bytes. Native fallback time averaged 1,654,785 us per process, with a 1,408,746 us minimum and 3,489,146 us maximum. Raw records are `tools/results/expert-cache/2026-08-31-native-fallback-fast-reject-final-{control,cache}-{1..28}.jsonl`.
+
+That matrix was collected before the final 7/8 policy edit. It contained no complete bundles, so the edited branch was not reached. A post-policy TG128 smoke confirmed 3,456 fast rejects, zero classifications, zero route-ID and partition time, and 1,465,903 us native fallback time in the cache row; its records are `tools/results/expert-cache/2026-08-31-native-fallback-policy-smoke-{control,cache}-1.jsonl`. After the final target rebuild, a one-pair smoke measured control at 25.136 tok/s and cache at 24.830 tok/s; the final cache row again recorded 3,456 fast rejects, a `0:3456` resident histogram, zero classifications, and 1,559,756 us native fallback time. Those records are `tools/results/expert-cache/2026-08-31-native-fallback-policy-final-{control,cache}-1.jsonl`.
+
+The corrected APEX 7/8 direct latency benchmark was:
+
+| Complete routes | CPU-base median/P95 us | Serial median/P95 us | Concurrent median/P95 us |
+|---|---:|---:|---:|
+| 1 | 139 / 323 | 589 / 898 | 571 / 900 |
+| 2 | 147 / 223 | 539 / 855 | 532 / 863 |
+| 3 | 185 / 289 | 543.5 / 901 | 556 / 874 |
+| 4 | 136.5 / 170 | 496 / 735 | 475 / 614 |
+| 5 | 137 / 163 | 475 / 649 | 536 / 860 |
+| 6 | 219 / 523 | 485 / 734 | 446 / 593 |
+| 7 | 138 / 317 | 427 / 696 | 424 / 660 |
+
+CPU-base was the fastest path at every measured mask. The 7/8 serial and concurrent medians were about 3.1x slower than native CPU-base, so production uses native fallback for 7/8. The benchmark output is `tools/results/expert-cache/2026-08-31-partial-mask-latency-final.csv`.
+
+Verification after the policy change:
+
+```text
+build/bin/Release/test-expert-cache.exe
+  all test-expert-cache tests passed successfully
+
+build/bin/Release/test-backend-ops.exe test -b CUDA0 -o MUL_MAT_ID
+  869/869 tests passed
+```
+
+The Compact server smoke used the cache-on preset shape (`-exc 128M`, `-excp 128`, fit target 256) and generated 256 tokens at 22.133 tok/s without an assertion or malformed response. A direct `/completion` request also returned the same first 64 tokens as the cache-off control smoke, including a coherent reasoning prefix. The deterministic cache record is `tools/results/expert-cache/2026-08-31-compact-fast-reject-deterministic-cache-nopersist.json`, with token hash `21341a6b4f91cffbb9327a984d5ac4736ec5dccef80a582c5b96db30752f3513`.
+
+The separate MTP workload was not changed. `test-benchmark-mtp.exe -m G:/ai/models/Qwen3.6-35B-A3B-APEX-MTP-Quality.gguf -p 64 -n 16 -fitt 256 -exc 0 -t 14` completed its cache-off baseline (PP 10.97 tok/s, TG 12.90 tok/s), then aborted during dynamic MTP promotion at `ggml/src/ggml-backend.cpp:213` with `GGML_ASSERT(buffer)` because a backend buffer was null. This prevents a valid new five-sample cache-on/cache-off MTP comparison. Existing multi-token cache correctness tests pass; no TG1 fast-reject rule was applied to MTP.
+
+Decision: retain the complete-bundle query and fast reject, keep the full-hit sidecar, demote TG1 7/8 to native fallback, and retain direct partial executors only for tests and development. Do not lower the threshold, add a GPU route classifier, or tune cache capacity based on this no-full-hit workload.
