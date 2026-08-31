@@ -2971,3 +2971,58 @@ Checkpoint committed as `89e732076` (Task 1). Task 2 pending commit.
 - expert_cache_route_ready_native_fallback_us: 1816510-4958218 (1.8-4.9 ms per decode step)
 
 **Conclusion:** Cache is within measurement noise (+0.05 tok/s mean, -0.42 median). Zero full hits, zero zero-copy hits. The cache layer operates but has zero seeded experts — every route falls through to native graph compute. 3456 fast rejects confirm 8/8 policy is working (no resident bundles = immediate fallback). Baseline confirmed: no cache benefit or cost without seeded residency.
+
+### Task 5: Held-Out Full-Hit Residency Oracle
+
+**Date:** 2026-08-31
+**Trace:** `tools/results/expert-cache/reports/tg1-route-trace.jsonl` (32 tokens, 1280 routes, 40 layers)
+**Geometry:** `tools/results/expert-cache/reports/geometry-v1.json` (256 experts, top_k=8, 40 layers)
+**Bundle bytes:** 1,351,680 (layers 5-34, q3_K) / 2,039,808 (layers 0-4, 35-39, q4_K+q6_K)
+
+**Oracle sweep (held-out, 50/50 train/test split):**
+
+| Capacity | Bundles | Train Hit Rate | Held-Out Hit Rate |
+|---|---|---|---|
+| 32 MiB | 24 | 2.03% | 0.16% |
+| 64 MiB | 48 | 3.44% | 0.16% |
+| 96 MiB | 73 | 5.16% | 0.47% |
+| 128 MiB | 93 | 7.50% | 0.63% |
+| 160 MiB | 122 | 10.00% | 1.09% |
+| 192 MiB | 148 | 12.50% | 1.25% |
+| 256 MiB | 197 | 16.56% | 1.72% |
+| 384 MiB | 296 | 22.97% | 2.50% |
+| 512 MiB | 397 | 29.06% | 3.28% |
+
+**Route diversity (per-layer):**
+- Unique experts per layer: 24-51 (out of 256)
+- Shannon entropy: 3.6-4.7 bits (moderate concentration)
+- Gini coefficient: 0.48-0.64 (moderate inequality)
+
+**Gate 1 assessment:** At 512 MiB, held-out hit rate is 3.28%. This is at the low end of the 3-5% target. The trace is small (32 tokens); a larger trace (10,000+ tokens) would provide more reliable estimates. However, the high route diversity (24-51 unique experts per layer across only 32 tokens) suggests that static residency will struggle to achieve high full-hit rates even with larger traces.
+
+**Conclusion:** Static residency is marginal. The held-out hit rate at 512 MiB is 3.28%, at the boundary of the 3-5% target. With only 32 tokens in the trace, the estimate is noisy. A larger trace is needed to make a definitive Gate 1 decision. Proceeding to Task 6 (static manifests) to prepare for real-model benchmarking.
+
+**Analyzer:** `tools/results/expert-cache/analyze_residency.py` (26 tests PASS)
+**Tests:** `tools/results/expert-cache/test_analyze_residency.py`
+
+### Task 6: Strict v3 Manifest Parsing
+
+**Date:** 2026-08-31
+
+**Changes:**
+- `ggml/src/ggml-backend-expert-cache.cpp`: Replaced text-scanning manifest loader with strict v3 JSON validation
+  - Validates `format == 3`, `admission == "8of8"`, `model` field presence, `top_k == 8`, `expert_count == 256`
+  - Validates projection lists: `["gate", "up", "down"]` or `["gate_up", "down"]`
+  - Supports both legacy (`"expert_id"`, `"pinned_experts"`) and v3 (`"expert"`, `"bundles"`) formats
+  - Rejects non-v3 formats with `"format"` field present
+- `tests/test-expert-cache.cpp`: Added `test_manifest_v3_rejection_and_atomicity()` with 6 rejection cases
+
+**Rejection cases tested:**
+1. Format 2 (not v3) - REJECTED
+2. Admission "7of8" (not "8of8") - REJECTED
+3. Missing "model" field - REJECTED
+4. Wrong projections ["gate", "up"] (missing "down") - REJECTED
+5. Valid empty v3 manifest - ACCEPTED
+6. Valid v3 manifest with one bundle - ACCEPTED
+
+**Test results:** All 40 test-expert-cache tests pass

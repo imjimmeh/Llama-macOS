@@ -2233,6 +2233,30 @@ void ggml_backend_expert_cache_sync(ggml_backend_expert_cache_t cache) {
     ggml_expert_cache_poll_residency(cache);
 }
 
+// Helper to find a JSON integer value by key
+static int json_find_int(const std::string & json, const std::string & key) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return -1;
+    size_t colon = json.find(':', pos + needle.size());
+    if (colon == std::string::npos) return -1;
+    return atoi(json.c_str() + colon + 1);
+}
+
+// Helper to find a JSON string value by key
+static std::string json_find_string(const std::string & json, const std::string & key) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return "";
+    size_t colon = json.find(':', pos + needle.size());
+    if (colon == std::string::npos) return "";
+    size_t start = json.find('"', colon + 1);
+    if (start == std::string::npos) return "";
+    size_t end = json.find('"', start + 1);
+    if (end == std::string::npos) return "";
+    return json.substr(start + 1, end - start - 1);
+}
+
 bool ggml_backend_expert_cache_load_pinned_manifest(
         ggml_backend_expert_cache_t cache,
         const char * manifest_json_path) {
@@ -2250,9 +2274,45 @@ bool ggml_backend_expert_cache_load_pinned_manifest(
                          std::istreambuf_iterator<char>());
     ifs.close();
 
+    // Detect format: v3 has "format": 3, legacy has "pinned_experts"
+    bool has_format = content.find("\"format\"") != std::string::npos;
+    bool is_v3 = has_format && json_find_int(content, "format") == 3;
+    bool is_legacy = content.find("\"pinned_experts\"") != std::string::npos;
+
+    // Reject non-v3, non-legacy formats
+    if (has_format && !is_v3) {
+        fprintf(stderr, "%s: unsupported format %d (expected 3) in '%s'\n",
+            __func__, json_find_int(content, "format"), manifest_json_path);
+        return false;
+    }
+
+    if (is_v3) {
+        // Validate v3 format
+        std::string admission = json_find_string(content, "admission");
+        if (admission != "8of8") {
+            fprintf(stderr, "%s: invalid admission '%s' (expected '8of8') in '%s'\n", __func__, admission.c_str(), manifest_json_path);
+            return false;
+        }
+
+        // Validate model field exists
+        if (content.find("\"model\"") == std::string::npos) {
+            fprintf(stderr, "%s: missing 'model' field in '%s'\n", __func__, manifest_json_path);
+            return false;
+        }
+
+        // Validate model fingerprint
+        int top_k = json_find_int(content, "top_k");
+        int expert_count = json_find_int(content, "expert_count");
+        if (top_k != 8 || expert_count != 256) {
+            fprintf(stderr, "%s: invalid model params (top_k=%d, expert_count=%d) in '%s'\n", __func__, top_k, expert_count, manifest_json_path);
+            return false;
+        }
+    }
+
     cache->pinned_bundles.clear();
     cache->manifest_stats = {};
 
+    // Parse bundles - look for "layer" and "expert"/"expert_id" pairs
     std::vector<std::pair<int32_t, int32_t>> parsed;
     size_t pos = 0;
     while ((pos = content.find("\"layer\"", pos)) != std::string::npos) {
@@ -2260,20 +2320,46 @@ bool ggml_backend_expert_cache_load_pinned_manifest(
         if (colon == std::string::npos) break;
         int layer = atoi(content.c_str() + colon + 1);
 
-        size_t exp_pos = content.find("\"expert_id\"", colon);
-        if (exp_pos == std::string::npos) break;
+        // Try "expert" first (v3), then "expert_id" (legacy)
+        size_t exp_pos = content.find("\"expert\"", colon);
+        if (exp_pos == std::string::npos || exp_pos > colon + 200) {
+            exp_pos = content.find("\"expert_id\"", colon);
+        }
+        if (exp_pos == std::string::npos || exp_pos > colon + 200) break;
         size_t exp_colon = content.find(':', exp_pos);
         if (exp_colon == std::string::npos) break;
         int expert_id = atoi(content.c_str() + exp_colon + 1);
+
+        // Validate projections for v3 format
+        if (is_v3) {
+            size_t proj_pos = content.find("\"projections\"", exp_colon);
+            if (proj_pos == std::string::npos || proj_pos > exp_colon + 200) {
+                fprintf(stderr, "%s: missing projections for layer %d expert %d in '%s'\n", __func__, layer, expert_id, manifest_json_path);
+                return false;
+            }
+            size_t proj_start = content.find('[', proj_pos);
+            size_t proj_end = content.find(']', proj_start);
+            if (proj_start == std::string::npos || proj_end == std::string::npos) {
+                fprintf(stderr, "%s: invalid projections format in '%s'\n", __func__, manifest_json_path);
+                return false;
+            }
+            std::string proj_str = content.substr(proj_start, proj_end - proj_start + 1);
+            bool valid_proj = (proj_str == "[\"gate\", \"up\", \"down\"]" ||
+                              proj_str == "[\"gate_up\", \"down\"]" ||
+                              proj_str == "[\"gate\",\"up\",\"down\"]" ||
+                              proj_str == "[\"gate_up\",\"down\"]");
+            if (!valid_proj) {
+                fprintf(stderr, "%s: invalid projections '%s' for layer %d expert %d in '%s'\n",
+                    __func__, proj_str.c_str(), layer, expert_id, manifest_json_path);
+                return false;
+            }
+        }
 
         parsed.push_back({ layer, expert_id });
         cache->pinned_bundles.insert({ layer, expert_id });
         pos = exp_colon + 1;
     }
     cache->manifest_stats.n_parsed = parsed.size();
-
-    cache->is_static_manifest_loaded = true;
-    cache->zero_miss_upload = true;
 
     fprintf(stderr, "%s: parsed %zu entries (%zu unique) from '%s'\n",
         __func__, cache->manifest_stats.n_parsed, cache->pinned_bundles.size(), manifest_json_path);

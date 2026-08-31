@@ -3350,6 +3350,113 @@ static void test_deterministic_full_hit_latency_fixture() {
 }
 
 
+
+static void test_manifest_v3_rejection_and_atomicity() {
+    printf("testing manifest v3 rejection and atomicity...\n");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t gpu_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu_device == nullptr) {
+        printf("  no GPU backend available; skipped\n");
+        return;
+    }
+
+    ggml_backend_t gpu_backend = ggml_backend_dev_init(gpu_device, nullptr);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    require(gpu_backend != nullptr);
+    require(cpu_backend != nullptr);
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    require(ctx != nullptr);
+
+    const int32_t top_k = 8;
+    ggml_tensor * gate_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, top_k);
+    ggml_tensor * up_weights   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, top_k);
+    ggml_tensor * down_weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2, 2, top_k);
+    ggml_set_name(gate_weights, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(up_weights,   "blk.0.ffn_up_exps.weight");
+    ggml_set_name(down_weights, "blk.0.ffn_down_exps.weight");
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
+    require(buffer != nullptr);
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    ggml_backend_t backends[] = { gpu_backend, cpu_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    require(sched != nullptr);
+    ggml_backend_sched_set_expert_cache(sched, 1024 * 1024);
+    ggml_backend_sched_register_expert_bundle(sched, 0, gate_weights, up_weights, down_weights);
+
+    // Helper to write temp manifest file
+    auto write_manifest = [](const char * json) -> std::string {
+        std::string path = std::tmpnam(nullptr);
+        FILE * f = fopen(path.c_str(), "w");
+        require(f != nullptr);
+        fputs(json, f);
+        fclose(f);
+        return path;
+    };
+
+    // Test 1: Bad format (not v3)
+    {
+        std::string path = write_manifest("{\"format\": 2, \"admission\": \"8of8\", \"bundles\": []}");
+        require(!ggml_backend_sched_load_pinned_manifest(sched, path.c_str()));
+        std::remove(path.c_str());
+    }
+
+    // Test 2: 7of8 admission (not 8of8)
+    {
+        std::string path = write_manifest("{\"format\": 3, \"admission\": \"7of8\", \"bundles\": []}");
+        require(!ggml_backend_sched_load_pinned_manifest(sched, path.c_str()));
+        std::remove(path.c_str());
+    }
+
+    // Test 3: Missing model field
+    {
+        std::string path = write_manifest("{\"format\": 3, \"admission\": \"8of8\", "
+            "\"cache_bytes\": 1048576, \"bundles\": []}");
+        require(!ggml_backend_sched_load_pinned_manifest(sched, path.c_str()));
+        std::remove(path.c_str());
+    }
+
+    // Test 4: Wrong projection list
+    {
+        std::string path = write_manifest("{\"format\": 3, \"admission\": \"8of8\", "
+            "\"model\": {\"sha256\": \"\", \"top_k\": 8, \"expert_count\": 256}, "
+            "\"cache_bytes\": 1048576, "
+            "\"bundles\": [{\"layer\": 0, \"expert\": 0, \"projections\": [\"gate\", \"up\"]}]}");
+        require(!ggml_backend_sched_load_pinned_manifest(sched, path.c_str()));
+        std::remove(path.c_str());
+    }
+
+    // Test 5: Valid v3 manifest (empty)
+    {
+        std::string path = write_manifest("{\"format\": 3, \"admission\": \"8of8\", "
+            "\"model\": {\"sha256\": \"\", \"top_k\": 8, \"expert_count\": 256}, "
+            "\"cache_bytes\": 1048576, \"bundles\": []}");
+        require(ggml_backend_sched_load_pinned_manifest(sched, path.c_str()));
+        std::remove(path.c_str());
+    }
+
+    // Test 6: Valid v3 manifest with one bundle
+    {
+        std::string path = write_manifest("{\"format\": 3, \"admission\": \"8of8\", "
+            "\"model\": {\"sha256\": \"\", \"top_k\": 8, \"expert_count\": 256}, "
+            "\"cache_bytes\": 1048576, "
+            "\"bundles\": [{\"layer\": 0, \"expert\": 0, \"projections\": [\"gate\", \"up\", \"down\"]}]}");
+        require(ggml_backend_sched_load_pinned_manifest(sched, path.c_str()));
+        std::remove(path.c_str());
+    }
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+
+    printf("  manifest v3 rejection and atomicity tests passed\n");
+}
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -3396,6 +3503,7 @@ int main() {
     test_route_ready_two_bundles_same_split_gap();
     test_route_ready_cross_split_sidecar();
 
+    test_manifest_v3_rejection_and_atomicity();
     test_deterministic_full_hit_latency_fixture();
     printf("all test-expert-cache tests passed successfully!\n");
     return 0;
