@@ -453,6 +453,57 @@ load.
 - Keep `docs/superpowers/plans/2026-08-31-persistent-ngram-mod-implementation.md`
   Stage 8 list in sync (hot/cold tiering moves from future work to done).
 
+**Stage E Results (2026-08-31, MSVC Release, Qwen3.6-35B-A3B-APEX-Compact)**
+
+Matrix: hot sizes 1G/2G x cold sizes off/2G/4G x fallback on/off, cold and
+warm start each (20 runs, `run-ngram-mod-sweep.py --cold-sizes ...`),
+`--cache-dir C:/tmp/ngram-mod-cache` because G: had ~1 GB free. The earlier
+aborted matrix was environmental: `SetEndOfFile` error 112 (ERROR_DISK_FULL)
+on the 4G cold store left tiering disabled and the runs crashed under
+commit pressure; with caches on C: every run exits 0 and 4G stores map at
+exactly 4,294,967,540 B.
+
+The 768-token sweep prompt fits the hot pool at any size, so hit rates are
+identical everywhere - this matrix proves correctness and measures the cost
+of tiering, not capacity value:
+
+| config | mode | hot lookups | hot hits | cold lookups | cold hits | hot_loaded | TG t/s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1G off (baseline) | cold | 844 | 241 | - | - | - | 10.95 |
+| 1G off (baseline) | warm | 1004 | 700 | - | - | - | 17.42 |
+| 1G 2G on | cold | 844 | 241 | 603 | 0 | 0 | 11.79 |
+| 1G 2G on | warm | 1004 | 700 | 304 | 0 | 748 | 14.40 |
+| 1G 2G off | cold | 844 | 241 | 0 | 0 | 0 | 12.00 |
+| 1G 2G off | warm | 1004 | 700 | 0 | 0 | 748 | 15.30 |
+| 1G 4G on | cold | 844 | 241 | 603 | 0 | 0 | 10.46 |
+| 1G 4G on | warm | 1004 | 700 | 304 | 0 | 748 | 15.24 |
+| 1G 4G off | cold | 844 | 241 | 0 | 0 | 0 | 11.28 |
+| 1G 4G off | warm | 1004 | 700 | 0 | 0 | 748 | 15.63 |
+| 2G 2G on | warm | 1004 | 700 | 304 | 0 | 748 | 12.57 |
+| 2G 4G on | warm | 1004 | 700 | 304 | 0 | 748 | 16.08 |
+| 2G 4G off | warm | 1004 | 700 | 0 | 0 | 748 | 16.37 |
+
+Full 20-row JSONL: `tools/results/ngram-mod/20260831-tier-ngram-mod-sweep.jsonl`.
+
+Readings:
+
+- Cold-store semantics are correct: every hot miss consults the cold store
+  when fallback is on (603 cold starts, 304 warm = 1004 - 700 hot misses),
+  never when off; an empty cold store yields 0 cold hits; the warm restart
+  restores all 748 flushed entries (`hot_loaded=748`, top 100%).
+- Startup hot restore over a 4G cold store: 1.8-2.2 s at 1G hot, 4.2 s at
+  2G hot (single pass + 2 GiB shadow array). The plan risk row estimated
+  ~0.4 s; measured cost is higher but still a load-time one-off.
+- TG throughput: warm tiered runs land 14.4-16.4 t/s vs 12.5-17.4 t/s for
+  the identical non-tiered baselines - spread is machine noise, no
+  systematic page-fault or cold-consult penalty at 304 cold lookups per run.
+- Not demonstrated: cold-store VALUE (hit coverage beyond the hot pool)
+  needs a corpus larger than 1-2G of distinct n-grams; the sweep prompt is
+  a single repeated document. Left as future work with the corpus
+  pre-seeding tool.
+
+Commits: `877c55db0` (sweep script), `6b8175363` (docs).
+
 ## 7. Files
 
 | File | Change | Stage |
