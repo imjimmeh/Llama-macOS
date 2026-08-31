@@ -356,6 +356,9 @@ Unsupported samplers and device layouts fall back to CPU sampling. Tensor split 
                                         percentage sizes resolve relative to model weight bytes
 --spec-ngram-mod-cache                  PATH
                                         path to persistent ngram-mod cache file (enables persistence)
+--spec-ngram-mod-cold-size              SIZE
+                                        size of the on-disk cold store (e.g. 16M, 1G, 10%; default: 0 = tiering off)
+                                        percentage sizes resolve relative to model weight bytes; requires --spec-ngram-mod-cache
 --spec-ngram-mod-save-interval          N
                                         seconds between periodic cache saves; 0 = shutdown only (default: 0)
 ```

@@ -311,6 +311,26 @@ New writable mapping helper in `common/ngram-mod-cache.cpp`:
 header round-trips; v1 file still loads with tiering off; v1 upgraded to v2
 with tiering on; unmapped cleanly at exit.
 
+**Stage B Results (2026-08-31, MSVC Release, `test-ngram-mod`)**
+
+- Cold file layout: `240 B header + cap*(8 B slot + 4 B hits) + 8 B footer`.
+  1M-slot store = 12,583,160 B, verified byte-exact after flush.
+- Header round-trip: v2 header (tiered flag, capacity_cold, cold_entry_count)
+  survives reopen; slot 10 content `{0x12345678, -3}` with hits 9 and slot
+  123456 `{0xCAFEBABE, 1000}` persist across reopen; empty slots read as
+  `next_token == -1` (nullptr).
+- Crash simulation: CLEAN_CLOSE cleared in the file -> reopen marks store
+  dirty; footer rewritten on next flush.
+- Checksum mismatch on a clean-close file -> store reopens, flags dirty,
+  self-heals (no data loss).
+- Wrong n_match / mismatched tokenizer rejected at open.
+- v1 (224 B header) file upgrades in place: all slots copied, hits = 0,
+  extension region 0xFF, reopens as valid tiered v2.
+- `--spec-ngram-mod-cold-size 0` (default): non-tiered save/load round-trip
+  unchanged and byte-compatible with v1 readers.
+- Commits: `e3c3bc5fa` (format v2 + mmap cold store), `bd7c226e3` (CLI +
+  runtime wiring), `6efd3fc2d` (tests).
+
 ### Stage C: Hot/Cold Runtime
 
 **Task C1: tier wrapper**
