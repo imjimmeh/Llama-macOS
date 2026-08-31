@@ -575,21 +575,24 @@ bool ngram_mod_cold_store::open(
             header.cold_entry_count = 0;
             header.flags         = NGRAM_MOD_CACHE_FLAG_TIERED;
 
-            const size_t n_copy = v1_slots.size() < capacity_cold ? v1_slots.size() : capacity_cold;
-            for (size_t i = 0; i < n_copy; i++) {
-                slots[i] = v1_slots[i];
-                hits[i]  = 0;
-                if (!slots[i].is_empty()) {
-                    header.cold_entry_count++;
+            // place v1 entries at their fingerprint index so runtime cold
+            // lookups (fp % capacity) find them; later entries win collisions
+            memset(slots, 0xFF, capacity_cold * sizeof(ngram_mod_slot));
+            memset(hits, 0, capacity_cold * sizeof(uint32_t));
+            used = 0;
+            this->capacity = capacity_cold; // set_slot/get_slot guard on these
+            open_ok = true;
+            for (size_t i = 0; i < v1_slots.size(); i++) {
+                if (v1_slots[i].is_empty()) {
+                    continue;
                 }
+                const size_t j = v1_slots[i].fingerprint % capacity_cold;
+                const ngram_mod_slot * cs = get_slot(j);
+                const uint32_t h = (cs && cs->matches(v1_slots[i].fingerprint)) ? get_hits(j) : 0;
+                set_slot(j, v1_slots[i], h);
             }
-            // fresh extension beyond the copied v1 slots: mark empty
-            if (n_copy < capacity_cold) {
-                memset(slots + n_copy, 0xFF, (capacity_cold - n_copy) * sizeof(ngram_mod_slot));
-            }
-            used = header.cold_entry_count;
+            header.cold_entry_count = used;
             dirty = true; // header + footer must be written back
-            this->capacity = capacity_cold;
             open_ok = true;
             return true;
         }

@@ -94,6 +94,8 @@ add_library(${TARGET}
     ngram-mod.h
     ngram-mod-cache.cpp
     ngram-mod-cache.h
+    ngram-mod-tier.cpp
+    ngram-mod-tier.h
     peg-parser.cpp
     peg-parser.h
     preset.cpp

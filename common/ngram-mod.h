@@ -28,9 +28,11 @@ struct common_ngram_mod {
 
     common_ngram_mod(uint16_t n, size_t size);
 
+    // fold n tokens into a 64-bit hash; idx() and fp() are derived from it
+    size_t hash(const entry_t * tokens) const;
+
     // hash n-gram tokens and return slot index
     size_t idx(const entry_t * tokens) const;
-
     // compute fingerprint for an n-gram
     uint32_t fp(const entry_t * tokens) const;
 
