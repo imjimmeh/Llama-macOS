@@ -3065,3 +3065,42 @@ No capacity produces positive TG improvement. The static manifest cannot produce
 **Conclusion:** Static full-bundle residency is not viable on this hardware/configuration. The expert cache architecture requires the MUL_MAT_ID to be assigned to the GPU backend with CPU-hosted weights, but the scheduler's `backend_id_from_cur` function assigns it to CPU instead. Tasks 8-11 (dynamic policy) are blocked by the same architectural limitation.
 
 **Recommendation:** Fix the scheduler to offload MUL_MAT_ID to GPU when the expert cache has the weight registered (change `continue` to `return b` at line 1115 of `ggml-backend.cpp`). This is a prerequisite for both static and dynamic residency.
+
+### Mapped-Host GPU Expert Execution Oracle - Gate 1 Negative Result (2026-08-31)
+
+**Question:** Can the GTX 1080 execute Qwen3.6 APEX expert bundles by directly reading persistent mapped host memory (cudaHostRegister on GGUF mmap pages), with zero timed expert-weight H2D, fast enough to beat native CPU execution?
+
+**What was built (test-only, no production changes):**
+- `tests/test-moe-mapped-host-bench.cpp` + CUDA-gated `test-moe-mapped-host-bench` target (find_package(CUDAToolkit REQUIRED) in tests/CMakeLists.txt). Modes: CPU control, VRAM control, mapped-host (direct GGUF page registration with persistent mapped-staging fallback). Complete routed FFN per case (Gate/Up/Down MUL_MAT_ID + SwiGLU + route weighting/reduction, production graph shapes verified against build_lora_mm_id/build_moe_ffn). CUDA-event timing, 28-field JSON schema, Gate 1 evaluation. --self-test pins the case contract (10/10).
+
+**Model fact established:** The Compact export (sha256 a2f6c7fd..., 733 tensors) contains ZERO scale tensors (no .scale/.input_scale suffixes). Per-expert scales are optional in the oracle; the production w_s == nullptr path is exercised. Earlier "APEX scale" assumptions do not apply to this file.
+
+**Environment:** Windows 11 Pro 10.0.26200, GTX 1080 (SM 6.1, 8191 MiB), 14 threads, mmap load, all MoE tensors forced host via llm_ffn_exps_cpu_override, layer 5 (q3_K), 100 warmup / 1000 reps per (mode, shape, pattern).
+
+**Key finding - Windows mmap registration works:** cudaHostRegister(Portable|Mapped|ReadOnly) on file-mapped GGUF pages SUCCEEDED on WDDM (3/3 tensors, ~115 MB each, offset 960 from page base). moe-l2's Linux failure mode does not transfer. mapping_kind = direct_gguf; staging fallback unexercised.
+
+**Results (medians, us; distinct pattern = Gate 1 basis):**
+
+| Shape | CPU | VRAM | Mapped | Mapped vs CPU |
+|-------|----:|-----:|-------:|--------------:|
+| tg1   | 303 | 291 | 6997 | 23.1x slower |
+| tg4   | 1494 | 551 | 3976 | 2.7x slower |
+| tg8   | 3187 | 1260 | 12718 | 4.0x slower |
+| pp128 | 36242 | 11131 | 53921 | 1.5x slower |
+| pp512 | 97864 | 13577 | 55293 | 1.8x faster |
+
+Repeated-route sensitivity (all 512 tokens hit the same 8 experts; GEMM data reuse): mapped pp128 3852 us (5.3x faster than CPU), pp512 15567 us (5.5x faster) - but VRAM remains 3.4x faster again at pp512 (4520 us). This is a synthetic-pattern artifact, not a production route distribution.
+
+**Physics:** Distinct pp512 reads ~346 MB from mapped memory per iteration in 55.3 ms = 6.26 GB/s effective mapped-read throughput on this WDDM/PCIe3 stack (consistent with moe-l2's 5.8 GB/s Linux measurement). Per-token expert traffic is 8 experts x 1.35 MB = 10.8 MB, so mapped-host TG1 carries a ~1.75 ms/token floor vs 0.22-0.30 ms measured CPU TG1 - a structural loss of ~8x before kernel overheads. No Pascal/PCIe3 mapped-host path can win top-8 TG1 on this workload.
+
+**Gate 1: NEGATIVE.** Timed expert-weight H2D = 0 in all modes; correctness PASS in all cases (approved scale-aware tolerances: NMSE <= 2e-3 with observed 2.5e-4; mean_rel <= 5e-2 with 5%-RMS denominator floor; observed 4.2e-2 - CPU-vs-CUDA quantization kernel-path noise).
+
+**Decision:** Direct mapped-host GPU expert execution is rejected for the target configuration. Retain native CPU misses plus full-hit VRAM sidecar; the 8/8 threshold, native fallback, scheduler, fit, and speculative paths are unchanged. The post-gate production sequence (registration facility, storage-aware MUL_MAT_ID, two-tier store) is NOT pursued. A separate, production-shaped PP experiment would be required before ever revisiting mapped-host for prompt processing; the TG1 result alone closes the low-VRAM TG use case.
+
+**Artifacts:**
+- tools/results/expert-cache/mapped-host-oracle/2026-08-31-metadata.json
+- tools/results/expert-cache/mapped-host-oracle/2026-08-31-samples-distinct.json (gate basis; gate_one.status = negative)
+- tools/results/expert-cache/mapped-host-oracle/2026-08-31-samples-repeated.json
+- tools/results/expert-cache/mapped-host-oracle/{cpu-vram-smoke,mapped-smoke,gate-smoke}.json
+- docs/superpowers/plans/2026-08-31-low-vram-moe-mapped-host-oracle.md
+- docs/superpowers/specs/2026-08-31-low-vram-moe-mapped-host-design.md

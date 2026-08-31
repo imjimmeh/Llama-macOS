@@ -19,6 +19,7 @@ CURRENT IMPLEMENTATION STATUS:
 - Fallback bundle ordering: the down node runs on the host after its activation input exists, never before.
 - Event-driven dual-device concurrency: Implemented for the direct partial executor and retained for focused tests and development. The scheduler demotes TG1 7/8 bundles to the native CPU path after the 2026-08-31 latency recheck; 0-6 stays CPU-base and 8/8 retains the GPU sidecar.
 - Fixed TG1 partial executor: seven persistent exact-K GPU graphs, seven exact-M CPU graphs, GPU-host-pinned exchange storage, and the required event set are constructed during scheduler graph allocation. Direct execution covers every 1/8 through 7/8 mask with overlapped GPU/CPU routes and a canonical host result.
+- Direct mapped-host GPU expert execution (cudaHostRegister on GGUF mmap pages, zero-copy device reads): Investigated and REJECTED on GTX 1080 / PCIe 3 (Gate 1 negative, 2026-08-31). The current architecture (native CPU misses + full-hit VRAM sidecar) remains the retained design.
 ```
 
 For the Compact model's `top_k = 8` single-token route-ready workload, production dispatch is intentionally selective:

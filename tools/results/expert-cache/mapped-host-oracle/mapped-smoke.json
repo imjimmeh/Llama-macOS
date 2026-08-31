@@ -1,0 +1,35 @@
+{
+  "format": 1,
+  "experiment": "low-vram-moe-mapped-host-oracle",
+  "model": "C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf",
+  "layer": 5,
+  "warmup": 1,
+  "reps": 1,
+  "mapped_host_results": 1,
+  "results": [
+    {
+      "mode": "mapped_host",
+      "shape": "tg1",
+      "pattern": "distinct",
+      "n_tokens": 1,
+      "n_selected_experts": 8,
+      "unique_experts": 8,
+      "samples": 1,
+      "wall_min_us": 7589.000,
+      "wall_median_us": 7589.000,
+      "wall_p95_us": 7589.000,
+      "wall_mean_us": 7589.000,
+      "wall_stddev_us": 0.000,
+      "setup_expert_weight_h2d_bytes": 0,
+      "max_abs_error": 0.000943940133,
+      "mean_relative_error": 0.0425297084,
+      "nmse": 0.000246447564,
+      "mapping_kind": "direct_gguf",
+      "registration_count": 3,
+      "timed_registration_count": 0,
+      "timed_expert_weight_h2d_bytes": 0,
+      "mapped_host_status": "ok",
+      "correctness_pass": true
+    }
+  ]
+}

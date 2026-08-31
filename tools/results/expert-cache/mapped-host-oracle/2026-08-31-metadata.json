@@ -1,0 +1,23 @@
+{
+  "experiment": "low-vram-moe-mapped-host-oracle",
+  "date": "2026-08-31",
+  "model_path": "C:/Users/jimme/.lmstudio/models/mudler/Qwen3.6-35B-A3B-APEX-GGUF/Qwen3.6-35B-A3B-APEX-Compact.gguf",
+  "model_sha256": "a2f6c7fdbe82113a2e48e2c38022b55bdcc4308a8002da96cf6d48dab67bb77d",
+  "base_commit": "173caf63a063d2b04754f4f33eb027d85d3f9aee",
+  "gpu": "NVIDIA GeForce GTX 1080",
+  "compute_capability": "6.1",
+  "vram_mib": 8191,
+  "os": "Windows 11 Pro (10.0.26200)",
+  "cpu_threads": 14,
+  "load_mode": "mmap",
+  "moe_placement": "all MoE expert tensors forced to host via llm_ffn_exps_cpu_override",
+  "selected_layer": 5,
+  "expert_types": "q3_K gate/up/down",
+  "scale_tensors": "none present in this export; production w_s==nullptr path exercised",
+  "warmup": 100,
+  "reps": 1000,
+  "shapes": ["tg1", "tg4", "tg8", "pp128", "pp512"],
+  "patterns": ["distinct", "repeated"],
+  "command_template": "build/bin/Release/test-moe-mapped-host-bench.exe -m <model> --layer 5 --shapes tg1,tg4,tg8,pp128,pp512 --pattern <pattern> --warmup 100 --reps 1000 --mode all --json tools/results/expert-cache/mapped-host-oracle/2026-08-31-samples-<pattern>.json",
+  "notes": "JSON writer emits one object per invocation; distinct and repeated captured as separate files (deviation from single-JSONL plan noted in ledger)."
+}

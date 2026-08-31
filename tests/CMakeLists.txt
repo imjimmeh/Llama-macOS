@@ -367,5 +367,10 @@ llama_build(test-moe-dynamic-drift-bench.cpp)
 llama_build(test-moe-partial-hit-oracle.cpp)
 llama_build(test-moe-partial-hit-bench.cpp)
 llama_build(test-fit-debug.cpp)
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    llama_build(test-moe-mapped-host-bench.cpp)
+    target_link_libraries(test-moe-mapped-host-bench PRIVATE CUDA::cudart)
+endif()
 
 
