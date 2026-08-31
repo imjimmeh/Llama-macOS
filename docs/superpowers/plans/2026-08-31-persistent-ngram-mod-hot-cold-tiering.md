@@ -406,6 +406,35 @@ comparable to a pre-tiering full-RAM load of the same data; cold-fallback
 off mode shows identical behavior to current persistence plus hotness-ranked
 load.
 
+**Stage D Results (2026-08-31, MSVC Release)**
+
+- Hot pool keying changed to the fingerprint index (idx = fp % size), the
+  same key the cold store uses: a load-time restore only has {fp, token}
+  per cold entry, and the full hash cannot be reconstructed. The pool index
+  and the stored identity are now the same 32-bit value, so a fully
+  occupied pool has 2^-(32-log2(size)) false-hit probability per lookup
+  (1/4096 at 1M slots) instead of ~1/2^32; the sanity band in
+  `test_false_hits` reflects this. At the 25% runtime occupancy cap the
+  real pools see <= ~1/128 per lookup at 1G.
+- New header flag `NGRAM_MOD_CACHE_FLAG_FP_INDEX` (bit 2) written by every
+  save and cold-store flush; non-tiered loads reject files without it
+  (v1 dumps and early v2 dumps are h-keyed and unreachable under fp keying).
+  The tiered v1 upgrade path is not gated - it re-places by fingerprint.
+- Startup scan: single pass over cold slots, per hot slot the highest-hit
+  candidate wins (direct-mapped top-K). Telemetry logs tier sizes, loaded
+  count and scan time at SPC_TRC; `hot_loaded` added to the statistics line.
+- Smoke (CPU build, Qwen3.6-35B-APEX-Compact, 128M hot + 512M cold,
+  repeated-prompt text): warm restart logs
+  `loaded 299 hot entries (top 100% by hotness) in 0.096 s`; with
+  `--spec-ngram-mod-cold-fallback off` the same warm cache drafts and
+  accepts 21/21 tokens with `cold lookups=0` (pure hot-tier operation).
+  Cold file: 536,871,152 B exact, flags=7 (TIERED|CLEAN_CLOSE|FP_INDEX).
+- `test-ngram-mod` green: hot selection (hotter entry wins a colliding
+  slot), v1 and non-FP_INDEX v2 rejection, fp-keyed occupancy curve
+  unchanged (0.884 hit rate at 25% occupancy), deterministic flush_reset.
+- Commits: `57673c361` (fp index + compat gate), `5ea8bd6a7` (startup hot
+  restore), `d8ca2ffba` (tests).
+
 ### Stage E: Measurement and Documentation
 
 **Task E1: tiering benchmark matrix**
@@ -439,20 +468,19 @@ load.
 | `docs/speculative.md` | options + architecture | E |
 | `tools/server/README.md` | options rows | E |
 
+
 ## 8. Backwards Compatibility
 
 - `--spec-type ngram-mod` with no new options: unchanged (32 MB RAM pool,
   v1 file format, full-array save).
 - `--spec-ngram-mod-cache` alone: unchanged behavior, but the file format
-  written by a tiering-enabled build is v2. v2 files must still load with
-  tiering off (cold-only semantics: the whole file is the pool... not
-  exactly - see note below).
-
-**Note**: with tiering on, the cache file layout changes from
-"full pool snapshot" to "cold store + hits". A v2 file opened with tiering
-off should behave as: load the cold slots as the pool (hits ignored). This
-keeps v2 files readable by both modes. v1 files written by older builds
-load in both modes (upgrade path handled in B2).
+  written by a tiering-enabled build is v2. v2 files still load with
+  tiering off (cold-only semantics: the whole file is the pool).
+- Fingerprint keying (Stage D): the hot pool index is now fp % size, so
+  v1 dumps and early v2 dumps (h-keyed) are unreachable in non-tiered
+  loads and are rejected by the FP_INDEX flag gate; the tiered v1 upgrade
+  re-places them by fingerprint and still works. New saves set FP_INDEX,
+  so same-build round-trips are unaffected.
 
 ## 9. Risks
 
@@ -463,6 +491,7 @@ load in both modes (upgrade path handled in B2).
 | RAM pressure (mlock model + hot pool) | cold pages are evictable - that is the point; hot pool sized by flag |
 | Weaker crash semantics than v1 atomic replace | fingerprint self-healing on corrupted slots; header validation; clean-close flag; documented best-effort durability |
 | 4 GB startup scan for hot selection | ~0.4 s at load; acceptable; future hot-candidate index |
+| Fingerprint-keyed false hits | bounded at 2^-(32-log2(hot slots)) per lookup at full occupancy, <= 1/128 at 1G at the 25% cap; a wrong draft is rejected by verification, no correctness impact |
 
 ## 10. Out of Scope (future work)
 
