@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "ngram-mod-cache.h"
+#include "ngram-mod-tier.h"
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
@@ -1861,8 +1862,8 @@ static size_t compute_cold_slots(const common_params_speculative_ngram_mod & cfg
 struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     common_params_speculative_ngram_mod params;
 
-    // shared across all sequences
-    common_ngram_mod mod;
+    // shared across all sequences: hot pool + cold store when tiering
+    common_ngram_mod_tier tier;
 
     // enable trace logging if LLAMA_TRACE is set
     const bool verbose;
@@ -1884,15 +1885,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     bool dirty = false;
     int64_t last_save_ts = 0;
 
-    // format v2 cold store (mapped; empty when tiering is off)
-    ngram_mod_cold_store cold_store;
-
     common_speculative_impl_ngram_mod(
             const common_params_speculative & params,
             uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq)
         , params(params.ngram_mod)
-        , mod(params.ngram_mod.n_match, compute_pool_slots(params.ngram_mod))
+        , tier(params.ngram_mod.n_match, compute_pool_slots(params.ngram_mod))
         , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
 
         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
@@ -1902,24 +1900,27 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         if (cold_slots > 0) {
             if (this->params.cache_path.empty()) {
                 SPC_WRN("%s", "ngram_mod cold store needs --spec-ngram-mod-cache; tiering disabled\n");
-            } else if (cold_store.open(this->params.cache_path, cold_slots,
+            } else if (tier.cold.open(this->params.cache_path, cold_slots,
                     this->params.n_match, 0, "", "")) {
-                SPC_TRC("ngram-mod cold store: %zu cold slots (%.3f MB mapped)\n",
-                        cold_store.size(),
-                        (float)(cold_store.size() * (sizeof(ngram_mod_slot) + sizeof(uint32_t)))/1024/1024);
+                tier.cold_fallback = this->params.cold_fallback;
+                SPC_TRC("ngram-mod cold store: %zu cold slots (%.3f MB mapped), fallback %s\n",
+                        tier.cold.size(),
+                        (float)(tier.cold.size() * (sizeof(ngram_mod_slot) + sizeof(uint32_t)))/1024/1024,
+                        tier.cold_fallback ? "on" : "off");
                 SPC_TRC("%s", "ngram-mod tiered: hot table starts empty, cold store holds the cache file\n");
             } else {
                 SPC_WRN("ngram_mod cold store open failed (capacity %zu slots); tiering disabled\n", cold_slots);
             }
         }
 
+
         // attempt to load persistent cache (non-tiered only)
-        if (!this->params.cache_path.empty() && !cold_store.is_open()) {
+        if (!this->params.cache_path.empty() && !tier.cold.is_open()) {
             ngram_mod_cache_header cache_header;
-            if (ngram_mod_cache_load(this->params.cache_path, mod, cache_header,
+            if (ngram_mod_cache_load(this->params.cache_path, tier.hot, cache_header,
                     this->params.n_match, 0, "", "")) {
                 SPC_TRC("ngram-mod cache loaded: %zu entries, %.3f MB\n",
-                        mod.get_used(), (float)(mod.size_bytes())/1024/1024);
+                        tier.hot.get_used(), (float)(tier.hot.size_bytes())/1024/1024);
             } else {
                 SPC_TRC("%s", "ngram-mod cache not loaded (missing or incompatible)\n");
             }
@@ -1930,16 +1931,21 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     }
 
     ~common_speculative_impl_ngram_mod() override {
+        // tiered shutdown: keep hot entries by writing them to the cold
+        // store before the final flush
+        if (tier.cold.is_open()) {
+            tier.flush_reset();
+        }
         save_cache();
     }
 
     void save_cache() {
-        if (cold_store.is_open()) {
+        if (tier.cold.is_open()) {
             // tiered: the mapped cold store is the persistence; flush dirty
             // pages plus the footer checksum and clean-close flag
-            if (cold_store.flush()) {
+            if (tier.cold.flush()) {
                 SPC_TRC("ngram-mod cold store flushed: %zu cold entries\n",
-                        cold_store.used_count());
+                        tier.cold.used_count());
                 last_save_ts = (int64_t)time(nullptr);
             } else {
                 SPC_WRN("%s", "ngram-mod cold store flush failed\n");
@@ -1952,43 +1958,43 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         ngram_mod_cache_header header;
-        ngram_mod_cache_fill_header(header, mod, params.n_match, 0, "", "");
+        ngram_mod_cache_fill_header(header, tier.hot, params.n_match, 0, "", "");
         header.saved_ts = (uint64_t)time(nullptr);
 
-        if (ngram_mod_cache_save(params.cache_path, mod, header)) {
+        if (ngram_mod_cache_save(params.cache_path, tier.hot, header)) {
             SPC_TRC("ngram-mod cache saved: %zu entries, %.3f MB\n",
-                    mod.get_used(), (float)(mod.size_bytes())/1024/1024);
+                    tier.hot.get_used(), (float)(tier.hot.size_bytes())/1024/1024);
             dirty = false;
             last_save_ts = (int64_t)time(nullptr);
         }
     }
-
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         auto & sinfo = sinfos[seq_id];
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
 
-        const size_t n = mod.get_n();
+        const size_t n = tier.hot.get_n();
         if (prompt.size() < n) {
             return;
         }
 
         for (size_t i = 0; i < prompt.size() - n; ++i) {
-            mod.add(prompt.data() + i);
+            tier.add(prompt.data() + i);
         }
 
         dirty = true;
         sinfo.i_last = prompt.size() - n;
 
-        const double f = (double)mod.get_used() / (double)mod.size();
-        SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n", mod.get_used(), mod.size(), f);
+        const double f = (double)tier.hot.get_used() / (double)tier.hot.size();
+        SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n", tier.hot.get_used(), tier.hot.size(), f);
 
         constexpr double f_thold = 0.25;
         if (f > f_thold) {
-            SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
+            SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - flushing to cold and resetting\n", f, f_thold);
 
-            mod.reset();
+            // keep the entries: demote everything to the cold store
+            tier.flush_reset();
         }
     }
 
@@ -2001,18 +2007,17 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         const auto & prompt = *dparams.prompt;
 
         sinfo.n_draft_last = 0;
-
         const size_t cur_len = prompt.size();
-        if (cur_len < mod.get_n()) {
+        if (cur_len < tier.hot.get_n()) {
             return;
         }
 
-        const size_t n = mod.get_n();
+        const size_t n = tier.hot.get_n();
 
         // add new ngrams in chunks
         if (sinfo.i_last + 32 < cur_len) {
             for (size_t i = sinfo.i_last; i < cur_len - n; ++i) {
-                mod.add(prompt.data() + i);
+                tier.add(prompt.data() + i);
             }
 
             dirty = true;
@@ -2026,7 +2031,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         result[n - 1] = dparams.id_last;
 
         for (int i = 0; i < params.n_max; ++i) {
-            const llama_token token = mod.get(result.data() + i);
+            const llama_token token = tier.get(result.data() + i);
             if (token == common_ngram_mod::EMPTY) {
                 if (i < params.n_min) {
                     result.clear();
@@ -2048,10 +2053,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // store length of drafted n-gram for later acceptance analysis
         sinfo.n_draft_last = result.size();
     }
-
     bool process(const llama_batch & /*batch*/) override {
         if (params.save_interval_sec > 0 &&
-                (dirty || (cold_store.is_open() && cold_store.is_dirty()))) {
+                (dirty || (tier.cold.is_open() && tier.cold.is_dirty()))) {
             int64_t now = (int64_t)time(nullptr);
             if (now - last_save_ts >= params.save_interval_sec) {
                 save_cache();
@@ -2089,9 +2093,7 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                     if (verbose) {
                         SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
                     }
-
-                    mod.reset();
-                    sinfo.n_low = 0;
+                    tier.hot.reset();
                     sinfo.i_last = 0;
                 }
             } else {
@@ -2905,13 +2907,21 @@ void common_speculative_print_stats(const common_speculative * spec) {
         if (impl->type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD) {
             const auto * nm = dynamic_cast<const common_speculative_impl_ngram_mod *>(impl.get());
             if (nm) {
-                const auto & s = nm->mod.get_stats();
+                const auto & s = nm->tier.hot.get_stats();
                 std::ostringstream oss;
                 oss << ", #nm lookups=" << s.n_lookups
                     << " hits=" << s.n_hits
                     << " miss_fp=" << s.n_miss_fp
                     << " inserts=" << s.n_inserts
                     << " overwrites=" << s.n_overwrites;
+                if (nm->tier.tiered()) {
+                    const auto & t = nm->tier.t_stats;
+                    oss << ", cold lookups=" << t.n_cold_lookups
+                        << " hits=" << t.n_cold_hits
+                        << " promotes=" << t.n_promotions
+                        << " demotes=" << t.n_demotions
+                        << " flushes=" << t.n_flushed;
+                }
                 str_ngram_mod = oss.str();
             }
         }

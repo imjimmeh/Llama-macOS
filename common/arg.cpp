@@ -4381,6 +4381,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-ngram-mod-cold-fallback"}, "on|off",
+        "consult the cold store on a hot miss when tiering is enabled (default: on)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_mod.cold_fallback = parse_bool_value(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-ngram-mod-save-interval"}, "N",
         "interval in seconds between periodic cache saves (0 = save only on shutdown, default: 0)",
         [](common_params & params, int value) {
