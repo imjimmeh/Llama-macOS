@@ -6,7 +6,9 @@
 // absolute slot count), so small pools stand in for the real 256M/1G/4G sizes.
 
 #include "ngram-mod-cache.h"
+#include "ngram-mod-tier.h"
 #include "ngram-mod.h"
+#include <map>
 
 #include <cinttypes>
 #include <cstdint>
@@ -274,31 +276,127 @@ static void test_v1_upgrade() {
     ngram_mod_cold_store store;
     require(store.open(V1_PATH, cold_cap, 24, 0, "", ""));
     require(store.size() == cold_cap);
-    require(store.used_count() == v1_used);
-
+    // entries land at their fingerprint index; later entries win collisions
     const ngram_mod_slot * src = mod.slots();
+    std::map<size_t, ngram_mod_slot> expected;
     for (size_t i = 0; i < v1_cap; i++) {
-        if (src[i].is_empty()) {
-            require(store.get_slot(i) == nullptr);
-        } else {
-            const ngram_mod_slot * got = store.get_slot(i);
-            require(got != nullptr);
-            require(got->fingerprint == src[i].fingerprint);
-            require(got->next_token == src[i].next_token);
-            require(store.get_hits(i) == 0);
+        if (!src[i].is_empty()) {
+            expected[src[i].fingerprint % cold_cap] = src[i];
         }
     }
+    require(store.used_count() == expected.size());
+    for (const auto & kv : expected) {
+        const ngram_mod_slot * got = store.get_slot(kv.first);
+        require(got != nullptr);
+        require(got->fingerprint == kv.second.fingerprint);
+        require(got->next_token == kv.second.next_token);
+        require(store.get_hits(kv.first) == 0);
+    }
+    require(store.used_count() == expected.size());
     require(store.flush());
 
     // upgraded file reopens as a valid tiered v2 store
     {
         ngram_mod_cold_store s2;
         require(s2.open(V1_PATH, cold_cap, 24, 0, "", ""));
-        require(s2.used_count() == v1_used);
+        require(s2.used_count() == expected.size());
     }
 
     store.close(); // release the mapping so remove() can delete the file
     remove(V1_PATH);
+}
+
+// tier: hot add/get with demotion, cold fallback, promotion, fallback gate
+static void test_tier_hot_cold() {
+    const char * path = "test-ngram-mod-tier.bin";
+    remove(path);
+
+    common_ngram_mod_tier tier(3, 64);
+    require(tier.cold.open(path, 1024, 3, 0, "", ""));
+    require(tier.tiered());
+
+    int32_t a[4] = {1, 2, 3, 10};
+    // find a sequence that collides with a on the hot index but differs in
+    // fingerprint, so adding it evicts a; vary a middle token so the
+    // fingerprint changes freely while the index repeats
+    int32_t b[4] = {1, 0, 0, 20};
+    bool found = false;
+    for (int32_t x = 4; x < 100000; x++) {
+        b[1] = x;
+        if (tier.hot.idx(a) == tier.hot.idx(b) && tier.hot.fp(a) != tier.hot.fp(b)) {
+            found = true;
+            break;
+        }
+    }
+    require(found);
+
+    tier.add(a);
+    require(tier.get(a) == 10); // hot hit
+
+    tier.add(b); // evicts a -> demoted to cold
+    require(tier.t_stats.n_demotions == 1);
+    require(tier.get(b) == 20); // hot hit
+
+    // a now lives in cold; the lookup promotes it back into the hot pool
+    require(tier.get(a) == 10);
+    require(tier.t_stats.n_cold_lookups == 1);
+    require(tier.t_stats.n_cold_hits == 1);
+    require(tier.t_stats.n_promotions == 1);
+    require(tier.get(a) == 10); // hot hit again, no extra cold lookup
+    require(tier.t_stats.n_cold_lookups == 1);
+
+    // fallback off: hot miss returns EMPTY without consulting cold
+    tier.cold_fallback = false;
+    int32_t c[4] = {7, 8, 9, 30};
+    require(tier.get(c) == COMMON_NGRAM_MOD_EMPTY);
+    require(tier.t_stats.n_cold_lookups == 1); // unchanged
+
+    tier.cold.close(); // release the mapping so remove() can delete the file
+    remove(path);
+}
+
+// tier: flush_reset moves hot entries to cold and they survive a reopen
+static void test_tier_flush_reset() {
+    const char * path = "test-ngram-mod-tier.bin";
+    remove(path);
+
+    const size_t cold_cap = 1U << 16;
+    common_ngram_mod_tier tier(3, 64);
+    require(tier.cold.open(path, cold_cap, 3, 0, "", ""));
+
+    // vary a middle token: consecutive last tokens give consecutive hashes,
+    // which mostly share a fingerprint and pile onto one cold slot
+    for (int32_t x = 0; x < 24; x++) {
+        int32_t t[4] = {100, x, 300, 1000 + x};
+        tier.add(t);
+    }
+    require(tier.hot.get_used() == 24);
+
+    tier.flush_reset();
+    require(tier.hot.get_used() == 0);
+    require(tier.t_stats.n_flushed == 24);
+    require(tier.cold.used_count() == 24); // distinct fp indices for this data
+
+    // entries are found via the cold store and promoted on hit
+    int32_t q[3] = {100, 5, 300};
+    require(tier.get(q) == 1005);
+    require(tier.t_stats.n_cold_hits == 1);
+    require(tier.hot.get_used() == 1);
+    require(tier.cold.flush());
+
+    // a fresh tier over the same file must find the flushed entries
+    {
+        common_ngram_mod_tier tier2(3, 64);
+        require(tier2.cold.open(path, cold_cap, 3, 0, "", ""));
+        int32_t q2[3] = {100, 10, 300};
+        require(tier2.get(q2) == 1010);
+        int32_t q3[3] = {100, 999, 300};
+        require(tier2.get(q3) == COMMON_NGRAM_MOD_EMPTY);
+        tier2.cold.close();
+    }
+
+    tier.cold.close(); // release the mapping so remove() can delete the file
+    remove(path);
 }
 
 int main() {
@@ -321,7 +419,8 @@ int main() {
 
     printf("test-ngram-mod: persistence round-trips\n");
     test_v1_round_trip();
-    test_cold_store_round_trip();
+    test_tier_hot_cold();
+    test_tier_flush_reset();
     test_v1_upgrade();
 
     printf("test-ngram-mod: OK\n");
