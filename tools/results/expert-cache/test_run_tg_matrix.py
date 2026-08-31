@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import pathlib
 import unittest
 from argparse import Namespace
@@ -70,6 +71,69 @@ class BenchEnvironmentTest(unittest.TestCase):
         environment = run_tg_matrix.bench_environment(args)
 
         self.assertIn("PATH", environment)
+
+
+
+class MatrixCommandTest(unittest.TestCase):
+    def test_three_way_rows_for_one_capacity(self):
+        args = Namespace(
+            bench=pathlib.Path("llama-bench"),
+            model=pathlib.Path("model.gguf"),
+            cache_mib=128,
+            cache_period=256,
+            n_gen=128,
+            load_mode="mlock",
+            fit_target=256,
+            gpu_layers=None,
+            cpu_moe_layers=None,
+            max_swaps=0,
+            pinned_experts=pathlib.Path("manifests/oracle-128m.json"),
+            hetero_concurrent=0,
+        )
+        a = run_tg_matrix.matrix_command(args, "A")
+        b = run_tg_matrix.matrix_command(args, "B")
+        c = run_tg_matrix.matrix_command(args, "C")
+        self.assertEqual(a[a.index("-exc") + 1], "0")
+        self.assertNotIn("-pe", a)
+        self.assertEqual(b[b.index("-exc") + 1], "128")
+        self.assertEqual(b[b.index("-excm") + 1], "0")
+        self.assertNotIn("-pe", b)
+        self.assertEqual(c[c.index("-exc") + 1], "128")
+        self.assertEqual(c[c.index("-excm") + 1], "0")
+        self.assertEqual(c[c.index("-pe") + 1], os.fsdecode(pathlib.Path("manifests/oracle-128m.json")))
+        # identical fixed flags across all three rows (pair flag tokens -> value)
+        def fixed(cmd):
+            it = iter(cmd[1:])  # drop bench binary path; rest are flag/value pairs
+            flags = dict(zip(it, it))
+            return {k: v for k, v in flags.items() if k not in ("-exc", "-pe", "-excp", "-excm")}
+        fa, fb, fc = fixed(a), fixed(b), fixed(c)
+        self.assertEqual(fa, fb)
+        self.assertEqual(fa, fc)
+
+    def test_matrix_order_alternates_by_pair(self):
+        order = run_tg_matrix.matrix_order(pair=1, cache_first=False)
+        self.assertEqual(order, ["A", "B", "C"])
+        order = run_tg_matrix.matrix_order(pair=2, cache_first=False)
+        self.assertEqual(order, ["C", "B", "A"])
+        self.assertEqual(run_tg_matrix.matrix_order(pair=1, cache_first=True),
+                         ["C", "B", "A"])
+
+
+class MatrixIndexTest(unittest.TestCase):
+    def test_index_records_one_row_per_child_process(self):
+        rows = [
+            {"config": "A", "pair": 1, "order": "control_first", "stdout": "o1.jsonl", "stderr": "e1.log"},
+            {"config": "C", "pair": 2, "order": "static_first", "stdout": "o2.jsonl", "stderr": "e2.log"},
+        ]
+        index = run_tg_matrix.build_matrix_index(capacity_mib=128, rows=rows)
+        self.assertEqual(index["capacity_mib"], 128)
+        self.assertEqual(len(index["runs"]), 2)
+        first = index["runs"][0]
+        self.assertEqual(first["config"], "A")
+        self.assertEqual(first["run"], 1)
+        self.assertEqual(first["order"], "control_first")
+        self.assertEqual(first["jsonl"], "o1.jsonl")
+        self.assertEqual(first["stderr"], "e1.log")
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,444 @@
+{
+  "format": 3,
+  "admission": "8of8",
+  "model": {
+    "sha256": "a2f6c7fdbe82113a2e48e2c38022b55bdcc4308a8002da96cf6d48dab67bb77d",
+    "top_k": 8,
+    "expert_count": 256
+  },
+  "cache_bytes": 67108864,
+  "bundles": [
+    {
+      "layer": 5,
+      "expert": 4,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 60,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 64,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 79,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 103,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 182,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 205,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 234,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 137,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 206,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 222,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 139,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 13,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 68,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 72,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 145,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 44,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 158,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 220,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 15,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 214,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 29,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 106,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 216,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 190,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 43,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 173,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 243,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 203,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 130,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 231,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 107,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 162,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 237,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 109,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 82,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 184,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 166,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 86,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 5,
+      "expert": 112,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 6,
+      "expert": 15,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 6,
+      "expert": 31,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 6,
+      "expert": 36,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 6,
+      "expert": 47,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 6,
+      "expert": 54,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 6,
+      "expert": 68,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 6,
+      "expert": 169,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    },
+    {
+      "layer": 6,
+      "expert": 194,
+      "projections": [
+        "gate",
+        "up",
+        "down"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8191 MiB):
+  Device 0: NVIDIA GeForce GTX 1080, compute capability 6.1, VMM: yes, VRAM: 8191 MiB
+ggml_backend_expert_cache_load_pinned_manifest: invalid projections '[
+        "gate",
+        "up",
+        "down"
+      ]' for layer 5 expert 4 in 'tools\results\expert-cache\manifests\oracle-128m.json'

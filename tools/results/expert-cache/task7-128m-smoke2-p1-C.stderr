@@ -1,0 +1,4 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 8191 MiB):
+  Device 0: NVIDIA GeForce GTX 1080, compute capability 6.1, VMM: yes, VRAM: 8191 MiB
+ggml_backend_expert_cache_load_pinned_manifest: parsed 99 entries (99 unique) from 'tools\results\expert-cache\manifests\oracle-128m.json'
+ggml_backend_expert_cache_load_pinned_manifest: seeded 0 tensor slots from 99 parsed entries (0 unregistered layer, 297 seed failed) in 'tools\results\expert-cache\manifests\oracle-128m.json'

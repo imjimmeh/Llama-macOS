@@ -1,0 +1,26 @@
+{
+  "capacity_mib": 128,
+  "runs": [
+    {
+      "config": "A",
+      "run": 1,
+      "order": "control_first",
+      "jsonl": "tools\\results\\expert-cache\\task7-128m-smoke2-p1-A.jsonl",
+      "stderr": "tools\\results\\expert-cache\\task7-128m-smoke2-p1-A.stderr"
+    },
+    {
+      "config": "B",
+      "run": 1,
+      "order": "control_first",
+      "jsonl": "tools\\results\\expert-cache\\task7-128m-smoke2-p1-B.jsonl",
+      "stderr": "tools\\results\\expert-cache\\task7-128m-smoke2-p1-B.stderr"
+    },
+    {
+      "config": "C",
+      "run": 1,
+      "order": "control_first",
+      "jsonl": "tools\\results\\expert-cache\\task7-128m-smoke2-p1-C.jsonl",
+      "stderr": "tools\\results\\expert-cache\\task7-128m-smoke2-p1-C.stderr"
+    }
+  ]
+}

@@ -2344,10 +2344,13 @@ bool ggml_backend_expert_cache_load_pinned_manifest(
                 return false;
             }
             std::string proj_str = content.substr(proj_start, proj_end - proj_start + 1);
-            bool valid_proj = (proj_str == "[\"gate\", \"up\", \"down\"]" ||
-                              proj_str == "[\"gate_up\", \"down\"]" ||
-                              proj_str == "[\"gate\",\"up\",\"down\"]" ||
-                              proj_str == "[\"gate_up\",\"down\"]");
+            // normalize whitespace for comparison
+            std::string norm;
+            for (char c : proj_str) {
+                if (c != ' ' && c != '\n' && c != '\r' && c != '\t') norm += c;
+            }
+            bool valid_proj = (norm == "[\"gate\",\"up\",\"down\"]" ||
+                              norm == "[\"gate_up\",\"down\"]");
             if (!valid_proj) {
                 fprintf(stderr, "%s: invalid projections '%s' for layer %d expert %d in '%s'\n",
                     __func__, proj_str.c_str(), layer, expert_id, manifest_json_path);

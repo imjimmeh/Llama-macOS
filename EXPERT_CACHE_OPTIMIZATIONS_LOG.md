@@ -3026,3 +3026,42 @@ Checkpoint committed as `89e732076` (Task 1). Task 2 pending commit.
 6. Valid v3 manifest with one bundle - ACCEPTED
 
 **Test results:** All 40 test-expert-cache tests pass
+
+### Task 7: Static Oracle Benchmark - Gate 2 Negative Result
+
+**Date:** 2026-08-31
+
+**What was built:**
+- `tools/results/expert-cache/run-tg-matrix.py`: Added `--matrix` mode for A/B/C three-way comparison (A=cache-off, B=reserved-empty, C=static-manifest), with alternating pair ordering and placement report generation
+- `tools/results/expert-cache/analyze_tg_matrix.py`: Generic paired analyzer with Student-t 95% CI, placement attribution (cost = B/A-1, execution benefit = C/B-1, net benefit = C/A-1), gate checks (full hits, timed H2D, reserved-empty purity), and resident histogram
+- 17 tests across `test_run_tg_matrix.py` (8) and `test_analyze_tg_matrix.py` (9) - all pass
+- Oracle manifests generated for 64, 128, 192, 256 MiB capacities
+
+**Benchmark results (128 MiB, 1 pair smoke):**
+
+| Config | TG (t/s) | Full Hits | Fallbacks | Fast Rejects | Eligible | Requests |
+|--------|----------|-----------|-----------|--------------|----------|----------|
+| A (cache off) | 25.97 | - | - | - | 0 | 0 |
+| B (reserved empty) | 26.45 | 0 | 3456 | 3456 | 0 | 0 |
+| C (static manifest) | 25.23 | 0 | 3456 | 3456 | 0 | 0 |
+
+Net benefit: -2.86% (static is SLOWER than baseline)
+
+**Root cause: expert cache never engages in the compute path**
+
+With `-fitt 256` on a GTX 1080 (8 GB VRAM), the fit pushes 27 of 40 layers entirely to CPU. The expert cache only creates caches on non-CPU backends (line 3388 of `ggml-backend.cpp`). For layers with attention on GPU and MoE on CPU, the scheduler assigns MUL_MAT_ID to the CPU backend (line 1125 of `ggml-backend.cpp`), creating CPU splits without a cache. Result: `eligible_ops=0`, `requests=0`, `cpu_backend_bypasses=8064`.
+
+With `-ngl 20 -ncmoe 20` (forcing 20 layers with GPU attention + CPU MoE):
+- Manifest loaded: 99 entries, 148 tensor slots seeded, 149 seed failed (capacity)
+- Route-ready classifier found 128 dispatches with 8/8 resident bundles
+- But `full_hits=0` and `eligible_ops=0` — the cache still didn't execute
+- The MUL_MAT_ID is assigned to CPU (line 1125), and the `is_registered_host_expert_weight` check at line 1114 causes `continue`, skipping GPU offload
+- CPU splits have no cache, so `cpu_backend_bypasses` fires
+
+**Gate 2 assessment: FAIL**
+
+No capacity produces positive TG improvement. The static manifest cannot produce full hits through the actual compute path because the scheduler assigns MUL_MAT_ID to CPU when MoE weights are on host, and the expert cache is only attached to non-CPU backends. The route-ready classifier identifies opportunities but the execution path doesn't intercept them.
+
+**Conclusion:** Static full-bundle residency is not viable on this hardware/configuration. The expert cache architecture requires the MUL_MAT_ID to be assigned to the GPU backend with CPU-hosted weights, but the scheduler's `backend_id_from_cur` function assigns it to CPU instead. Tasks 8-11 (dynamic policy) are blocked by the same architectural limitation.
+
+**Recommendation:** Fix the scheduler to offload MUL_MAT_ID to GPU when the expert cache has the weight registered (change `continue` to `return b` at line 1115 of `ggml-backend.cpp`). This is a prerequisite for both static and dynamic residency.
