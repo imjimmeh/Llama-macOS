@@ -2721,3 +2721,19 @@ Text generation on MoE models with cache enabled broke and outputted forward sla
    - Full bundle FFN CPU fallback implementation with host weights, safe leaf tensors, SwiGLU forward, and selective active-route GPU upload.
 2. `tests/test-expert-cache.cpp`: Enabled full test suite execution in `main()`.
 
+### Bug 5: MoE Dispatch State Node Op Inconsistency and Fallback Lifecycle (2026-08-31)
+
+Token generation on MoE models (`Qwen3.6-35B-A3B-APEX-Compact`) with expert cache enabled produced repetitive backslash (`\\\\\\\\\\\\`) or degenerate word loops.
+
+- **Root Cause (Route-Ready Dispatch Op Lifecycle Inconsistency)**:
+  1. In `ggml_backend_sched_compute_splits` (`ggml-backend.cpp`), when route-ready actions executed (`ggml_moe_route_ready_sidecar_execute_full_hit`, `ggml_moe_partial_executor_execute`, or `ggml_backend_moe_hetero_execute_serial`), `plan.down_node` was evaluated and populated with matrix products, but `plan.down_node->op` was not reset to `GGML_OP_NONE` and `save_node_for_restore(plan.down_node)` was omitted. This left node descriptors in an inconsistent state during suffix view evaluation and subsequent decode steps.
+  2. In `ggml_backend_moe_hetero_execute_serial`, scatter merging for CPU split outputs on host memory required explicit host buffer tensor set operations rather than device-only CUDA scatter calls.
+- **Fix**:
+  1. Added `save_node_for_restore(plan.down_node);` and `plan.down_node->op = GGML_OP_NONE;` across all successful route-ready dispatch branches in `ggml/src/ggml-backend.cpp`.
+  2. Maintained exact original preset configuration in `G:\qwen3.6-35b-a3b-presets-exc-latest.ini` (`exc = 128M`, `spec-type = ngram-mod`, `repeat-penalty = 1.0`, `expert-cache-profile = default`, `expert-cache-persist = on`).
+- **Verification**:
+  1. All 36 tests in `test-expert-cache.exe` passed 100%.
+  2. Verified end-to-end token generation on `llama-server` (port 8089) with the full preset under multi-turn chat requests. Produced clean, coherent reasoning traces and fluent responses with zero backslashes or repetitive loops.
+
+
+

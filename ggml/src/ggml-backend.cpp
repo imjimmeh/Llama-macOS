@@ -3095,6 +3095,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             return ec;
                         }
                         sched->route_census_stats.n_route_ready_actions++;
+                        save_node_for_restore(plan.down_node);
+                        plan.down_node->op = GGML_OP_NONE;
                         cur_j = dispatch->last_bundle_node_idx + 1;
                         bundle_handled = true;
                     } else if (concurrent_eligible) {
@@ -3115,6 +3117,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         if (result == GGML_MOE_PARTIAL_EXECUTOR_SUCCESS) {
                             sched->route_census_stats.n_route_ready_actions++;
+                            save_node_for_restore(plan.down_node);
+                            plan.down_node->op = GGML_OP_NONE;
                             cur_j = dispatch->last_bundle_node_idx + 1;
                             bundle_handled = true;
                         }
@@ -3143,6 +3147,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             return ec;
                         }
                         sched->route_census_stats.n_route_ready_actions++;
+                        save_node_for_restore(plan.down_node);
+                        plan.down_node->op = GGML_OP_NONE;
                         cur_j = dispatch->last_bundle_node_idx + 1;
                         bundle_handled = true;
                     }
