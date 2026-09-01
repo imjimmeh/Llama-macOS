@@ -871,6 +871,7 @@ struct ggml_backend_sched {
     int32_t expert_cache_period;
     int32_t expert_cache_max_swaps;
     ggml_backend_expert_cache_t expert_caches[GGML_SCHED_MAX_BACKENDS];
+    bool expert_cache_decode_only = false; // PP bypasses cache, uses normal GPU offload
     bool expert_cache_prefetch = false;
     uint64_t expert_cache_route_step = 0;
     std::vector<ggml_backend_sched_route_snapshot> expert_cache_route_snapshots;
@@ -1038,6 +1039,9 @@ static bool ggml_backend_sched_is_registered_host_expert_weight(
         ggml_backend_sched_t sched,
         int backend_id,
         const struct ggml_tensor * tensor) {
+    if (sched->expert_cache_decode_only) {
+        return false;
+    }
     const ggml_backend_expert_cache_t cache = sched->expert_caches[backend_id];
     return cache != nullptr &&
         tensor != nullptr &&
@@ -1048,6 +1052,9 @@ static bool ggml_backend_sched_is_registered_host_expert_weight(
 }
 
 static bool ggml_backend_sched_has_expert_cache(ggml_backend_sched_t sched) {
+    if (sched->expert_cache_decode_only) {
+        return false;
+    }
     for (int b = 0; b < sched->n_backends; ++b) {
         if (sched->expert_caches[b] != nullptr) {
             return true;
@@ -1542,7 +1549,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         }
     }
-
     // pass 2: expand current backend assignments
     // assign the same backend to adjacent nodes
     // expand gpu backends (i.e. non last prio) up and down, ignoring cpu (the lowest priority backend)
@@ -1789,8 +1795,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-                            if (sched->expert_caches[cur_backend_id] != NULL && node->op == GGML_OP_MUL_MAT_ID) {
-                                // Handled by expert cache without weight transfer, keep in current split
+                            if (!sched->expert_cache_decode_only && sched->expert_caches[cur_backend_id] != NULL && node->op == GGML_OP_MUL_MAT_ID) {
+                                // Handled by expert cache without weight transfer, keep in current split (TG only)
                             } else {
                                 need_new_split = true;
                                 break;
@@ -1804,8 +1810,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         int src_backend_id = sched->hv_tensor_backend_ids[id];
                         bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
                         if (src_backend_id != cur_backend_id && tensor_id_copy(id, cur_backend_id, 0) == NULL && !supported) {
-                            if (sched->expert_caches[cur_backend_id] != NULL && node->op == GGML_OP_MUL_MAT_ID) {
-                                // Handled by expert cache without PCIe weight transfer
+                            if (!sched->expert_cache_decode_only && sched->expert_caches[cur_backend_id] != NULL && node->op == GGML_OP_MUL_MAT_ID) {
+                                // Handled by expert cache without PCIe weight transfer (TG only)
                             } else {
                                 need_new_split = true;
                                 break;
@@ -1871,8 +1877,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-                    if (sched->expert_caches[cur_backend_id] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[cur_backend_id], src)) {
-                        // Managed by expert cache; do not duplicate full weight matrices into GPU VRAM
+                    if (!sched->expert_cache_decode_only && sched->expert_caches[cur_backend_id] != NULL && ggml_backend_expert_cache_has_tensor(sched->expert_caches[cur_backend_id], src)) {
+                        // Managed by expert cache; do not duplicate full weight matrices into GPU VRAM (TG only)
                         continue;
                     }
                     // create a copy of the input in the split's backend
@@ -2899,9 +2905,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // evaluate graph
         if (sched->callback_eval == NULL) {
             std::vector<ggml_backend_sched::ggml_backend_sched_route_ready_dispatch *> route_ready_dispatches;
-            for (auto & dispatch : sched->route_ready_dispatches) {
-                if (dispatch.bundle_split == split_id) {
-                    route_ready_dispatches.push_back(&dispatch);
+            if (!sched->expert_cache_decode_only) {
+                for (auto & dispatch : sched->route_ready_dispatches) {
+                    if (dispatch.bundle_split == split_id) {
+                        route_ready_dispatches.push_back(&dispatch);
+                    }
                 }
             }
             std::sort(route_ready_dispatches.begin(), route_ready_dispatches.end(),
@@ -3329,7 +3337,6 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
     ggml_backend_sched_synchronize(sched);
     return err;
 }
-
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
     if (!sched->is_reset && !sched->is_alloc) {
@@ -3376,6 +3383,14 @@ void ggml_backend_sched_set_expert_cache_prefetch(
     }
 }
 
+void ggml_backend_sched_set_expert_cache_decode_only(
+        ggml_backend_sched_t sched,
+        bool enabled) {
+    if (sched == NULL) {
+        return;
+    }
+    sched->expert_cache_decode_only = enabled;
+}
 void ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size) {
     GGML_ASSERT(sched);
     sched->expert_cache_route_snapshots.clear();

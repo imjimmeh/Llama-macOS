@@ -3104,3 +3104,31 @@ Repeated-route sensitivity (all 512 tokens hit the same 8 experts; GEMM data reu
 - tools/results/expert-cache/mapped-host-oracle/{cpu-vram-smoke,mapped-smoke,gate-smoke}.json
 - docs/superpowers/plans/2026-08-31-low-vram-moe-mapped-host-oracle.md
 - docs/superpowers/specs/2026-08-31-low-vram-moe-mapped-host-design.md
+
+## PP and TG Scheduler Layout Transition (2026-09-01)
+
+**Root cause**: `graph_compute()` selected PP mode after `process_ubatch()` had built and allocated the graph. The scheduler therefore always baked the TG cache layout: MUL_MAT_ID boundaries stayed in cache-managed splits, which made TG fast but reduced PP from about 470 to 185 t/s.
+
+**Failed approach**: Reallocating from `graph_compute()` by clearing `is_alloc` is unsafe. It bypasses the scheduler reserve lifecycle and aborts in CUDA allocation. Applying the mode before calling `sched_reserve()` also failed because `sched_reserve()` creates a new scheduler with the default TG mode.
+
+**Fix**:
+- `llama_context` persists the desired scheduler mode.
+- `process_ubatch()` changes the mode before graph reuse/allocation. On a transition it requests `sched_reserve()`, which synchronizes and reserves the scheduler through its supported lifecycle.
+- Each scheduler creation restores the persisted mode after expert-cache configuration, before graph split reservation.
+- PP uses cache-bypassed GPU splits. TG restores cache-managed CPU-base splits.
+
+**Measurements** (Compact, 14 threads, q8_0, FA on, mlock, ngl 99, fitt 256):
+| Config | PP512 b=4096 | PP512 b=1024 | TG128 |
+|--------|-------------|-------------|-------|
+| exc=0 baseline | 475.6 t/s | 472.5 t/s | 20.9 t/s |
+| exc=128M, TG layout reused | 185.2 t/s | 185.8 t/s | 26.1 t/s |
+| exc=128M, dynamic layouts | 465.29 +/- 5.58 t/s | 465.09 +/- 5.50 t/s | 26.17 +/- 0.10 t/s |
+
+**Server smoke**: A 32,778-token cached-prompt request on the Compact preset used PP layout without expert-cache work and completed prompt evaluation at 412.94 t/s. Reusing that prompt to generate eight tokens selected TG layout, re-reserved in 68.42 ms, and completed without CUDA failure.
+
+**Files changed**:
+- `src/llama-context.h`: Persist the active expert-cache scheduler mode.
+- `src/llama-context.cpp`: Re-reserve on PP/TG mode changes and restore the persisted mode after scheduler creation.
+- `ggml/include/ggml-backend.h`, `ggml/src/ggml-backend.cpp`: Expose and implement the scheduler mode flag; gate cache-only split and dispatch paths.
+
+**Key insight**: Split placement must be selected before scheduler reservation. A runtime mode change needs the scheduler's reserve lifecycle, not an in-place graph allocation reset.

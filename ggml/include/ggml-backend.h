@@ -484,6 +484,7 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_expert_cache(ggml_backend_sched_t sched, size_t size);
     GGML_API void                 ggml_backend_sched_set_expert_cache_period(ggml_backend_sched_t sched, int32_t period);
     GGML_API void                 ggml_backend_sched_set_expert_cache_max_swaps(ggml_backend_sched_t sched, int32_t max_swaps);
+    GGML_API void                 ggml_backend_sched_set_expert_cache_decode_only(ggml_backend_sched_t sched, bool enabled);
     GGML_API void                 ggml_backend_sched_print_expert_cache_stats(ggml_backend_sched_t sched);
     GGML_API bool                 ggml_backend_sched_get_expert_cache_stats(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_stats * out_stats);
     GGML_API size_t               ggml_backend_sched_expert_cache_export_entries(ggml_backend_sched_t sched, int backend_idx, struct ggml_backend_expert_cache_export_entry * out_entries, size_t max_entries);

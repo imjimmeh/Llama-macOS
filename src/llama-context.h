@@ -344,6 +344,7 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    bool expert_cache_decode_only = false;
 
     bool sched_need_reserve = true;
 

@@ -659,6 +659,7 @@ void llama_context::sched_reserve() {
     if (sched && cparams.expert_cache_size > 0 && cparams.expert_cache_size != (size_t)-1) {
         configure_expert_cache(cparams.expert_cache_size);
     }
+    ggml_backend_sched_set_expert_cache_decode_only(sched.get(), expert_cache_decode_only);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -697,6 +698,7 @@ void llama_context::sched_reserve() {
                 if (cparams.expert_cache_size > 0 && cparams.expert_cache_size != (size_t)-1) {
                     configure_expert_cache(cparams.expert_cache_size);
                 }
+                ggml_backend_sched_set_expert_cache_decode_only(sched.get(), expert_cache_decode_only);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -768,6 +770,7 @@ void llama_context::sched_reserve() {
         }
         if (eff_expert_cache_size > 0) {
             configure_expert_cache(eff_expert_cache_size);
+            ggml_backend_sched_set_expert_cache_decode_only(sched.get(), expert_cache_decode_only);
         }
     }
 
@@ -1415,6 +1418,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    const bool expert_cache_decode_only_next = cparams.expert_cache_size != 0 && ubatch.n_tokens > 1;
+    if (expert_cache_decode_only != expert_cache_decode_only_next) {
+        expert_cache_decode_only = expert_cache_decode_only_next;
+        sched_need_reserve = true;
+        sched_reserve();
+    }
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1452,6 +1461,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1477,7 +1487,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
-
     return res;
 }
 
