@@ -16,6 +16,13 @@
 
 struct llama_model;
 class llama_batch_allocr;
+inline bool llama_uses_expert_cache_pp_layout(
+        uint32_t n_tokens,
+        uint32_t n_outputs,
+        bool expert_cache_enabled) {
+    return expert_cache_enabled && n_tokens > 1 && n_outputs < n_tokens;
+}
+
 
 class llama_io_read_i;
 class llama_io_write_i;

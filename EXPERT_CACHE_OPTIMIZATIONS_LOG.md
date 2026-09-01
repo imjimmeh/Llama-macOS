@@ -3132,3 +3132,26 @@ Repeated-route sensitivity (all 512 tokens hit the same 8 experts; GEMM data reu
 - `ggml/include/ggml-backend.h`, `ggml/src/ggml-backend.cpp`: Expose and implement the scheduler mode flag; gate cache-only split and dispatch paths.
 
 **Key insight**: Split placement must be selected before scheduler reservation. A runtime mode change needs the scheduler's reserve lifecycle, not an in-place graph allocation reset.
+
+## Server Workload Calibration and Speculative Layout Classification (2026-09-01)
+
+**Problem**: The PP512/TG128 `llama-bench` numbers in the prior entry did not describe real server throughput. A 32K server smoke had already measured 412.94 t/s PP and 16.61 t/s TG, while the direct TG128 microbenchmark reported 26.17 t/s.
+
+**Root cause**: `process_ubatch()` selected the PP scheduler layout from `ubatch.n_tokens > 1`. That is correct for ordinary prompt batches, but wrong for server speculative verification. `server_slot::handle_last_sampled_token()` adds the sampled token and every draft token with output enabled. The Compact preset permits ngram-mod drafts only at 24 or more tokens, so a successful speculative verification batch has multiple tokens and one output per token. The old condition selected the PP cache-bypassed layout and re-reserved the scheduler for that decode work.
+
+**Fix**: PP mode now requires an expert cache, multiple tokens, and fewer outputs than tokens. Prompt processing normally requests only its final output. A speculative verification batch requests every output and therefore retains the TG cache layout. `test-expert-cache` covers prompt, speculative verification, single-token decode, and cache-disabled classification.
+
+**Representative server measurements**: GTX 1080, Compact preset shape, `ctx-size=128000`, `b=1024`, `ub=512`, Q8_0 KV, Flash Attention, 14 threads, `-exc 128M`, `-excp 128`, and ngram-mod enabled.
+
+| Request | Prompt tokens | PP t/s | Generated tokens | TG t/s | Drafts accepted |
+|---------|--------------:|-------:|-----------------:|-------:|----------------:|
+| Repeated-token speculative workload | 32,768 | 389.57 | 64 | 84.57 effective | 61 |
+| Unique-token long-context workload | 45,976 | 237.59 | 64 | 17.92 | 0 |
+
+The first row validates speculative decoding after the classification fix, but its accepted drafts make it unsuitable as a normal TG baseline. The second row is the appropriate long-context reference: 26.17 t/s from an empty-context TG128 microbenchmark is not a claim about a 45,976-token server decode.
+
+**Cache telemetry**: Both requests printed `expert cache = no requests`, with 0 eligible operations. The repeated request recorded 240 MUL_MAT_ID inputs; the unique long-context request recorded 7,560. Under automatic fit, these MoE operations are CPU-backend or non-host bypasses, so the current expert cache cannot explain their PP or TG rate.
+
+**Baseline qualification**: The prior 453.84 t/s server aggregate is not a controlled long-context PP baseline. Its raw request samples range from 184.64 to 774.34 t/s with different prompt lengths. Do not use it to claim a regression for the 32K or 46K rows above.
+
+**Verification**: The classifier test failed before implementation with the expected missing-symbol link error, then `cmake --build build --config Release --target test-expert-cache && ./build/bin/Release/test-expert-cache.exe` passed all expert-cache tests. The two rows above came from actual `/completion` requests to the rebuilt `llama-server`.

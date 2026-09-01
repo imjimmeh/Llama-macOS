@@ -1412,13 +1412,15 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
-    const bool expert_cache_decode_only_next = cparams.expert_cache_size != 0 && ubatch.n_tokens > 1;
+    const bool expert_cache_decode_only_next =
+        llama_uses_expert_cache_pp_layout(ubatch.n_tokens, n_outputs, cparams.expert_cache_size != 0);
     if (expert_cache_decode_only != expert_cache_decode_only_next) {
         expert_cache_decode_only = expert_cache_decode_only_next;
         sched_need_reserve = true;

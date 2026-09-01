@@ -4,6 +4,9 @@
 #include "../ggml/src/ggml-backend-moe-hetero.h"
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../src/llama-context.h"
+
+
 
 #include <cassert>
 #include <cstdio>
@@ -3457,6 +3460,17 @@ static void test_manifest_v3_rejection_and_atomicity() {
 
     printf("  manifest v3 rejection and atomicity tests passed\n");
 }
+static void test_expert_cache_layout_classification() {
+    printf("testing expert-cache layout classification...\n");
+
+    require(llama_uses_expert_cache_pp_layout(25, 1, true));
+    require(!llama_uses_expert_cache_pp_layout(25, 25, true));
+    require(!llama_uses_expert_cache_pp_layout(1, 1, true));
+    require(!llama_uses_expert_cache_pp_layout(25, 1, false));
+
+    printf("  expert-cache layout classification tests passed\n");
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -3484,6 +3498,7 @@ int main() {
     test_prefetch_deduplicates_expert_ids();
     test_route_prefetch_telemetry();
     test_pp_tg_telemetry_isolation();
+    test_expert_cache_layout_classification();
 
     test_slot_loading_lifecycle();
     test_per_tensor_slot_isolation();
